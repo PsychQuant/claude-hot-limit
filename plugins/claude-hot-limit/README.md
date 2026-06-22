@@ -12,6 +12,7 @@ Anthropic 的 **acceleration-limit / short-burst 節流**（429，以及 529
 | 組件 | 類型 | 作用 |
 |------|------|------|
 | **pacing-guard** | PreToolUse hook | 執行期**硬擋**：守住 `Workflow`/`Agent` 啟動節奏，超量 deny、太近 sleep |
+| **trip-recorder** | StopFailure hook | 撞牆**自動記錄**：429/529 turn 結束時記下當下各時間窗 launch 數，供校準上限 |
 | **pacing-playbook** | skill | 設計期**引導**：fan-out 前讀的反 burst 規則與決策檢查表 |
 
 > 為什麼要 hook 不只 skill：當初的教訓是「**知道 batched 對、卻還是連開 4 個**」。
@@ -32,6 +33,17 @@ PreToolUse 攔 `Workflow` 與 `Agent` 兩個 fan-out 入口：
 session 共用同一本**（flock 序列化）——因為 acceleration limit 是 account 級的，必須全帳號一起數
 才準。**不用 `$CLAUDE_PLUGIN_DATA`**：那是 per-install 路徑，不同安裝來源各記各的會 split-brain、
 低估暴衝（同時開多個專案跑 Claude Code 時尤其危險）。位置可用 `CLAUDE_HOT_LIMIT_DATA` 覆寫。
+
+## 撞牆自動記錄（trip-recorder · 校準上限用）
+
+`StopFailure` 是**唯一**會在 rate-limit / overloaded fire 的 hook（PreToolUse 在 call 之前看不到、
+Notification 沒有 rate-limit 類型）。trip-recorder 掛在 matcher `rate_limit|overloaded`（429 / 529），
+在你**真的撞牆、Claude Code 自己 retry 到放棄、turn 結束**的當下自動 fire：讀帳本、把當下各時間窗
+（60 / 180 / 300 / 600s）的 launch 數記成一列 `[auto]` 進 `~/.cache/claude-hot-limit/calibration-log.md`。
+
+那組數字 = 你 fan-out cadence 在 trip 點的快照。蒐集多次（不同 session 都會記、共用帳本）後看分佈，
+把 `CLAUDE_HOT_LIMIT_MAX` 設在 trip 值之下即完成校準。**StopFailure 文檔明載 "cannot block、輸出被忽略"**
+——本 hook 只記錄、不干預 retry。fail-open。
 
 ## 設定
 

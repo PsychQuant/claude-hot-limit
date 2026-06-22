@@ -12,6 +12,7 @@ acceleration-limit / short-burst 節流（429 / 529）。
 | 組件 | 路徑 | 作用 |
 |------|------|------|
 | pacing-guard hook | `hooks/pacing-guard.py` + `hooks/hooks.json` | PreToolUse 執行期硬擋（deny / sleep） |
+| trip-recorder hook | `hooks/trip-recorder.py` + `hooks/hooks.json` | StopFailure（matcher `rate_limit\|overloaded`）撞牆自動記錄 trip → calibration-log.md |
 | pacing-playbook skill | `skills/pacing-playbook/SKILL.md` | 設計期反 burst 引導 |
 
 ## Hook 設計重點
@@ -24,6 +25,7 @@ acceleration-limit / short-burst 節流（429 / 529）。
   共用一本——acceleration limit 是 account 級的）。**刻意不用 `$CLAUDE_PLUGIN_DATA`**：那是 per-install，
   不同安裝來源會 split-brain、各數各的、低估暴衝。位置以 `CLAUDE_HOT_LIMIT_DATA` 覆寫。
 - override：`CLAUDE_HOT_LIMIT_OFF=1` 或 `~/.cache/claude-hot-limit/disabled` 檔案旗標。
+- **trip-recorder（StopFailure）**：唯一會在 429/529 fire 的 hook（PreToolUse 在 call 前看不到撞牆）。turn 因 `rate_limit`/`overloaded` 結束時，自動把當下各時間窗 launch 數記進 `calibration-log.md` 供校準 `MAX`。StopFailure 文檔「cannot block、輸出被忽略」→ 只記錄、fail-open。
 
 ## 參數（env）
 
