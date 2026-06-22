@@ -14,7 +14,7 @@
     ],
     "StopFailure": [
       {
-        "matcher": "rate_limit|overloaded",
+        "matcher": ".*",
         "hooks": [
           {
             "type": "command",

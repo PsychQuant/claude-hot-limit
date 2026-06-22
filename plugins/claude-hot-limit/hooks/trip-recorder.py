@@ -23,15 +23,30 @@ import time
 WINDOWS = [60, 180, 300, 600]  # 秒
 
 
+# 明確「不是 rate-limit」的 API error → 不污染校準 log。
+# matcher 已放寬為 .*（保證每次 StopFailure 都進得來——實測 error_type 可能是 null，
+# 窄 matcher 會漏），故過濾改在這裡用「明確非 rate-limit」denylist，其餘（含
+# rate_limit / overloaded / server_error / ambiguous 的 unknown）一律記下、寧記勿漏。
+SKIP_TYPES = {
+    "authentication_failed", "oauth_org_not_allowed", "billing_error",
+    "invalid_request", "model_not_found", "max_output_tokens",
+}
+
+
 def main():
     # --- 解析 StopFailure payload（fail-open）---
     try:
         payload = json.load(sys.stdin)
-        error_type = str(payload.get("error_type", "unknown"))
     except Exception:
         sys.exit(0)
 
-    error_type = error_type.replace("|", "/")  # 別弄壞 markdown 表格
+    # error_type 實測可能是 null/缺/字串：None 或空 → unknown（ambiguous，可能是沒填好的撞牆）。
+    raw = payload.get("error_type")
+    error_type = (str(raw).strip() if raw else "unknown").replace("|", "/")
+
+    # 明確非 rate-limit 的 API error 不記成 trip
+    if error_type in SKIP_TYPES:
+        sys.exit(0)
 
     data_dir = os.environ.get("CLAUDE_HOT_LIMIT_DATA") or os.path.expanduser("~/.cache/claude-hot-limit")
     ledger = os.path.join(data_dir, "launches.jsonl")

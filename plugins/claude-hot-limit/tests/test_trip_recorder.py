@@ -75,6 +75,27 @@ class TripRecorderTest(unittest.TestCase):
                  {"CLAUDE_HOT_LIMIT_DATA": self.data})
         self.assertIn("|", self.log_text(), "應建出表格")
 
+    def test_null_error_type_recorded_as_unknown(self):
+        # 實測：StopFailure 的 error_type 可能是 null/None（退化路徑）。
+        # matcher 已放寬為 .*，腳本必須把 None 正規化成 unknown 並仍記下（ambiguous → 寧記勿漏）
+        code, _, _ = run_hook(
+            {"hook_event_name": "StopFailure", "error_type": None},
+            {"CLAUDE_HOT_LIMIT_DATA": self.data},
+        )
+        self.assertEqual(code, 0)
+        txt = self.log_text()
+        self.assertIn("[auto] unknown", txt, "None error_type 應記成 unknown，txt=%r" % txt)
+        self.assertNotIn("[auto] None", txt, "不該出現字面 None")
+
+    def test_skips_clearly_non_ratelimit_type(self):
+        # 明確非 rate-limit 的 API error（auth/billing/model…）不該污染校準 log
+        code, _, _ = run_hook(
+            {"hook_event_name": "StopFailure", "error_type": "billing_error"},
+            {"CLAUDE_HOT_LIMIT_DATA": self.data},
+        )
+        self.assertEqual(code, 0)
+        self.assertNotIn("[auto]", self.log_text(), "billing_error 不應記成 trip")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
