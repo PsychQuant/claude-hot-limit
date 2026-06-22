@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# session-local working state (Claude Code hooks/tools)
+.remember/
+.impeccable/

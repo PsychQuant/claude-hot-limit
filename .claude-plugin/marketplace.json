@@ -1,0 +1,21 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "claude-hot-limit",
+  "description": "claude-hot-limit — 防 fan-out 暴衝撞上 Anthropic acceleration-limit / short-burst 節流（429/529）的 Claude Code plugin marketplace。",
+  "owner": {
+    "name": "Che Cheng"
+  },
+  "homepage": "https://github.com/PsychQuant/claude-hot-limit",
+  "plugins": [
+    {
+      "name": "claude-hot-limit",
+      "version": "1.0.1",
+      "description": "致敬「最燙的 bucket」— PreToolUse hook（pacing-guard）守住 Workflow/Agent fan-out 的啟動節奏：滾動窗口內啟動數超上限就 deny、兩發太近就自動 sleep，防 back-to-back 暴衝撞 Anthropic 的 acceleration-limit / short-burst 節流（429 / 529 'Server is temporarily limiting requests'）。fail-open + flock 序列化 + env/檔案旗標 override。另含 pacing-playbook skill（設計期反 burst 引導與決策檢查表）。",
+      "author": {
+        "name": "Che Cheng"
+      },
+      "source": "./plugins/claude-hot-limit",
+      "category": "development"
+    }
+  ]
+}
