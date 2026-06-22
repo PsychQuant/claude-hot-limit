@@ -11,7 +11,8 @@ claude-hot-limit · pacing-guard  (PreToolUse hook)
   - "short bursts of requests can exceed the limit"
 
 策略:
-  - 把每次 Workflow/Agent 啟動記進 launch 帳本（CLAUDE_PLUGIN_DATA/launches.jsonl）。
+  - 把每次 Workflow/Agent 啟動記進帳號級 launch 帳本（~/.cache/claude-hot-limit/launches.jsonl，
+    跨所有安裝來源 / session 共用一本——acceleration limit 是 account 級的）。
   - 滾動窗口內超過上限 → deny（逼你改串行 / 等 bucket 回填），不記錄被擋的這發。
   - 距上一發太近 → 短 sleep 把間隔拉開（防 short-burst），不打擾你。
 
@@ -26,6 +27,7 @@ claude-hot-limit · pacing-guard  (PreToolUse hook)
   CLAUDE_HOT_LIMIT_MAX=3        窗口內允許的 fan-out 啟動數（第 MAX+1 發被擋）
   CLAUDE_HOT_LIMIT_MIN_GAP=20   兩發之間最小間隔秒數（不足則 sleep 補足）
   CLAUDE_HOT_LIMIT_SLEEP_CAP=45 hook 內單次 sleep 上限（避免 hold 太久）
+  CLAUDE_HOT_LIMIT_DATA=<dir>   覆寫帳本位置（預設 ~/.cache/claude-hot-limit；自訂或測試重導）
   檔案旗標 <data_dir>/disabled    存在即全域停用（比照 archive-first 慣例）
 """
 import sys
@@ -87,8 +89,12 @@ def main():
     min_gap = env_int("CLAUDE_HOT_LIMIT_MIN_GAP", 20)
     sleep_cap = env_int("CLAUDE_HOT_LIMIT_SLEEP_CAP", 45)
 
-    # --- 資料夾 / 帳本 ---
-    data_dir = os.environ.get("CLAUDE_PLUGIN_DATA") or os.path.expanduser("~/.cache/claude-hot-limit")
+    # --- 資料夾 / 帳本（帳號級固定路徑）---
+    # acceleration limit 是 account 級的，帳本必須跨「所有安裝來源 / session」共用一本才數得準。
+    # 故走固定路徑 ~/.cache/claude-hot-limit（flock 序列化並發寫入），而非 CLAUDE_PLUGIN_DATA
+    # —— 後者 per-install，不同安裝來源各記各的會 split-brain、低估暴衝。
+    # CLAUDE_HOT_LIMIT_DATA 可覆寫帳本位置（自訂或測試重導）。
+    data_dir = os.environ.get("CLAUDE_HOT_LIMIT_DATA") or os.path.expanduser("~/.cache/claude-hot-limit")
     try:
         os.makedirs(data_dir, exist_ok=True)
     except Exception:

@@ -20,18 +20,20 @@ acceleration-limit / short-burst 節流（429 / 529）。
 - deny 用 `permissionDecision: "deny"`（archive-first 同款 proven pattern）。
 - **fail-open**：任何異常一律放行。
 - **flock** 序列化並發 hook，計數精確。
-- 帳本：`$CLAUDE_PLUGIN_DATA/launches.jsonl`（跨 session，account 級節流的正確粒度）。
-- override：`CLAUDE_HOT_LIMIT_OFF=1` 或 `$CLAUDE_PLUGIN_DATA/disabled` 檔案旗標。
+- 帳本：**帳號級固定路徑** `~/.cache/claude-hot-limit/launches.jsonl`（跨所有安裝來源 / 並發 session
+  共用一本——acceleration limit 是 account 級的）。**刻意不用 `$CLAUDE_PLUGIN_DATA`**：那是 per-install，
+  不同安裝來源會 split-brain、各數各的、低估暴衝。位置以 `CLAUDE_HOT_LIMIT_DATA` 覆寫。
+- override：`CLAUDE_HOT_LIMIT_OFF=1` 或 `~/.cache/claude-hot-limit/disabled` 檔案旗標。
 
 ## 參數（env）
 
-`CLAUDE_HOT_LIMIT_WINDOW`(600) / `_MAX`(3) / `_MIN_GAP`(20) / `_SLEEP_CAP`(45)
+`CLAUDE_HOT_LIMIT_WINDOW`(600) / `_MAX`(3) / `_MIN_GAP`(20) / `_SLEEP_CAP`(45) / `_DATA`(~/.cache/claude-hot-limit)
 
 ## Development
 
+- 跑測試：`python3 tests/test_pacing_guard.py`（黑箱行為測試，stdlib only，pytest 亦可 discover）。
 - 本地測試：`claude --plugin-dir ./plugins/claude-hot-limit`
-- 改完同步：`/plugin-tools:plugin-update claude-hot-limit`
-- hook 單元測試：見 README「開發 / 測試」段。
+- 發版（standalone repo 自帶 marketplace）：bump `plugin.json` + 根 `marketplace.json` version → push → 使用者 `/plugin update claude-hot-limit@claude-hot-limit`。
 
 ## 誠實邊界
 
