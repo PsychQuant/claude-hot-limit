@@ -40,19 +40,30 @@ def main():
     except Exception:
         sys.exit(0)
 
+    data_dir = os.environ.get("CLAUDE_HOT_LIMIT_DATA") or os.path.expanduser("~/.cache/claude-hot-limit")
+    ledger = os.path.join(data_dir, "launches.jsonl")
+    log = os.path.join(data_dir, "calibration-log.md")
+    now = time.time()
+
+    # --- 原始診斷 dump：把「整包」StopFailure payload 原封不動落地（每次都記、不過濾）---
+    # 為什麼：UI 訊息會說「not your usage limit」不管真相、error_type 又常傳 None——兩個都不可信。
+    # 唯一誠實的做法是把事件原始 JSON 留下，事後看真實欄位（retry_after / status / message…）。
+    # 在 skip 過濾「之前」就 dump，連 auth/billing 等型別也抓，才看得到全貌。fail-open：
+    # 這裡失敗只 pass，不可 sys.exit（否則會吃掉下面該記的 calibration row）。
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+        with open(os.path.join(data_dir, "trips-raw.jsonl"), "a") as f:
+            f.write(json.dumps({"recorded_at": now, "payload": payload}, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
     # error_type 實測可能是 null/缺/字串：None 或空 → unknown（ambiguous，可能是沒填好的撞牆）。
     raw = payload.get("error_type")
     error_type = (str(raw).strip() if raw else "unknown").replace("|", "/")
 
-    # 明確非 rate-limit 的 API error 不記成 trip
+    # 明確非 rate-limit 的 API error 不記成 calibration trip（但上面 raw dump 已抓到全貌）
     if error_type in SKIP_TYPES:
         sys.exit(0)
-
-    data_dir = os.environ.get("CLAUDE_HOT_LIMIT_DATA") or os.path.expanduser("~/.cache/claude-hot-limit")
-    ledger = os.path.join(data_dir, "launches.jsonl")
-    log = os.path.join(data_dir, "calibration-log.md")
-
-    now = time.time()
 
     # --- 讀帳本、算各時間窗 launch 數 ---
     counts = {w: 0 for w in WINDOWS}

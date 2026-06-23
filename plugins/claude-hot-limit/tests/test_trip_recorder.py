@@ -96,6 +96,35 @@ class TripRecorderTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertNotIn("[auto]", self.log_text(), "billing_error 不應記成 trip")
 
+    def raw_rows(self):
+        p = os.path.join(self.data, "trips-raw.jsonl")
+        return [json.loads(l) for l in open(p)] if os.path.exists(p) else []
+
+    def test_dumps_full_raw_payload(self):
+        # 不信任 error_type / UI 訊息 → 把整包 StopFailure payload 原封不動落地，事後看真實欄位
+        payload = {
+            "hook_event_name": "StopFailure", "error_type": "overloaded",
+            "retry_after": 42, "request_id": "req_abc",
+            "message": "Server is temporarily limiting requests",
+        }
+        run_hook(payload, {"CLAUDE_HOT_LIMIT_DATA": self.data})
+        rows = self.raw_rows()
+        self.assertEqual(len(rows), 1, "應產生一筆 trips-raw.jsonl")
+        self.assertIn("recorded_at", rows[-1])
+        pl = rows[-1]["payload"]
+        self.assertEqual(pl.get("retry_after"), 42, "完整欄位都要在，pl=%r" % pl)
+        self.assertEqual(pl.get("request_id"), "req_abc")
+        self.assertIn("message", pl)
+
+    def test_raw_dump_captures_even_skipped_types(self):
+        # 即使會被 calibration log skip 的型別，原始 payload 仍要落地（診斷不過濾）
+        run_hook({"hook_event_name": "StopFailure", "error_type": "billing_error"},
+                 {"CLAUDE_HOT_LIMIT_DATA": self.data})
+        rows = self.raw_rows()
+        self.assertEqual(rows[-1]["payload"].get("error_type"), "billing_error",
+                         "skip 型別的原始 payload 仍要抓到")
+        self.assertNotIn("[auto]", self.log_text(), "但 calibration log 仍 skip")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
