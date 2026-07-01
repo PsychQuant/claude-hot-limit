@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.3.0
+
+- **fix（trip-recorder 讀錯欄位）**：實測 131 筆真實 StopFailure payload，型別欄位叫 **`error`**
+  （`rate_limit` / `server_error` / `invalid_request`），**`error_type` 這個 key 根本不存在**——
+  早期憑想像寫的，導致校準表整片 `[auto] unknown`、且 `SKIP_TYPES` denylist 從未生效（過濾的是恆為
+  `None` 的欄位）。改為 `error` 為主、`error_type` 退路（相容潛在版本差異）。這版起校準表才真的分得出
+  429 `rate_limit` vs 5xx `server_error`，benign 型別（invalid_request 等）也才會被正確 skip。
+- **feat（Workflow 寬度提醒，heat-aware nudge）**：補上 guard 的結構性盲區——pacing-guard 只數主迴圈的
+  `Workflow`/`Agent` 啟動，看不到 **workflow 內部 spawn 的 subagent**（由 runtime 管），而那寬度（實測單一
+  Workflow 可展開 ~74 個並發 subagent）才是真正燙 bucket 的元兇。新機制：launch `Workflow` 時讀
+  trip-recorder 落地的 `trips-raw.jsonl`，若 `CLAUDE_HOT_LIMIT_WINDOW` 內**實際撞牆過**（rate_limit /
+  overloaded / server_error；90s 內多列收斂成一個 episode，不誤報次數），就注入一條 `systemMessage`
+  提醒「收斂並發 / 改串行」。**只提醒、不 deny、不 sleep**；冷 bucket 完全安靜（訊號最純）；
+  `Agent`（寬度 1）不觸發；`CLAUDE_HOT_LIMIT_WORKFLOW_NUDGE=0` 可關。fail-open。把 trip-recorder 的觀測
+  反饋回 guard，兩個 hook 串成閉環。
+- **test**：pacing-guard +6（nudge 出聲 / 冷靜默 / 過期 trip / benign 不算熱 / Agent 不 nudge / env 關閉）、
+  trip-recorder +2（真實 `error` 欄位記錄 / 經 `error` 欄位 skip）。全套 **23 tests 綠**。
+
 ## 1.2.2
 
 - **feat（原始診斷 dump）**：trip-recorder 現在把**整包 StopFailure payload** 原封不動寫進

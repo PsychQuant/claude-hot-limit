@@ -96,6 +96,26 @@ class TripRecorderTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertNotIn("[auto]", self.log_text(), "billing_error 不應記成 trip")
 
+    def test_records_real_error_field(self):
+        # 實測 131 筆 StopFailure payload：欄位叫 `error`（不是 `error_type`，後者根本不存在）。
+        # 真值在 error：rate_limit / server_error / invalid_request。hook 必須讀得到。
+        code, _, _ = run_hook(
+            {"hook_event_name": "StopFailure", "error": "rate_limit"},
+            {"CLAUDE_HOT_LIMIT_DATA": self.data},
+        )
+        self.assertEqual(code, 0)
+        txt = self.log_text()
+        self.assertIn("[auto] rate_limit", txt,
+                      "真實 error 欄位應被記成 rate_limit（不是 unknown），txt=%r" % txt)
+        self.assertNotIn("[auto] unknown", txt, "有明確 error 時不該退化成 unknown")
+
+    def test_skips_via_real_error_field(self):
+        # SKIP 過濾也必須吃真實 error 欄位：invalid_request 不是撞牆，不該污染校準 log
+        run_hook({"hook_event_name": "StopFailure", "error": "invalid_request"},
+                 {"CLAUDE_HOT_LIMIT_DATA": self.data})
+        self.assertNotIn("[auto]", self.log_text(),
+                         "invalid_request（經真實 error 欄位）應被 skip")
+
     def raw_rows(self):
         p = os.path.join(self.data, "trips-raw.jsonl")
         return [json.loads(l) for l in open(p)] if os.path.exists(p) else []

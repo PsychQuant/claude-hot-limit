@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -152,6 +153,72 @@ class GuardBehaviorTest(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(proc.stdout.strip(), "")
+
+
+class WorkflowNudgeTest(unittest.TestCase):
+    """Workflow 寬度提醒（heat-aware nudge）：近期撞過牆 + launch Workflow → 出聲提醒；
+    冷（無/過期 trip）→ 安靜；Agent 不 nudge；env 可關。純提醒、絕不 deny。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.data = os.path.join(self.tmp.name, "ledger")
+        os.makedirs(self.data, exist_ok=True)
+        # MAX 放寬、MIN_GAP=0 → 隔離出 nudge 這條路徑（不被 burst/​sleep 訊息干擾）
+        self.env = {
+            "CLAUDE_HOT_LIMIT_DATA": self.data,
+            "CLAUDE_HOT_LIMIT_MAX": "999",
+            "CLAUDE_HOT_LIMIT_MIN_GAP": "0",
+            "CLAUDE_HOT_LIMIT_WINDOW": "600",
+        }
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def seed_trip(self, error="rate_limit", age=5):
+        now = time.time()
+        with open(os.path.join(self.data, "trips-raw.jsonl"), "a") as f:
+            f.write(json.dumps({"recorded_at": now - age,
+                                "payload": {"error": error}}) + "\n")
+
+    def fire(self, tool="Workflow", extra=None):
+        return run_hook(tool=tool, env_overrides=dict(self.env, **(extra or {})))
+
+    def test_nudges_when_recent_trip(self):
+        self.seed_trip("rate_limit", age=5)
+        _, parsed, raw = self.fire("Workflow")
+        self.assertFalse(is_deny(parsed), "nudge 只提醒、絕不 deny，stdout=%r" % raw)
+        self.assertIsNotNone(parsed, "近期撞牆 + Workflow 應出聲，stdout=%r" % raw)
+        self.assertIn("systemMessage", parsed, "應走 systemMessage，stdout=%r" % raw)
+        self.assertIn("fan-out", parsed["systemMessage"],
+                      "提醒應點名 fan-out 寬度，msg=%r" % parsed.get("systemMessage"))
+
+    def test_silent_when_cold(self):
+        # 沒有任何 trip → bucket 不燙 → 完全安靜（冷時不出聲是設計預設）
+        _, parsed, raw = self.fire("Workflow")
+        self.assertEqual(raw, "", "冷 bucket 不該 nudge，stdout=%r" % raw)
+
+    def test_silent_when_trip_outside_window(self):
+        # trip 在 window 外（很久以前）→ 視為已冷 → 安靜
+        self.seed_trip("rate_limit", age=9999)
+        _, parsed, raw = self.fire("Workflow")
+        self.assertEqual(raw, "", "過期 trip 不算燙，stdout=%r" % raw)
+
+    def test_benign_trip_does_not_count_as_heat(self):
+        # 明確非 rate-limit（invalid_request）不算 bucket 燙 → 不 nudge
+        self.seed_trip("invalid_request", age=5)
+        _, parsed, raw = self.fire("Workflow")
+        self.assertEqual(raw, "", "benign error 不算熱，stdout=%r" % raw)
+
+    def test_agent_not_nudged(self):
+        # 單一 Agent 是寬度 1、非病灶 → 即使 bucket 燙也不 nudge
+        self.seed_trip("rate_limit", age=5)
+        _, parsed, raw = self.fire("Agent")
+        self.assertEqual(raw, "", "Agent 不該觸發 workflow 寬度提醒，stdout=%r" % raw)
+
+    def test_nudge_disabled_by_env(self):
+        self.seed_trip("rate_limit", age=5)
+        _, parsed, raw = self.fire("Workflow", extra={"CLAUDE_HOT_LIMIT_WORKFLOW_NUDGE": "0"})
+        self.assertEqual(raw, "", "NUDGE=0 應關閉提醒，stdout=%r" % raw)
 
 
 if __name__ == "__main__":

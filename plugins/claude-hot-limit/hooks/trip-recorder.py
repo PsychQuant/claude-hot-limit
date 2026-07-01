@@ -57,8 +57,10 @@ def main():
     except Exception:
         pass
 
-    # error_type 實測可能是 null/缺/字串：None 或空 → unknown（ambiguous，可能是沒填好的撞牆）。
-    raw = payload.get("error_type")
+    # 訊號欄位：實測 131 筆真實 StopFailure payload，型別在 `error`（rate_limit / server_error /
+    # invalid_request）——`error_type` 這個 key 根本不存在（早期憑想像寫的，導致校準表整片 unknown）。
+    # 故 `error` 為主、`error_type` 為退路（相容潛在版本差異）。None/空 → unknown（ambiguous，寧記勿漏）。
+    raw = payload.get("error") or payload.get("error_type")
     error_type = (str(raw).strip() if raw else "unknown").replace("|", "/")
 
     # 明確非 rate-limit 的 API error 不記成 calibration trip（但上面 raw dump 已抓到全貌）

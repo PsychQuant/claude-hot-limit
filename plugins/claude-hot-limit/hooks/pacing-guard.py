@@ -28,7 +28,13 @@ claude-hot-limit · pacing-guard  (PreToolUse hook)
   CLAUDE_HOT_LIMIT_MIN_GAP=20   兩發之間最小間隔秒數（不足則 sleep 補足）
   CLAUDE_HOT_LIMIT_SLEEP_CAP=45 hook 內單次 sleep 上限（避免 hold 太久）
   CLAUDE_HOT_LIMIT_DATA=<dir>   覆寫帳本位置（預設 ~/.cache/claude-hot-limit；自訂或測試重導）
+  CLAUDE_HOT_LIMIT_WORKFLOW_NUDGE=1  launch Workflow 時若近期撞過牆，注入寬度提醒（=0 關閉）
   檔案旗標 <data_dir>/disabled    存在即全域停用（比照 archive-first 慣例）
+
+heat-aware nudge（補盲區）:
+  guard 只數主迴圈 Workflow/Agent 啟動，看不到 workflow 內部 spawn 的 subagent（runtime 管），
+  但那寬度才是燙 bucket 主因。折衷：launch Workflow 時讀 trips-raw.jsonl，WINDOW 內實際撞牆過
+  （90s 內多列收斂成 episode）就 systemMessage 提醒收斂並發。只提醒、不擋、冷時安靜、fail-open。
 """
 import sys
 import os
@@ -65,6 +71,58 @@ def env_int(name, default):
         return int(os.environ.get(name, ""))
     except (ValueError, TypeError):
         return default
+
+
+# 明確「不是 bucket 燙」的 API error（與 trip-recorder 的 SKIP_TYPES 一致）→ 不算熱。
+# 其餘（rate_limit / overloaded / server_error / None→unknown）一律算熱（ambiguous 寧算勿漏）。
+_BENIGN_ERRORS = {
+    "authentication_failed", "oauth_org_not_allowed", "billing_error",
+    "invalid_request", "model_not_found", "max_output_tokens",
+}
+
+
+def recent_heat(data_dir, window, now):
+    """讀 trip-recorder 落地的 trips-raw.jsonl，回傳 window 內「撞牆 episode」資訊。
+
+    把 90s 內的多筆 trip（同一次撞牆被 N 個 subagent 各記一列）收斂成一個 episode，
+    避免把一次寬 workflow 的 74 列誤報成「撞了 74 次」。
+
+    回傳 (episode_count, secs_since_last) 或 None（冷 / 無資料 / 讀取失敗 → fail-open）。
+    """
+    path = os.path.join(data_dir, "trips-raw.jsonl")
+    hot_ts = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                ts = float(o.get("recorded_at", 0) or 0)
+                if now - ts > window:
+                    continue
+                p = o.get("payload", {}) or {}
+                raw = p.get("error") or p.get("error_type")
+                err = (str(raw).strip().lower() if raw else "unknown")
+                if err in _BENIGN_ERRORS:
+                    continue
+                hot_ts.append(ts)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+
+    if not hot_ts:
+        return None
+    hot_ts.sort()
+    episodes = 1
+    for prev, cur in zip(hot_ts, hot_ts[1:]):
+        if cur - prev > 90:
+            episodes += 1
+    return episodes, int(now - hot_ts[-1])
 
 
 def main():
@@ -186,10 +244,29 @@ def main():
             time.sleep(need)
             slept = int(round(need))
 
+    messages = []
     if slept:
-        allow_with_message(
+        messages.append(
             "[claude-hot-limit] 距上一個 fan-out 太近，已自動間隔 {s}s 再放行（防 short-burst）。".format(s=slept)
         )
+
+    # --- Workflow 寬度提醒（heat-aware nudge；只提醒、不擋、不 sleep）---
+    # guard 看不到 workflow 內部 spawn 的 subagent（由 runtime 管），那寬度正是 bucket 殺手。
+    # 折衷：bucket 近期實際燙過（trip-recorder 有記）+ 這發又是 Workflow → 出聲提醒收斂並發。
+    # 冷時完全安靜（訊號最純）；env CLAUDE_HOT_LIMIT_WORKFLOW_NUDGE=0 可關。fail-open。
+    if tool_name == "Workflow" and os.environ.get("CLAUDE_HOT_LIMIT_WORKFLOW_NUDGE", "1") != "0":
+        heat = recent_heat(data_dir, window, now)
+        if heat:
+            episodes, since = heat
+            messages.append(
+                "[claude-hot-limit] ⚠️ 近 {m} 分鐘內偵測到 {n} 次撞牆（最近約 {s}s 前），bucket 還燙。"
+                "這發 Workflow 若會寬 fan-out（內部並發 subagent），先收斂並發或改串行——"
+                "workflow 內部 fan-out 不經過本 guard 計數，是 bucket 殺手。".format(
+                    m=window // 60, n=episodes, s=since)
+            )
+
+    if messages:
+        allow_with_message("\n".join(messages))
     allow_silent()
 
 
