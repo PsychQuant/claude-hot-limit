@@ -63,9 +63,14 @@ def detect_model(transcript_path):
             o = json.loads(line)
         except Exception:
             continue  # tail seek 可能切到半行 JSON；跳過，繼續往前找完整行
+        if not isinstance(o, dict):
+            continue  # 合法 JSON 但非 dict（bare 數字、字串內 U+2028 切出的片段）→ 跳過，不 crash
         if o.get("type") != "assistant":
             continue
-        model = (o.get("message") or {}).get("model")
+        msg = o.get("message")
+        if not isinstance(msg, dict):
+            continue
+        model = msg.get("model")
         if model and model != "<synthetic>":
             return model
     return None
@@ -89,7 +94,13 @@ def main():
     # 在 skip 過濾「之前」就 dump，連 auth/billing 等型別也抓，才看得到全貌。fail-open：
     # 這裡失敗只 pass，不可 sys.exit（否則會吃掉下面該記的 calibration row）。
     # model 標註（#2）：per-model 分桶的前提。偵測失敗 → "unknown"（fail-open，寧記勿漏）。
-    model = detect_model(payload.get("transcript_path")) or "unknown"
+    # 整段包 try/except 且防禦非 dict payload（verify 叢集 B）：model 偵測是附加資訊，
+    # 任何異常都絕不可阻礙下面的 raw dump——「dump 先於一切」是本 hook 的核心契約。
+    try:
+        tp = payload.get("transcript_path") if isinstance(payload, dict) else None
+        model = detect_model(tp) or "unknown"
+    except Exception:
+        model = "unknown"
     try:
         os.makedirs(data_dir, exist_ok=True)
         with open(os.path.join(data_dir, "trips-raw.jsonl"), "a") as f:
@@ -97,6 +108,11 @@ def main():
                                ensure_ascii=False) + "\n")
     except Exception:
         pass
+
+    # 非 dict 的合法 JSON payload（如 [1,2,3]）：raw dump 已完成（審計軌跡保住），
+    # 後續欄位提取無從做起 → 乾淨結束，不 crash（verify 叢集 B）。
+    if not isinstance(payload, dict):
+        sys.exit(0)
 
     # 訊號欄位：實測 131 筆真實 StopFailure payload，型別在 `error`（rate_limit / server_error /
     # invalid_request）——`error_type` 這個 key 根本不存在（早期憑想像寫的，導致校準表整片 unknown）。

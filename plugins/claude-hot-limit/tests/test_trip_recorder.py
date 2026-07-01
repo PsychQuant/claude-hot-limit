@@ -207,6 +207,45 @@ class PerModelTripRecordTest(unittest.TestCase):
         self.assertEqual(rows[-1].get("model"), "unknown",
                           "payload 缺 transcript_path 應記 unknown，row=%r" % rows[-1])
 
+    def test_non_dict_json_line_in_transcript_does_not_crash(self):
+        # Verify 叢集 B（DA repro 1）：transcript 內含合法但非 dict 的 JSON 行（bare 12345），
+        # detect_model 不可 crash——必須跳過壞行、往前找到真實 model，trip 照常記錄。
+        path = os.path.join(self.data, "transcript.jsonl")
+        with open(path, "w") as f:
+            f.write(json.dumps({"type": "assistant", "message": {"model": "claude-sonnet-5"}}) + "\n")
+            f.write("12345\n")  # 合法 JSON、非 dict → 舊版在 o.get() 拋 AttributeError
+        code, _, _ = run_hook({"hook_event_name": "StopFailure", "error": "rate_limit",
+                               "transcript_path": path},
+                              {"CLAUDE_HOT_LIMIT_DATA": self.data})
+        self.assertEqual(code, 0, "非 dict JSON 行不該讓 recorder crash")
+        rows = self.raw_rows()
+        self.assertEqual(len(rows), 1, "trip 必須照常記錄（dump 先於一切）")
+        self.assertEqual(rows[-1].get("model"), "claude-sonnet-5",
+                          "應跳過壞行、往前找到真實 model，row=%r" % rows[-1])
+
+    def test_non_dict_message_in_transcript_does_not_crash(self):
+        # message 欄位是字串而非 dict → 舊版 (o.get("message") or {}).get 拋 AttributeError
+        path = os.path.join(self.data, "transcript.jsonl")
+        with open(path, "w") as f:
+            f.write(json.dumps({"type": "assistant", "message": {"model": "claude-opus-4-8"}}) + "\n")
+            f.write(json.dumps({"type": "assistant", "message": "plain string"}) + "\n")
+        code, _, _ = run_hook({"hook_event_name": "StopFailure", "error": "rate_limit",
+                               "transcript_path": path},
+                              {"CLAUDE_HOT_LIMIT_DATA": self.data})
+        self.assertEqual(code, 0)
+        rows = self.raw_rows()
+        self.assertEqual(rows[-1].get("model"), "claude-opus-4-8")
+
+    def test_non_dict_stdin_payload_still_dumped(self):
+        # Verify 叢集 B（DA repro 2）：stdin 是合法 JSON 但非 dict（[1,2,3]）——
+        # 改動前能正常 dump（json.dumps 接受任何型別、payload.get 在 dump 之後），
+        # 必須恢復這個行為：dump 先於一切，不可在 dump 前 crash。
+        code, _, _ = run_hook([1, 2, 3], {"CLAUDE_HOT_LIMIT_DATA": self.data})
+        self.assertEqual(code, 0, "非 dict payload 不該 crash")
+        rows = self.raw_rows()
+        self.assertEqual(len(rows), 1, "原始 payload 仍要 dump（審計軌跡不可丟）")
+        self.assertEqual(rows[-1]["payload"], [1, 2, 3])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

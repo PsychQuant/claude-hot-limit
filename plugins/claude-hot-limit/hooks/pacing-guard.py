@@ -142,9 +142,14 @@ def detect_model(transcript_path):
             o = json.loads(line)
         except Exception:
             continue  # tail seek 可能切到半行 JSON；跳過，繼續往前找完整行
+        if not isinstance(o, dict):
+            continue  # 合法 JSON 但非 dict（bare 數字、字串內 U+2028 切出的片段）→ 跳過，不 crash
         if o.get("type") != "assistant":
             continue
-        model = (o.get("message") or {}).get("model")
+        msg = o.get("message")
+        if not isinstance(msg, dict):
+            continue
+        model = msg.get("model")
         if model and model != "<synthetic>":
             return model
     return None
