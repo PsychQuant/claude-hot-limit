@@ -146,5 +146,67 @@ class TripRecorderTest(unittest.TestCase):
         self.assertNotIn("[auto]", self.log_text(), "但 calibration log 仍 skip")
 
 
+class PerModelTripRecordTest(unittest.TestCase):
+    """#2 — trips-raw.jsonl 每筆 trip 記錄應標註是哪個 model 撞的牆。
+
+    StopFailure payload 帶 transcript_path（131 筆真實 payload 已驗證），用與 pacing-guard
+    v1.4.0 同一套 transcript-tail 手法偵測；偵測失敗 → "unknown"（fail-open）。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.data = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def raw_rows(self):
+        p = os.path.join(self.data, "trips-raw.jsonl")
+        return [json.loads(l) for l in open(p)] if os.path.exists(p) else []
+
+    def make_transcript(self, models):
+        """假 transcript JSONL；None → <synthetic>（應被跳過）。回傳路徑。"""
+        path = os.path.join(self.data, "transcript.jsonl")
+        with open(path, "w") as f:
+            for m in models:
+                value = m if m is not None else "<synthetic>"
+                f.write(json.dumps({"type": "assistant", "message": {"model": value}}) + "\n")
+        return path
+
+    def test_records_model_from_transcript(self):
+        tp = self.make_transcript(["claude-sonnet-5"])
+        run_hook({"hook_event_name": "StopFailure", "error": "rate_limit",
+                  "transcript_path": tp},
+                 {"CLAUDE_HOT_LIMIT_DATA": self.data})
+        rows = self.raw_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[-1].get("model"), "claude-sonnet-5",
+                          "trip 記錄應標註撞牆的 model，row=%r" % rows[-1])
+
+    def test_synthetic_skipped_finds_real_model(self):
+        tp = self.make_transcript(["claude-opus-4-8", None])
+        run_hook({"hook_event_name": "StopFailure", "error": "rate_limit",
+                  "transcript_path": tp},
+                 {"CLAUDE_HOT_LIMIT_DATA": self.data})
+        rows = self.raw_rows()
+        self.assertEqual(rows[-1].get("model"), "claude-opus-4-8",
+                          "<synthetic> 佔位應被跳過、往前找真實 model，row=%r" % rows[-1])
+
+    def test_missing_transcript_records_unknown(self):
+        run_hook({"hook_event_name": "StopFailure", "error": "rate_limit",
+                  "transcript_path": os.path.join(self.data, "does-not-exist.jsonl")},
+                 {"CLAUDE_HOT_LIMIT_DATA": self.data})
+        rows = self.raw_rows()
+        self.assertEqual(rows[-1].get("model"), "unknown",
+                          "transcript 讀不到應 fail-open 記 unknown，row=%r" % rows[-1])
+
+    def test_no_transcript_path_records_unknown(self):
+        run_hook({"hook_event_name": "StopFailure", "error": "rate_limit"},
+                 {"CLAUDE_HOT_LIMIT_DATA": self.data})
+        rows = self.raw_rows()
+        self.assertEqual(rows[-1].get("model"), "unknown",
+                          "payload 缺 transcript_path 應記 unknown，row=%r" % rows[-1])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

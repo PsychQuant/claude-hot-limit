@@ -33,6 +33,44 @@ SKIP_TYPES = {
 }
 
 
+# tail read 上限（bytes）：只掃 transcript 結尾。與 pacing-guard.py 的同名常數/函式刻意保持
+# 一致（各 hook 自成一體、無共用 import 的既有架構下，複製是正確選擇；改偵測邏輯時兩邊都要改）。
+_TRANSCRIPT_TAIL_BYTES = 200_000
+
+
+def detect_model(transcript_path):
+    """讀 transcript 結尾，找最後一筆真實（非 <synthetic>）assistant turn 的 model。
+
+    StopFailure payload 本身沒有 model 欄位（131 筆真實 payload 驗證過），但帶 transcript_path
+    ——與 pacing-guard v1.4.0 同一套 tail-read 手法。找不到 / 讀檔失敗 → None（fail-open）。
+    """
+    if not transcript_path:
+        return None
+    try:
+        size = os.path.getsize(transcript_path)
+        with open(transcript_path, "rb") as f:
+            if size > _TRANSCRIPT_TAIL_BYTES:
+                f.seek(size - _TRANSCRIPT_TAIL_BYTES)
+            text = f.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue  # tail seek 可能切到半行 JSON；跳過，繼續往前找完整行
+        if o.get("type") != "assistant":
+            continue
+        model = (o.get("message") or {}).get("model")
+        if model and model != "<synthetic>":
+            return model
+    return None
+
+
 def main():
     # --- 解析 StopFailure payload（fail-open）---
     try:
@@ -50,10 +88,13 @@ def main():
     # 唯一誠實的做法是把事件原始 JSON 留下，事後看真實欄位（retry_after / status / message…）。
     # 在 skip 過濾「之前」就 dump，連 auth/billing 等型別也抓，才看得到全貌。fail-open：
     # 這裡失敗只 pass，不可 sys.exit（否則會吃掉下面該記的 calibration row）。
+    # model 標註（#2）：per-model 分桶的前提。偵測失敗 → "unknown"（fail-open，寧記勿漏）。
+    model = detect_model(payload.get("transcript_path")) or "unknown"
     try:
         os.makedirs(data_dir, exist_ok=True)
         with open(os.path.join(data_dir, "trips-raw.jsonl"), "a") as f:
-            f.write(json.dumps({"recorded_at": now, "payload": payload}, ensure_ascii=False) + "\n")
+            f.write(json.dumps({"recorded_at": now, "model": model, "payload": payload},
+                               ensure_ascii=False) + "\n")
     except Exception:
         pass
 
