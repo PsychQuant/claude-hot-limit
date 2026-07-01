@@ -34,6 +34,9 @@ acceleration-limit / short-burst 節流（429 / 529）。
 
 `CLAUDE_HOT_LIMIT_WINDOW`(600) / `_MAX`(3) / `_MIN_GAP`(20) / `_SLEEP_CAP`(45) / `_DATA`(~/.cache/claude-hot-limit) / `_WORKFLOW_NUDGE`(1，0 關閉 Workflow 寬度提醒) / `_OFF`(全域停用)
 
+**檔案旗標（即時生效，不需重開 session——env var 不 hot-reload，檔案每次 hook 執行重讀）**：
+`<data_dir>/disabled`（存在即全域停用）/ `<data_dir>/max-override`（內容整數，優先於 `_MAX`）/ `<data_dir>/min-gap-override`（優先於 `_MIN_GAP`）。例：`echo 5 > ~/.cache/claude-hot-limit/max-override` 立即切回保護模式；`rm` 該檔回到 env var。
+
 ## Development
 
 - 跑測試：`python3 tests/test_pacing_guard.py`（黑箱行為測試，stdlib only，pytest 亦可 discover）。

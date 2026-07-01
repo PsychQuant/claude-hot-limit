@@ -486,5 +486,65 @@ class PerModelHeatNudgeTest(unittest.TestCase):
         self.assertIn("systemMessage", parsed)
 
 
+class FileOverrideTest(unittest.TestCase):
+    """#3 — MAX/MIN_GAP 支援檔案旗標即時切換（env var 不 hot-reload，檔案每次執行重新讀）。
+
+    優先序：<data_dir>/max-override（min-gap-override）→ env var → code default。
+    檔案不存在 / 內容無法解析 → fail-open fallback env var，不 crash。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.data = os.path.join(self.tmp.name, "ledger")
+        os.makedirs(self.data, exist_ok=True)
+        self.env = {"CLAUDE_HOT_LIMIT_DATA": self.data, "CLAUDE_HOT_LIMIT_MIN_GAP": "0"}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write_override(self, filename, content):
+        with open(os.path.join(self.data, filename), "w") as f:
+            f.write(content)
+
+    def fire(self, extra=None):
+        return run_hook(tool="Workflow", env_overrides=dict(self.env, **(extra or {})))
+
+    def test_max_override_file_takes_precedence_over_env(self):
+        # env 說 999（觀測模式），檔案說 1 → 檔案贏：第 2 發就該被擋
+        self.write_override("max-override", "1")
+        _, parsed, _ = self.fire(extra={"CLAUDE_HOT_LIMIT_MAX": "999"})
+        self.assertFalse(is_deny(parsed), "第 1 發應放行")
+        _, parsed, raw = self.fire(extra={"CLAUDE_HOT_LIMIT_MAX": "999"})
+        self.assertTrue(is_deny(parsed),
+                        "max-override=1 應蓋過 env MAX=999，第 2 發被擋，stdout=%r" % raw)
+
+    def test_missing_override_falls_back_to_env(self):
+        # 無檔案 → env MAX=2 生效：第 3 發被擋（既有行為不變）
+        for _ in range(2):
+            _, parsed, _ = self.fire(extra={"CLAUDE_HOT_LIMIT_MAX": "2"})
+            self.assertFalse(is_deny(parsed))
+        _, parsed, raw = self.fire(extra={"CLAUDE_HOT_LIMIT_MAX": "2"})
+        self.assertTrue(is_deny(parsed), "無 override 檔案應 fallback env，stdout=%r" % raw)
+
+    def test_unparseable_override_falls_back_to_env(self):
+        # 檔案內容不是數字 → fail-open fallback env MAX=1，不 crash
+        self.write_override("max-override", "not a number\n")
+        code, parsed, _ = self.fire(extra={"CLAUDE_HOT_LIMIT_MAX": "1"})
+        self.assertEqual(code, 0, "壞內容不該讓 hook crash")
+        self.assertFalse(is_deny(parsed), "第 1 發應放行（env MAX=1 生效）")
+        code, parsed, raw = self.fire(extra={"CLAUDE_HOT_LIMIT_MAX": "1"})
+        self.assertEqual(code, 0)
+        self.assertTrue(is_deny(parsed), "壞內容應 fallback env MAX=1：第 2 發被擋，stdout=%r" % raw)
+
+    def test_min_gap_override_file_works(self):
+        # min-gap-override=2 蓋過 env MIN_GAP=0 → 第 2 發應 sleep 並回報 systemMessage
+        self.write_override("min-gap-override", "2")
+        _, parsed, _ = self.fire(extra={"CLAUDE_HOT_LIMIT_MAX": "10"})
+        self.assertFalse(is_deny(parsed))
+        _, parsed, raw = self.fire(extra={"CLAUDE_HOT_LIMIT_MAX": "10"})
+        self.assertIsNotNone(parsed, "min-gap-override 生效時第 2 發應有 sleep 回報，stdout=%r" % raw)
+        self.assertIn("systemMessage", parsed, "應回報已間隔，stdout=%r" % raw)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -34,6 +34,9 @@ claude-hot-limit · pacing-guard  (PreToolUse hook)
   CLAUDE_HOT_LIMIT_RATE_STATE_MIN_TOKENS=2000    同上，rl_input_tokens_remaining /
                                                   rl_output_tokens_remaining 任一低於此值視為熱
   檔案旗標 <data_dir>/disabled    存在即全域停用（比照 archive-first 慣例）
+  檔案旗標 <data_dir>/max-override      內容為整數，優先於 CLAUDE_HOT_LIMIT_MAX（#3）——
+                                        env var 不 hot-reload，檔案每次執行重讀、立即生效
+  檔案旗標 <data_dir>/min-gap-override  同上，優先於 CLAUDE_HOT_LIMIT_MIN_GAP
 
 heat-aware nudge（補盲區）:
   guard 只數主迴圈 Workflow/Agent 啟動，看不到 workflow 內部 spawn 的 subagent（runtime 管），
@@ -79,6 +82,23 @@ def env_int(name, default):
         return int(os.environ.get(name, ""))
     except (ValueError, TypeError):
         return default
+
+
+def file_override_int(data_dir, filename, env_name, default):
+    """檔案旗標優先的整數參數（#3）：<data_dir>/<filename> → env var → code default。
+
+    為什麼要檔案這層：env var 改動對已在跑的 session 不會 hot-reload（實測驗證，需重開
+    session）；檔案跟既有 disabled 旗標一樣每次 hook 執行都重新讀磁碟，`echo 5 > 檔案`
+    立即對所有並發 session 生效。檔案不存在 / 內容無法解析 → fail-open fallback env var。
+    """
+    try:
+        with open(os.path.join(data_dir, filename)) as f:
+            return int(f.read().strip())
+    except (FileNotFoundError, ValueError):
+        pass
+    except Exception:
+        pass  # 權限錯誤等其他異常一律 fail-open，不讓參數讀取癱瘓 hook
+    return env_int(env_name, default)
 
 
 # 明確「不是 bucket 燙」的 API error（與 trip-recorder 的 SKIP_TYPES 一致）→ 不算熱。
@@ -290,10 +310,8 @@ def main():
     if os.environ.get("CLAUDE_HOT_LIMIT_OFF") == "1":
         allow_silent()
 
-    # --- 參數 ---
+    # --- 參數（不依賴 data_dir 的先讀）---
     window = env_int("CLAUDE_HOT_LIMIT_WINDOW", 600)
-    max_in_window = env_int("CLAUDE_HOT_LIMIT_MAX", 3)
-    min_gap = env_int("CLAUDE_HOT_LIMIT_MIN_GAP", 20)
     sleep_cap = env_int("CLAUDE_HOT_LIMIT_SLEEP_CAP", 45)
 
     # --- 資料夾 / 帳本（帳號級固定路徑）---
@@ -306,6 +324,12 @@ def main():
         os.makedirs(data_dir, exist_ok=True)
     except Exception:
         allow_silent()
+
+    # --- MAX / MIN_GAP：檔案旗標優先（#3，需要 data_dir 已解析，故在此讀）---
+    # `echo 5 > <data_dir>/max-override` 立即對所有並發 session 生效，不必重開；
+    # 刪掉檔案即回到 env var / code default。
+    max_in_window = file_override_int(data_dir, "max-override", "CLAUDE_HOT_LIMIT_MAX", 3)
+    min_gap = file_override_int(data_dir, "min-gap-override", "CLAUDE_HOT_LIMIT_MIN_GAP", 20)
 
     # 檔案旗標停用
     if os.path.exists(os.path.join(data_dir, "disabled")):
