@@ -167,9 +167,13 @@ def recent_heat(data_dir, window, now, model=None):
     避免把一次寬 workflow 的 74 列誤報成「撞了 74 次」。
 
     per-model 分桶（#2）：官方文檔證實各 model 是獨立 rate-limit 桶，Sonnet 5 撞牆的紀錄
-    不該讓 Opus 的 nudge 誤判為熱。篩選慣例比照 v1.4.0 launches.jsonl：trip 缺 model 欄位
-    （舊格式列）→ 保守計入任何 model；有值 → 需與傳入的 model 相符才計入。model=None →
-    不過濾（向後相容的呼叫方式，全部計入）。
+    不該讓 Opus 的 nudge 誤判為熱。
+
+    "unknown" 兩側都視為 unscoped（verify 叢集 A 修正）：nudge 的語意是「警告」，under-match
+    會殺掉警告（fail-closed）——跟 launches.jsonl 的 burst 計數不同（那裡 under-match 只是更
+    寬鬆、無害）。所以：傳入 model 為 None/"unknown"（launch 側偵測失敗）→ 完全不過濾；
+    trip 的 model 為缺欄位（舊格式）或 "unknown"（record 側偵測失敗）→ 一律計入。只有
+    「兩側都是已知且不同的真實 model」才排除。
 
     回傳 (episode_count, secs_since_last) 或 None（冷 / 無資料 / 讀取失敗 → fail-open）。
     """
@@ -189,7 +193,9 @@ def recent_heat(data_dir, window, now, model=None):
                 if now - ts > window:
                     continue
                 trip_model = o.get("model")
-                if model is not None and trip_model is not None and trip_model != model:
+                if (model not in (None, "unknown")
+                        and trip_model not in (None, "unknown")
+                        and trip_model != model):
                     continue
                 p = o.get("payload", {}) or {}
                 raw = p.get("error") or p.get("error_type")

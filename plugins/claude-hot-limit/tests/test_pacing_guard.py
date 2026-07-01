@@ -485,6 +485,22 @@ class PerModelHeatNudgeTest(unittest.TestCase):
         self.assertIsNotNone(parsed, "舊格式列應保守計入任何 model，stdout=%r" % raw)
         self.assertIn("systemMessage", parsed)
 
+    def test_launch_side_unknown_still_nudges(self):
+        # Verify 叢集 A（DA repro）：launch 當下 detect_model 失敗（無 transcript_path）
+        # → model="unknown" 不可以把真實 model 的 trip 全部過濾掉——v1.5.0 會出提醒，修復後要恢復。
+        self.seed_trip(model="claude-sonnet-5", age=5)
+        _, parsed, raw = run_hook(tool="Workflow", env_overrides=self.env)  # payload 無 transcript_path
+        self.assertIsNotNone(parsed, "launch 側偵測失敗不該靜默所有 nudge（fail-open），stdout=%r" % raw)
+        self.assertIn("systemMessage", parsed)
+
+    def test_record_side_unknown_still_nudges(self):
+        # Verify 叢集 A：trip 記成 model="unknown"（StopFailure 當下 transcript 讀不到）
+        # → 對任何真實 model 的 launch 都應保守計入（ambiguous trip ≠ 別人的桶）。
+        self.seed_trip(model="unknown", age=5)
+        _, parsed, raw = self.fire_workflow_as("claude-opus-4-8")
+        self.assertIsNotNone(parsed, "record 側 unknown trip 應保守計入任何 model，stdout=%r" % raw)
+        self.assertIn("systemMessage", parsed)
+
 
 class FileOverrideTest(unittest.TestCase):
     """#3 — MAX/MIN_GAP 支援檔案旗標即時切換（env var 不 hot-reload，檔案每次執行重新讀）。
