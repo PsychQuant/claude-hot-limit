@@ -140,11 +140,16 @@ def detect_effort(payload):
     return "unknown"
 
 
-def recent_heat(data_dir, window, now):
+def recent_heat(data_dir, window, now, model=None):
     """讀 trip-recorder 落地的 trips-raw.jsonl，回傳 window 內「撞牆 episode」資訊。
 
     把 90s 內的多筆 trip（同一次撞牆被 N 個 subagent 各記一列）收斂成一個 episode，
     避免把一次寬 workflow 的 74 列誤報成「撞了 74 次」。
+
+    per-model 分桶（#2）：官方文檔證實各 model 是獨立 rate-limit 桶，Sonnet 5 撞牆的紀錄
+    不該讓 Opus 的 nudge 誤判為熱。篩選慣例比照 v1.4.0 launches.jsonl：trip 缺 model 欄位
+    （舊格式列）→ 保守計入任何 model；有值 → 需與傳入的 model 相符才計入。model=None →
+    不過濾（向後相容的呼叫方式，全部計入）。
 
     回傳 (episode_count, secs_since_last) 或 None（冷 / 無資料 / 讀取失敗 → fail-open）。
     """
@@ -162,6 +167,9 @@ def recent_heat(data_dir, window, now):
                     continue
                 ts = float(o.get("recorded_at", 0) or 0)
                 if now - ts > window:
+                    continue
+                trip_model = o.get("model")
+                if model is not None and trip_model is not None and trip_model != model:
                     continue
                 p = o.get("payload", {}) or {}
                 raw = p.get("error") or p.get("error_type")
@@ -411,8 +419,8 @@ def main():
         rs_heat = rate_state_heat(data_dir, window, now)
         if rs_heat is _RATE_STATE_UNAVAILABLE:
             # 沒有 rate-state.jsonl（未裝/未啟用 proxy）、或資料太舊/解析失敗 → fail-open
-            # fallback 回既有 trips-raw.jsonl 啟發式（行為與升級前完全一致）。
-            heat = recent_heat(data_dir, window, now)
+            # fallback 回既有 trips-raw.jsonl 啟發式。model（main() 開頭已偵測）傳入分桶過濾（#2）。
+            heat = recent_heat(data_dir, window, now, model)
             if heat:
                 episodes, since = heat
                 messages.append(

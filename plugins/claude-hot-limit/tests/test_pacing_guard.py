@@ -434,5 +434,57 @@ class PerModelLedgerTest(unittest.TestCase):
         self.assertIn("claude-sonnet-5", reason, "deny 訊息應點名燙的是哪個 model，reason=%r" % reason)
 
 
+class PerModelHeatNudgeTest(unittest.TestCase):
+    """#2 — recent_heat() 按 model 分桶：Sonnet 5 撞牆的紀錄不該讓 Opus 的 nudge 誤判為熱。
+
+    篩選慣例比照 v1.4.0 launches.jsonl：trip 缺 model 欄位（舊格式）→ 保守計入任何 model；
+    有值 → 需與當前 launch 的 model 相符才計入。無 rate-state.jsonl → fallback 到 recent_heat。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.data = os.path.join(self.tmp.name, "ledger")
+        os.makedirs(self.data, exist_ok=True)
+        self.env = {
+            "CLAUDE_HOT_LIMIT_DATA": self.data,
+            "CLAUDE_HOT_LIMIT_MAX": "999",
+            "CLAUDE_HOT_LIMIT_MIN_GAP": "0",
+            "CLAUDE_HOT_LIMIT_WINDOW": "600",
+        }
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def seed_trip(self, model=None, age=5):
+        """model=None → 舊格式列（無 model 欄位）。"""
+        row = {"recorded_at": time.time() - age, "payload": {"error": "rate_limit"}}
+        if model is not None:
+            row["model"] = model
+        with open(os.path.join(self.data, "trips-raw.jsonl"), "a") as f:
+            f.write(json.dumps(row) + "\n")
+
+    def fire_workflow_as(self, model):
+        tp = make_transcript(self.tmp.name, [model])
+        payload = {"tool_name": "Workflow", "tool_input": {}, "transcript_path": tp}
+        return run_hook(tool="Workflow", env_overrides=self.env, payload=payload)
+
+    def test_different_model_trip_does_not_nudge(self):
+        self.seed_trip(model="claude-sonnet-5", age=5)
+        _, parsed, raw = self.fire_workflow_as("claude-opus-4-8")
+        self.assertEqual(raw, "", "Sonnet 5 的 trip 不該讓 Opus 的 nudge 誤判為熱，stdout=%r" % raw)
+
+    def test_same_model_trip_nudges(self):
+        self.seed_trip(model="claude-opus-4-8", age=5)
+        _, parsed, raw = self.fire_workflow_as("claude-opus-4-8")
+        self.assertIsNotNone(parsed, "同 model 的近期 trip 應觸發 nudge，stdout=%r" % raw)
+        self.assertIn("systemMessage", parsed)
+
+    def test_legacy_trip_without_model_counts_any(self):
+        self.seed_trip(model=None, age=5)  # 舊格式列
+        _, parsed, raw = self.fire_workflow_as("claude-opus-4-8")
+        self.assertIsNotNone(parsed, "舊格式列應保守計入任何 model，stdout=%r" % raw)
+        self.assertIn("systemMessage", parsed)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
