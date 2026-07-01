@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.5.0
+
+- **feat（rate-limit-proxy，Phase 1 純觀測）**：新增 `proxy/rate-limit-proxy.py`——本地 HTTP
+  reverse proxy，透過 `ANTHROPIC_BASE_URL` 導流。查證官方文檔確認 hook 機制（全 30 種事件）
+  結構上完全碰不到 HTTP response header，要拿到即時、精確的 rate-limit 狀態唯一路徑是本地
+  proxy。Transparent forwarding（含 streaming，逐 byte 轉發不整段 buffer）+ 擷取真實
+  `anthropic-ratelimit-*` header 與回應 body 的 `usage`（含 streaming 最終 event 才知道的總量）
+  寫入帳號級共用狀態檔 `~/.cache/claude-hot-limit/rate-state.jsonl`。
+- **範疇明確鎖定 Phase 1**：不做任何主動 delay/佇列/擋請求（Phase 2，留待下一個 change）。
+  Fail-open 貫穿全程——上游錯誤（429/529/5xx）原樣轉發不吞不重試，狀態檔寫入失敗不影響
+  client 端實際收到的回應。
+- **feat（pacing-guard 選配整合）**：heat-aware nudge 優先讀 `rate-state.jsonl`（若存在且在
+  WINDOW 內）用真實 remaining 判斷熱度，取代（非疊加）原本的 `trips-raw.jsonl` 啟發式；
+  沒裝/未啟用 proxy 時行為與 1.4.0 完全一致（fail-open fallback）。
+- **CLAUDE.md**：新增「Proxy 誠實邊界（Phase 1）」段落，既有 hook 的「誠實邊界」段落逐字
+  保留不動——proxy 是並存的新元件，不取代既有 hook。
+- **test**：新增 `test_rate_limit_proxy.py`（11 tests，含 mutation check 驗證 fail-open 分支
+  真的有保護作用）；`test_pacing_guard.py` +7（rate-state 優先/fallback/確認冷三態）。全套
+  **49 tests 綠**。
+- **spectra**：本次變更走完整 Spectra spec-driven 流程（`openspec/changes/add-rate-limit-proxy/`：
+  proposal → design → specs → tasks），源自 issue `PsychQuant/claude-hot-limit#1`。
+
 ## 1.4.0
 
 - **feat（per-model 分桶 launch ledger）**：查證官方文檔（`platform.claude.com/docs/en/api/rate-limits`）

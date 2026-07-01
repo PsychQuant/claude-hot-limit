@@ -5,3 +5,5 @@ __pycache__/
 # session-local working state (Claude Code hooks/tools)
 .remember/
 .impeccable/
+.spectra/
+openspec/.vector-search.db*

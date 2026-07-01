@@ -29,12 +29,20 @@ claude-hot-limit · pacing-guard  (PreToolUse hook)
   CLAUDE_HOT_LIMIT_SLEEP_CAP=45 hook 內單次 sleep 上限（避免 hold 太久）
   CLAUDE_HOT_LIMIT_DATA=<dir>   覆寫帳本位置（預設 ~/.cache/claude-hot-limit；自訂或測試重導）
   CLAUDE_HOT_LIMIT_WORKFLOW_NUDGE=1  launch Workflow 時若近期撞過牆，注入寬度提醒（=0 關閉）
+  CLAUDE_HOT_LIMIT_RATE_STATE_MIN_REQUESTS=10    rate-state.jsonl 的 rl_requests_remaining
+                                                  低於此值視為熱（見下方 heat-aware nudge）
+  CLAUDE_HOT_LIMIT_RATE_STATE_MIN_TOKENS=2000    同上，rl_input_tokens_remaining /
+                                                  rl_output_tokens_remaining 任一低於此值視為熱
   檔案旗標 <data_dir>/disabled    存在即全域停用（比照 archive-first 慣例）
 
 heat-aware nudge（補盲區）:
   guard 只數主迴圈 Workflow/Agent 啟動，看不到 workflow 內部 spawn 的 subagent（runtime 管），
-  但那寬度才是燙 bucket 主因。折衷：launch Workflow 時讀 trips-raw.jsonl，WINDOW 內實際撞牆過
-  （90s 內多列收斂成 episode）就 systemMessage 提醒收斂並發。只提醒、不擋、冷時安靜、fail-open。
+  但那寬度才是燙 bucket 主因。折衷：launch Workflow 時優先讀 rate-limit-proxy（add-rate-limit-
+  proxy change）落地的 rate-state.jsonl——若存在且有 WINDOW 內近期快照，直接用真實 remaining
+  判斷熱度，取代（不是疊加）下面的啟發式。該檔案不存在 / 快照太舊（token bucket 會持續回填，
+  陳舊低 remaining 不能代表現在）/ 解析失敗，一律 fail-open fallback 到讀 trips-raw.jsonl，
+  WINDOW 內實際撞牆過（90s 內多列收斂成 episode）就 systemMessage 提醒收斂並發。只提醒、不擋、
+  冷時安靜、fail-open。
 """
 import sys
 import os
@@ -174,6 +182,88 @@ def recent_heat(data_dir, window, now):
         if cur - prev > 90:
             episodes += 1
     return episodes, int(now - hot_ts[-1])
+
+
+# rate-limit-proxy（add-rate-limit-proxy change）落地的帳號級真實狀態檔，跟 trips-raw.jsonl/
+# launches.jsonl 同一個資料夾。若存在，heat-aware nudge 優先信任它，取代 recent_heat() 的
+# launch-count/trips-raw 啟發式。sentinel 用來跟「有資料但確認冷」的 None 區分開來——兩者對
+# 呼叫端的意義完全不同（前者要 fallback，後者要保持安靜）。
+_RATE_STATE_UNAVAILABLE = object()
+
+
+def _read_last_rate_state_record(data_dir):
+    """讀 rate-limit-proxy 落地的 rate-state.jsonl，回傳最後一筆能成功解析的 record（dict）。
+
+    找不到檔案 / 整份解析不出任何一行（壞掉的 JSON、檔案被刪一半等）→ None，呼叫端視為
+    「無可用真實資料」fail-open fallback 回既有 trips-raw.jsonl 啟發式。個別壞行（例如並發
+    寫入切到一半的最後一行）安靜跳過，不影響前面已解析成功的行。
+    """
+    path = os.path.join(data_dir, "rate-state.jsonl")
+    last = None
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(obj, dict):
+                    last = obj
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+    return last
+
+
+def rate_state_heat(data_dir, window, now):
+    """讀 rate-state.jsonl 最後一筆真實 rate-limit 快照，判斷帳號 bucket 是否真的熱。
+
+    回傳三態:
+      - _RATE_STATE_UNAVAILABLE — 檔案不存在 / 整份解析失敗 / 最後一筆已超出 window（token
+        bucket 會持續回填，陳舊快照不能代表「現在」）。呼叫端應 fail-open fallback 到
+        recent_heat()（既有 trips-raw.jsonl 啟發式）。
+      - None — 有近期（window 內）且可解析的快照，且各 remaining 欄位都在門檻之上 → 真實資料
+        已經回答「不熱」，確認冷，不 nudge，也不需要再 fallback。
+      - str — 有近期快照且至少一個 remaining 欄位低於門檻 → 「熱」，內容是給人看的判斷依據。
+
+    門檻用絕對數量而非百分比：schema（見 proxy 的 rate-state.jsonl 格式）只有 remaining，沒有
+    total/limit 欄位，百分比無從算起；改採絕對值，比照本檔案其他參數皆為絕對值的慣例。
+    """
+    record = _read_last_rate_state_record(data_dir)
+    if record is None:
+        return _RATE_STATE_UNAVAILABLE
+
+    try:
+        ts = float(record.get("ts"))
+    except (TypeError, ValueError):
+        return _RATE_STATE_UNAVAILABLE
+    if now - ts > window:
+        return _RATE_STATE_UNAVAILABLE
+
+    min_requests = env_int("CLAUDE_HOT_LIMIT_RATE_STATE_MIN_REQUESTS", 10)
+    min_tokens = env_int("CLAUDE_HOT_LIMIT_RATE_STATE_MIN_TOKENS", 2000)
+    checks = (
+        ("rl_requests_remaining", "requests remaining", min_requests),
+        ("rl_input_tokens_remaining", "input tokens remaining", min_tokens),
+        ("rl_output_tokens_remaining", "output tokens remaining", min_tokens),
+    )
+    for field, label, threshold in checks:
+        val = record.get(field)
+        if val is None:
+            continue
+        try:
+            val = float(val)
+        except (TypeError, ValueError):
+            continue
+        if val < threshold:
+            return "{label}={val:g}（門檻 {threshold:g}）".format(
+                label=label, val=val, threshold=threshold)
+
+    return None
 
 
 def main():
@@ -318,15 +408,27 @@ def main():
     # 折衷：bucket 近期實際燙過（trip-recorder 有記）+ 這發又是 Workflow → 出聲提醒收斂並發。
     # 冷時完全安靜（訊號最純）；env CLAUDE_HOT_LIMIT_WORKFLOW_NUDGE=0 可關。fail-open。
     if tool_name == "Workflow" and os.environ.get("CLAUDE_HOT_LIMIT_WORKFLOW_NUDGE", "1") != "0":
-        heat = recent_heat(data_dir, window, now)
-        if heat:
-            episodes, since = heat
+        rs_heat = rate_state_heat(data_dir, window, now)
+        if rs_heat is _RATE_STATE_UNAVAILABLE:
+            # 沒有 rate-state.jsonl（未裝/未啟用 proxy）、或資料太舊/解析失敗 → fail-open
+            # fallback 回既有 trips-raw.jsonl 啟發式（行為與升級前完全一致）。
+            heat = recent_heat(data_dir, window, now)
+            if heat:
+                episodes, since = heat
+                messages.append(
+                    "[claude-hot-limit] ⚠️ 近 {m} 分鐘內偵測到 {n} 次撞牆（最近約 {s}s 前），bucket 還燙。"
+                    "這發 Workflow 若會寬 fan-out（內部並發 subagent），先收斂並發或改串行——"
+                    "workflow 內部 fan-out 不經過本 guard 計數，是 bucket 殺手。".format(
+                        m=window // 60, n=episodes, s=since)
+                )
+        elif rs_heat is not None:
+            # 有近期真實 rate-limit 快照且顯示偏低 → 優先信任這個，取代上面的啟發式。
             messages.append(
-                "[claude-hot-limit] ⚠️ 近 {m} 分鐘內偵測到 {n} 次撞牆（最近約 {s}s 前），bucket 還燙。"
+                "[claude-hot-limit] ⚠️ 真實 rate-limit 資料顯示帳號 bucket 偏低（{detail}），還燙。"
                 "這發 Workflow 若會寬 fan-out（內部並發 subagent），先收斂並發或改串行——"
-                "workflow 內部 fan-out 不經過本 guard 計數，是 bucket 殺手。".format(
-                    m=window // 60, n=episodes, s=since)
+                "workflow 內部 fan-out 不經過本 guard 計數，是 bucket 殺手。".format(detail=rs_heat)
             )
+        # else: rs_heat is None → 有近期真實資料且各欄位都健康，確認冷，保持安靜（不 fallback）。
 
     if messages:
         allow_with_message("\n".join(messages))

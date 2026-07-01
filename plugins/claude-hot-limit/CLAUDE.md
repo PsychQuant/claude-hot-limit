@@ -13,6 +13,7 @@ acceleration-limit / short-burst 節流（429 / 529）。
 |------|------|------|
 | pacing-guard hook | `hooks/pacing-guard.py` + `hooks/hooks.json` | PreToolUse 執行期硬擋（deny / sleep）+ Workflow 寬度 heat-aware 提醒 |
 | trip-recorder hook | `hooks/trip-recorder.py` + `hooks/hooks.json` | StopFailure（matcher `.*`，腳本側過濾）撞牆自動記錄 trip → calibration-log.md + trips-raw.jsonl |
+| rate-limit-proxy | `proxy/rate-limit-proxy.py` | 本地 HTTP reverse proxy（**Phase 1，純觀測**）：經 `ANTHROPIC_BASE_URL` 導流，transparent forwarding（含 streaming）+ 擷取真實 rate-limit header 與 token usage 寫入 `rate-state.jsonl` |
 | pacing-playbook skill | `skills/pacing-playbook/SKILL.md` | 設計期反 burst 引導 |
 
 ## Hook 設計重點
@@ -43,3 +44,21 @@ acceleration-limit / short-burst 節流（429 / 529）。
 
 不繞 server-side 節流、不管 main-loop 自己的 API 節奏；只管**你發出的 fan-out 啟動節奏**
 （acceleration-limit 的觸發源）。
+
+## Proxy 誠實邊界（Phase 1）
+
+`rate-limit-proxy.py` 是獨立於上述 hook 之外的新元件，執行模型也不同（常駐 daemon vs. 每次
+tool call 才 spawn 的短命 subprocess）。上面「誠實邊界」段落描述的是既有 hook
+（pacing-guard.py/trip-recorder.py）的邊界，對 hook 本身仍然完全準確、不受這次新增影響——
+proxy 是額外並存的附加層，不取代、不修改既有 hook 的行為或邊界。
+
+本次變更範疇鎖定 **Phase 1（純觀測）**：
+
+- 只做 transparent forwarding（逐位元組原樣轉發，含 streaming）+ 擷取真實 rate-limit header
+  與 token usage，寫入 `~/.cache/claude-hot-limit/rate-state.jsonl`。
+- **明確排除 Phase 2 主動排程**（依真實 budget 主動 delay / 佇列 / 擋下請求）——風險（死鎖、
+  不公平排程）明顯更高，且要先靠 Phase 1 資料驗證「真實 header 可見度」本身有沒有用，留待
+  另開 change 處理，不在本次範疇內。
+- 只看得到經過它的流量，**不保證帳號級「絕對不撞牆」**——同一帳號若透過 claude.ai 網頁版
+  或其他工具直接呼叫 API，那些流量完全不在 proxy 視野內。
+- 不做 API key 管理/輪替，單純原樣轉發 Claude Code 已經在用的憑證。

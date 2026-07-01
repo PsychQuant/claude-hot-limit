@@ -238,6 +238,109 @@ class WorkflowNudgeTest(unittest.TestCase):
         self.assertEqual(raw, "", "NUDGE=0 應關閉提醒，stdout=%r" % raw)
 
 
+class RateStateHeatNudgeTest(unittest.TestCase):
+    """add-rate-limit-proxy task 3.2：heat-aware nudge 優先信任 rate-limit-proxy 落地的
+    rate-state.jsonl（若存在且有 WINDOW 內近期快照）判斷真實 bucket 熱度，取代（不是疊加）
+    trips-raw.jsonl 啟發式；該檔案不存在 / 太舊 / 解析失敗 → fail-open fallback 回既有邏輯。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.data = os.path.join(self.tmp.name, "ledger")
+        os.makedirs(self.data, exist_ok=True)
+        self.env = {
+            "CLAUDE_HOT_LIMIT_DATA": self.data,
+            "CLAUDE_HOT_LIMIT_MAX": "999",
+            "CLAUDE_HOT_LIMIT_MIN_GAP": "0",
+            "CLAUDE_HOT_LIMIT_WINDOW": "600",
+        }
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def fire(self, tool="Workflow", extra=None):
+        return run_hook(tool=tool, env_overrides=dict(self.env, **(extra or {})))
+
+    def seed_rate_state(self, age=5, **fields):
+        row = {
+            "ts": time.time() - age,
+            "rl_requests_remaining": None, "rl_requests_reset": None,
+            "rl_input_tokens_remaining": None, "rl_input_tokens_reset": None,
+            "rl_output_tokens_remaining": None, "rl_output_tokens_reset": None,
+            "usage": None,
+        }
+        row.update(fields)
+        with open(os.path.join(self.data, "rate-state.jsonl"), "a") as f:
+            f.write(json.dumps(row) + "\n")
+
+    def seed_hot_trip(self, age=5):
+        with open(os.path.join(self.data, "trips-raw.jsonl"), "a") as f:
+            f.write(json.dumps({"recorded_at": time.time() - age,
+                                "payload": {"error": "rate_limit"}}) + "\n")
+
+    def test_nudges_when_rate_state_shows_low_requests_remaining(self):
+        self.seed_rate_state(age=5, rl_requests_remaining=2)
+        _, parsed, raw = self.fire(extra={"CLAUDE_HOT_LIMIT_RATE_STATE_MIN_REQUESTS": "10"})
+        self.assertFalse(is_deny(parsed), "nudge 只提醒、絕不 deny，stdout=%r" % raw)
+        self.assertIsNotNone(parsed, "真實資料顯示 requests 偏低應出聲，stdout=%r" % raw)
+        self.assertIn("systemMessage", parsed, "應走 systemMessage，stdout=%r" % raw)
+        self.assertIn("fan-out", parsed["systemMessage"],
+                      "提醒仍應點名 fan-out 寬度，msg=%r" % parsed.get("systemMessage"))
+        self.assertIn("requests remaining", parsed["systemMessage"],
+                      "應點名是 requests 桶偏低，msg=%r" % parsed.get("systemMessage"))
+
+    def test_nudges_when_rate_state_shows_low_token_remaining(self):
+        # 涵蓋三個欄位的「或」語意：input tokens 偏低也該觸發，不只 requests
+        self.seed_rate_state(age=5, rl_requests_remaining=500, rl_input_tokens_remaining=100)
+        _, parsed, raw = self.fire(extra={"CLAUDE_HOT_LIMIT_RATE_STATE_MIN_REQUESTS": "10",
+                                          "CLAUDE_HOT_LIMIT_RATE_STATE_MIN_TOKENS": "2000"})
+        self.assertIsNotNone(parsed, "真實資料顯示 input tokens 偏低應出聲，stdout=%r" % raw)
+        self.assertIn("input tokens remaining", parsed["systemMessage"],
+                      "應點名是 input tokens 桶偏低，msg=%r" % parsed.get("systemMessage"))
+
+    def test_healthy_rate_state_suppresses_nudge_even_if_trips_raw_hot(self):
+        # 核心：rate-state.jsonl 存在時「取代」trips-raw 啟發式，不是「疊加」——即使舊邏輯會
+        # 因為近期 trip 判熱，真實資料顯示 budget 充足時，仍應保持安靜。
+        self.seed_hot_trip(age=5)
+        self.seed_rate_state(age=5, rl_requests_remaining=500,
+                              rl_input_tokens_remaining=50000, rl_output_tokens_remaining=50000)
+        _, parsed, raw = self.fire(extra={"CLAUDE_HOT_LIMIT_RATE_STATE_MIN_REQUESTS": "10",
+                                          "CLAUDE_HOT_LIMIT_RATE_STATE_MIN_TOKENS": "2000"})
+        self.assertEqual(raw, "",
+                          "真實資料確認 budget 充足時應保持安靜，即使 trips-raw 有近期撞牆，stdout=%r" % raw)
+
+    def test_falls_back_to_trips_raw_when_rate_state_file_absent(self):
+        # 沒有 rate-state.jsonl → 應沿用既有 trips-raw.jsonl 邏輯（回歸安全網，行為不可變）
+        self.seed_hot_trip(age=5)
+        _, parsed, raw = self.fire()
+        self.assertIsNotNone(parsed, "無 rate-state.jsonl 時應 fallback 到 trips-raw 邏輯，stdout=%r" % raw)
+        self.assertIn("撞牆", parsed["systemMessage"],
+                      "fallback 應該是既有 trips-raw 訊息措辭，msg=%r" % parsed.get("systemMessage"))
+
+    def test_falls_back_when_rate_state_file_corrupt(self):
+        # rate-state.jsonl 存在但整份都壞掉 → fail-open：不能讓 hook 掛掉或誤判，安靜 fallback
+        with open(os.path.join(self.data, "rate-state.jsonl"), "w") as f:
+            f.write("{not valid json\n")
+            f.write("also not valid\n")
+        self.seed_hot_trip(age=5)
+        _, parsed, raw = self.fire()
+        self.assertIsNotNone(parsed, "rate-state.jsonl 全毀應安靜 fallback 到 trips-raw，stdout=%r" % raw)
+        self.assertIn("撞牆", parsed["systemMessage"], "msg=%r" % parsed.get("systemMessage"))
+
+    def test_falls_back_when_rate_state_record_stale(self):
+        # 最後一筆 rate-state 遠超過 window → token bucket 可能早已回填，陳舊快照不可信 → fallback
+        self.seed_rate_state(age=9999, rl_requests_remaining=1)
+        self.seed_hot_trip(age=5)
+        _, parsed, raw = self.fire(extra={"CLAUDE_HOT_LIMIT_RATE_STATE_MIN_REQUESTS": "10"})
+        self.assertIsNotNone(parsed, "陳舊 rate-state 快照不可信，應 fallback 到 trips-raw，stdout=%r" % raw)
+        self.assertIn("撞牆", parsed["systemMessage"], "msg=%r" % parsed.get("systemMessage"))
+
+    def test_agent_not_nudged_even_with_hot_rate_state(self):
+        # 單一 Agent 是寬度 1、非病灶 → 即使 rate-state 顯示真實 budget 偏低也不 nudge
+        self.seed_rate_state(age=5, rl_requests_remaining=1)
+        _, parsed, raw = self.fire(tool="Agent", extra={"CLAUDE_HOT_LIMIT_RATE_STATE_MIN_REQUESTS": "10"})
+        self.assertEqual(raw, "", "Agent 不該觸發 workflow 寬度提醒，stdout=%r" % raw)
+
+
 class PerModelLedgerTest(unittest.TestCase):
     """v1.4.0：ledger 按 model 分桶記錄與計數。官方文檔證實 Opus / Sonnet 5 / Sonnet 4.x /
     Haiku 是各自獨立的 rate-limit 桶（Sonnet 5 明文獨立於 Sonnet 4.x 之外），共用同一個 burst
