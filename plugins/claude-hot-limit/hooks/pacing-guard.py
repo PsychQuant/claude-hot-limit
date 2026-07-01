@@ -89,13 +89,19 @@ def file_override_int(data_dir, filename, env_name, default):
 
     為什麼要檔案這層：env var 改動對已在跑的 session 不會 hot-reload（實測驗證，需重開
     session）；檔案跟既有 disabled 旗標一樣每次 hook 執行都重新讀磁碟，`echo 5 > 檔案`
-    立即對所有並發 session 生效。檔案不存在 / 內容無法解析 → fail-open fallback env var。
+    立即對所有並發 session 生效。檔案不存在 → 靜默 fallback（正常情況）；內容無法解析 →
+    fallback 並在 stderr 警告（re-verify finding 10：靜默會讓使用者以為保護已開）。
+    讀取有界（64 bytes，比照 _TRANSCRIPT_TAIL_BYTES 的 bounded-read 紀律，finding 5）。
     """
     try:
         with open(os.path.join(data_dir, filename)) as f:
-            return int(f.read().strip())
-    except (FileNotFoundError, ValueError):
-        pass
+            return int(f.read(64).strip())
+    except FileNotFoundError:
+        pass  # 無 override 檔 = 正常情況，靜默
+    except ValueError:
+        print("[claude-hot-limit] WARNING: %s 內容無法解析為整數，fallback 到 %s/預設值——"
+              "若你以為已用該檔案切換模式，請檢查檔案內容" % (filename, env_name),
+              file=sys.stderr)
     except Exception:
         pass  # 權限錯誤等其他異常一律 fail-open，不讓參數讀取癱瘓 hook
     return env_int(env_name, default)
@@ -343,15 +349,16 @@ def main():
     except Exception:
         allow_silent()
 
+    # 檔案旗標停用——必須在 override 檔讀取「之前」（re-verify finding 4）：
+    # 若 override 檔是 FIFO / 卡死的掛載點，open() 會 block，disabled 旗標要能先救援。
+    if os.path.exists(os.path.join(data_dir, "disabled")):
+        allow_silent()
+
     # --- MAX / MIN_GAP：檔案旗標優先（#3，需要 data_dir 已解析，故在此讀）---
     # `echo 5 > <data_dir>/max-override` 立即對所有並發 session 生效，不必重開；
     # 刪掉檔案即回到 env var / code default。
     max_in_window = file_override_int(data_dir, "max-override", "CLAUDE_HOT_LIMIT_MAX", 3)
     min_gap = file_override_int(data_dir, "min-gap-override", "CLAUDE_HOT_LIMIT_MIN_GAP", 20)
-
-    # 檔案旗標停用
-    if os.path.exists(os.path.join(data_dir, "disabled")):
-        allow_silent()
 
     ledger = os.path.join(data_dir, "launches.jsonl")
     lockpath = os.path.join(data_dir, ".lock")
@@ -407,25 +414,37 @@ def main():
             # 空 entries 防禦（verify 叢集 C）：MAX ≤ 0（env 或 max-override 皆可能）時
             # count(0) >= max(0) 直接進到這裡，entries 是空的——「0 = 全擋」是合理的使用者
             # 意圖，給正常 deny（wait 用整個 window），不可 IndexError crash。
-            if entries:
-                oldest = entries[0]["ts"]
-                wait = int(window - (now - oldest)) + 1
-            else:
-                wait = window
             reason = (
                 "[claude-hot-limit] BURST GUARD — 最近 {m} 分鐘內【{model}】已 launch {c} 個 fan-out"
                 "（上限 {mx}）。這就是 Anthropic acceleration-limit 的觸發條件"
                 "（'sharp increase in usage'），再 launch 極可能撞 429/529 全滅。"
             ).format(m=window // 60, model=model, c=count, mx=max_in_window)
-            context = (
-                "怎麼辦（擇一）:\n"
-                "  1. 改串行 — 一次一個、靠 idempotent guard 跨窗口慢慢清"
-                "（最穩，結構上不會 burst）。\n"
-                "  2. 等約 {w}s 讓 rolling window 滾掉最舊一筆再 launch。\n"
-                "  3. 確定要強制這一發：export CLAUDE_HOT_LIMIT_OFF=1 或 "
-                "touch {f}（記得事後移除）。\n"
-                "官方藥方是 ramp gradually + consistent pattern，不是再開更多。"
-            ).format(w=wait, f=os.path.join(data_dir, "disabled"))
+            if max_in_window <= 0:
+                # MAX ≤ 0 = 使用者刻意全面凍結（re-verify finding 11）：等待永遠沒用，
+                # 給正確的解除指引而不是誤導的「等 Xs」。
+                context = (
+                    "目前 MAX ≤ 0 = fan-out 全面凍結（max-override 或 env 設定）。\n"
+                    "解除方式（擇一）:\n"
+                    "  1. 調高/移除 {mo}（rm 該檔回到 env var / 預設值）。\n"
+                    "  2. 確定要強制這一發：export CLAUDE_HOT_LIMIT_OFF=1 或 "
+                    "touch {f}（記得事後移除）。"
+                ).format(mo=os.path.join(data_dir, "max-override"),
+                         f=os.path.join(data_dir, "disabled"))
+            else:
+                if entries:
+                    oldest = entries[0]["ts"]
+                    wait = int(window - (now - oldest)) + 1
+                else:
+                    wait = window
+                context = (
+                    "怎麼辦（擇一）:\n"
+                    "  1. 改串行 — 一次一個、靠 idempotent guard 跨窗口慢慢清"
+                    "（最穩，結構上不會 burst）。\n"
+                    "  2. 等約 {w}s 讓 rolling window 滾掉最舊一筆再 launch。\n"
+                    "  3. 確定要強制這一發：export CLAUDE_HOT_LIMIT_OFF=1 或 "
+                    "touch {f}（記得事後移除）。\n"
+                    "官方藥方是 ramp gradually + consistent pattern，不是再開更多。"
+                ).format(w=wait, f=os.path.join(data_dir, "disabled"))
             deny(reason, context)
 
         # --- 記錄本次啟動（含 model / effort）---

@@ -609,6 +609,41 @@ class FileOverrideTest(unittest.TestCase):
         self.assertEqual(code, 0, "負值不該 crash，stdout=%r" % raw)
         self.assertTrue(is_deny(parsed), "負值視同全擋，stdout=%r" % raw)
 
+    def test_disabled_flag_rescues_before_override_reads(self):
+        # Re-verify finding 4：disabled kill-switch 必須在 override 檔讀取「之前」檢查——
+        # 若 max-override 是 FIFO（無 writer 的 open 會永久 block），disabled 旗標應仍能救援。
+        os.mkfifo(os.path.join(self.data, "max-override"))
+        open(os.path.join(self.data, "disabled"), "w").close()
+        code, parsed, raw = self.fire()  # run_hook timeout=30：舊版會 block 到 timeout
+        self.assertEqual(code, 0, "disabled 應在 override 讀取前生效，stdout=%r" % raw)
+        self.assertEqual(raw, "", "disabled 生效 = 靜默放行")
+
+    def test_unparseable_override_warns_on_stderr(self):
+        # Re-verify finding 10：壞內容靜默 fallback 會讓使用者以為保護已開。應在 stderr 警告。
+        self.write_override("max-override", "not a number\n")
+        proc = subprocess.run(
+            [sys.executable, HOOK],
+            input=json.dumps({"tool_name": "Workflow", "tool_input": {}}),
+            capture_output=True, text=True,
+            env={**{k: v for k, v in os.environ.items()
+                    if not k.startswith("CLAUDE_HOT_LIMIT_") and k != "CLAUDE_PLUGIN_DATA"},
+                 "CLAUDE_HOT_LIMIT_DATA": self.data, "CLAUDE_HOT_LIMIT_MIN_GAP": "0"},
+            timeout=30,
+        )
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("max-override", proc.stderr,
+                      "壞內容 fallback 應在 stderr 警告點名檔案，stderr=%r" % proc.stderr)
+
+    def test_max_zero_deny_message_says_freeze_not_wait(self):
+        # Re-verify finding 11：MAX ≤ 0 時 deny 訊息不該建議「等 ~600s」（等再久也沒用），
+        # 應說明這是全面凍結、指向移除/調高 override。
+        self.write_override("max-override", "0")
+        _, parsed, raw = self.fire()
+        self.assertTrue(is_deny(parsed), "stdout=%r" % raw)
+        context = parsed["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("凍結", context, "MAX≤0 應說明全面凍結，context=%r" % context)
+        self.assertNotIn("等約", context, "不該給無效的等待建議，context=%r" % context)
+
     def test_min_gap_override_file_works(self):
         # min-gap-override=2 蓋過 env MIN_GAP=0 → 第 2 發應 sleep 並回報 systemMessage
         self.write_override("min-gap-override", "2")
