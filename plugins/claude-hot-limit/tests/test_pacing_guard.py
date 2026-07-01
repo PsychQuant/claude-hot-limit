@@ -552,6 +552,21 @@ class FileOverrideTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(is_deny(parsed), "壞內容應 fallback env MAX=1：第 2 發被擋，stdout=%r" % raw)
 
+    def test_max_override_zero_denies_without_crash(self):
+        # Verify 叢集 C（logic lens exact repro）：max-override=0 + 空帳本 →
+        # count(0) >= max(0) 進 deny 分支，舊版對空 entries 取 entries[0] 拋 IndexError（exit 1）。
+        # 「0 = 全擋」是合理的使用者意圖 → 應給正常 deny，不是 crash。
+        self.write_override("max-override", "0")
+        code, parsed, raw = self.fire()
+        self.assertEqual(code, 0, "max-override=0 不該讓 hook crash，stdout=%r" % raw)
+        self.assertTrue(is_deny(parsed), "0 = 全擋，第 1 發就該被正常 deny，stdout=%r" % raw)
+
+    def test_max_override_negative_denies_without_crash(self):
+        self.write_override("max-override", "-5")
+        code, parsed, raw = self.fire()
+        self.assertEqual(code, 0, "負值不該 crash，stdout=%r" % raw)
+        self.assertTrue(is_deny(parsed), "負值視同全擋，stdout=%r" % raw)
+
     def test_min_gap_override_file_works(self):
         # min-gap-override=2 蓋過 env MIN_GAP=0 → 第 2 發應 sleep 並回報 systemMessage
         self.write_override("min-gap-override", "2")

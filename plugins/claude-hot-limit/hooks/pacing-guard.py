@@ -397,8 +397,14 @@ def main():
 
         # --- burst rule → 擋（不記錄被擋的這發）---
         if count >= max_in_window:
-            oldest = entries[0]["ts"]
-            wait = int(window - (now - oldest)) + 1
+            # 空 entries 防禦（verify 叢集 C）：MAX ≤ 0（env 或 max-override 皆可能）時
+            # count(0) >= max(0) 直接進到這裡，entries 是空的——「0 = 全擋」是合理的使用者
+            # 意圖，給正常 deny（wait 用整個 window），不可 IndexError crash。
+            if entries:
+                oldest = entries[0]["ts"]
+                wait = int(window - (now - oldest)) + 1
+            else:
+                wait = window
             reason = (
                 "[claude-hot-limit] BURST GUARD — 最近 {m} 分鐘內【{model}】已 launch {c} 個 fan-out"
                 "（上限 {mx}）。這就是 Anthropic acceleration-limit 的觸發條件"
