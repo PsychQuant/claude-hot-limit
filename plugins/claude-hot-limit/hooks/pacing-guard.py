@@ -81,6 +81,57 @@ _BENIGN_ERRORS = {
 }
 
 
+# tail read 上限（bytes）：只掃 transcript 結尾，避免大逐字稿拖慢 hook。真實 assistant turn
+# 密度下，這個範圍幾乎必定含最後一輪；找不到就是 fail-open → "unknown"，不會硬撐去掃全檔。
+_TRANSCRIPT_TAIL_BYTES = 200_000
+
+
+def detect_model(transcript_path):
+    """讀 transcript 結尾，找最後一筆真實（非 <synthetic>）assistant turn 的 model。
+
+    PreToolUse payload 本身沒有 model 欄位（官方文檔證實），但 transcript_path 有——且讀
+    transcript 是「即時值」：使用者中途 /model 切換會直接反映在下一筆 assistant turn，不像
+    SessionStart 快照那樣一經切換就過期（且沒有任何 hook 會在 /model 切換時觸發）。
+
+    找不到 / 讀檔失敗 → None（呼叫端轉成 "unknown"，fail-open，絕不因此擋你）。
+    """
+    if not transcript_path:
+        return None
+    try:
+        size = os.path.getsize(transcript_path)
+        with open(transcript_path, "rb") as f:
+            if size > _TRANSCRIPT_TAIL_BYTES:
+                f.seek(size - _TRANSCRIPT_TAIL_BYTES)
+            text = f.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue  # tail seek 可能切到半行 JSON；跳過，繼續往前找完整行
+        if o.get("type") != "assistant":
+            continue
+        model = (o.get("message") or {}).get("model")
+        if model and model != "<synthetic>":
+            return model
+    return None
+
+
+def detect_effort(payload):
+    """從 payload 頂層 effort.level 讀取（已存在的欄位，零額外 I/O）。缺欄位 → "unknown"。"""
+    effort = payload.get("effort")
+    if isinstance(effort, dict):
+        level = effort.get("level")
+        if level:
+            return str(level)
+    return "unknown"
+
+
 def recent_heat(data_dir, window, now):
     """讀 trip-recorder 落地的 trips-raw.jsonl，回傳 window 內「撞牆 episode」資訊。
 
@@ -168,6 +219,12 @@ def main():
     now = time.time()
     since_last = None
 
+    # --- model / effort（按 model 分桶計數的關鍵：Opus / Sonnet 5 / Sonnet 4.x / Haiku 是官方
+    # 證實的獨立 rate-limit 桶，共用一個 burst 計數器會誤報。effort 只是同一桶內的消耗權重，
+    # 不分桶，純附掛記錄）---
+    model = detect_model(payload.get("transcript_path")) or "unknown"
+    effort = detect_effort(payload)
+
     # --- critical section（flock 序列化並發 hook 行程）---
     lockf = None
     try:
@@ -187,10 +244,16 @@ def main():
                         continue
                     try:
                         e = json.loads(line)
-                        if now - float(e.get("ts", 0)) <= window:
-                            entries.append(e)
                     except Exception:
                         continue
+                    if now - float(e.get("ts", 0)) > window:
+                        continue
+                    # 分桶過濾：只算「同一個 model」的列。缺 model key（升級前寫入的舊格式列）
+                    # 一律保守計入任何 model 的窗口——寧可多算、也不要改版後頭 WINDOW 秒漏算真實 burst。
+                    e_model = e.get("model")
+                    if e_model is not None and e_model != model:
+                        continue
+                    entries.append(e)
         except FileNotFoundError:
             pass
 
@@ -204,10 +267,10 @@ def main():
             oldest = entries[0]["ts"]
             wait = int(window - (now - oldest)) + 1
             reason = (
-                "[claude-hot-limit] BURST GUARD — 最近 {m} 分鐘內已 launch {c} 個 fan-out"
+                "[claude-hot-limit] BURST GUARD — 最近 {m} 分鐘內【{model}】已 launch {c} 個 fan-out"
                 "（上限 {mx}）。這就是 Anthropic acceleration-limit 的觸發條件"
                 "（'sharp increase in usage'），再 launch 極可能撞 429/529 全滅。"
-            ).format(m=window // 60, c=count, mx=max_in_window)
+            ).format(m=window // 60, model=model, c=count, mx=max_in_window)
             context = (
                 "怎麼辦（擇一）:\n"
                 "  1. 改串行 — 一次一個、靠 idempotent guard 跨窗口慢慢清"
@@ -219,10 +282,10 @@ def main():
             ).format(w=wait, f=os.path.join(data_dir, "disabled"))
             deny(reason, context)
 
-        # --- 記錄本次啟動 ---
+        # --- 記錄本次啟動（含 model / effort）---
         try:
             with open(ledger, "a") as f:
-                f.write(json.dumps({"ts": now, "tool": tool_name}) + "\n")
+                f.write(json.dumps({"ts": now, "tool": tool_name, "model": model, "effort": effort}) + "\n")
         except Exception:
             pass
     finally:

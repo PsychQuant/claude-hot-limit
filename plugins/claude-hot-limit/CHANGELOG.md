@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.4.0
+
+- **feat（per-model 分桶 launch ledger）**：查證官方文檔（`platform.claude.com/docs/en/api/rate-limits`）
+  確認 **rate limit 是逐模型獨立的桶**——Opus 4.x 一組合併桶、Sonnet 4.x 另一組合併桶，**Sonnet 5
+  明文獨立於 Sonnet 4.x 之外**。先前 `launches.jsonl` 把所有 model 的 launch 混在同一個計數器裡，
+  跨模型切換（如 Opus → Sonnet 5）時會誤報「燙」或「冷」。
+- PreToolUse payload 本身不含 `model` 欄位（官方 hooks 文檔證實，只有 SessionStart 可能有、且不保證
+  存在，也**沒有任何 hook 會在 `/model` 切換時觸發**，SessionStart 快照會在使用者中途切模型後直接
+  過期）。改為讀 `transcript_path` **結尾**（bounded tail read，預設 200KB，不掃全檔）找最後一筆
+  真實 assistant turn 的 `message.model`（跳過 `<synthetic>` 佔位列）——這是即時值，正確反映中途
+  `/model` 切換。讀不到 → `"unknown"`，fail-open。
+- **feat（記錄 effort）**：`effort` 直接讀 payload 頂層既有欄位（零額外 I/O）。effort 不是獨立
+  rate-limit 桶（只是同一 model 桶內的 OTPM 消耗權重），純附掛診斷欄位，不參與分桶。
+- `launches.jsonl` 每列新增 `model`/`effort` 兩欄；burst 計數（MAX/WINDOW）與 min-gap 現在**只看
+  同一 model 的窗口**，不同 model 的連發互不相剋。升級前寫入的舊格式列（無 `model` key）保守計入
+  任何 model 的窗口（避免改版後頭 WINDOW 秒漏算真實 burst）。deny 訊息點名是哪個 model 的桶燙了。
+- **範圍**：`trips-raw.jsonl` / heat-aware nudge 本輪未拆（trip-recorder 要做一樣的事需單獨補上
+  transcript-tail 偵測，留待下次，避免範圍蔓延）。
+- **test**：pacing-guard +8（model 偵測記錄 / synthetic 跳過 / transcript 缺失 fail-open / effort
+  記錄與預設 / 兩 model 各自獨立 burst / 舊格式列保守計入 / deny 訊息點名 model）。全套 **31 tests 綠**。
+
 ## 1.3.0
 
 - **fix（trip-recorder 讀錯欄位）**：實測 131 筆真實 StopFailure payload，型別欄位叫 **`error`**
