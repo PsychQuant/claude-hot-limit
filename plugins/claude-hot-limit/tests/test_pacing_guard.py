@@ -645,12 +645,16 @@ class FileOverrideTest(unittest.TestCase):
         self.assertNotIn("等約", context, "不該給無效的等待建議，context=%r" % context)
 
     def test_min_gap_override_file_works(self):
-        # min-gap-override=2 蓋過 env MIN_GAP=0 → 第 2 發應 sleep 並回報 systemMessage
-        self.write_override("min-gap-override", "2")
-        _, parsed, _ = self.fire(extra={"CLAUDE_HOT_LIMIT_MAX": "10"})
+        # min-gap-override=60 蓋過 env MIN_GAP=0 → 距上一發太近應 sleep 並回報 systemMessage。
+        # 確定性化（re-verify findings 6/15）：直接 seed 帳本一筆剛剛的 launch，不靠兩次
+        # subprocess 的 wall-clock 間隔 < 2s（慢 CI 會 flaky）；SLEEP_CAP=1 讓測試只睡 1 秒。
+        self.write_override("min-gap-override", "60")
+        with open(os.path.join(self.data, "launches.jsonl"), "w") as f:
+            f.write(json.dumps({"ts": time.time() - 0.1, "tool": "Workflow"}) + "\n")
+        _, parsed, raw = self.fire(extra={"CLAUDE_HOT_LIMIT_MAX": "10",
+                                           "CLAUDE_HOT_LIMIT_SLEEP_CAP": "1"})
         self.assertFalse(is_deny(parsed))
-        _, parsed, raw = self.fire(extra={"CLAUDE_HOT_LIMIT_MAX": "10"})
-        self.assertIsNotNone(parsed, "min-gap-override 生效時第 2 發應有 sleep 回報，stdout=%r" % raw)
+        self.assertIsNotNone(parsed, "min-gap-override 生效時應有 sleep 回報，stdout=%r" % raw)
         self.assertIn("systemMessage", parsed, "應回報已間隔，stdout=%r" % raw)
 
 
