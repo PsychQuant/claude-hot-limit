@@ -194,6 +194,8 @@ def recent_heat(data_dir, window, now, model=None):
                     o = json.loads(line)
                 except Exception:
                     continue
+                if not isinstance(o, dict):
+                    continue  # 一行壞資料（合法 JSON 非 dict）只跳過該行，不讓外層 except 靜默全部 nudge（finding 9）
                 ts = float(o.get("recorded_at", 0) or 0)
                 if now - ts > window:
                     continue
@@ -310,6 +312,11 @@ def main():
     try:
         payload = json.load(sys.stdin)
     except Exception:
+        allow_silent()
+
+    # 合法 JSON 但非 dict（如 [1,2,3]）→ fail-open 靜默放行（re-verify finding 8：
+    # 叢集 B 的威脅模型兩個 hook 都要防，不能只修 trip-recorder 一邊）。
+    if not isinstance(payload, dict):
         allow_silent()
 
     tool_name = payload.get("tool_name", "")

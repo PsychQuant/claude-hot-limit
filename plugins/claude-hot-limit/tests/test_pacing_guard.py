@@ -159,6 +159,19 @@ class GuardBehaviorTest(unittest.TestCase):
         self.assertIsNotNone(parsed, "第 2 發應有 systemMessage（min-gap sleep），stdout=%r" % raw)
         self.assertIn("systemMessage", parsed, "min-gap 應回報已間隔，stdout=%r" % raw)
 
+    def test_non_dict_json_stdin_fails_open(self):
+        # Re-verify finding 8（DA 重現）：合法 JSON 但非 dict 的 stdin（[1,2,3]）
+        # 舊版在 payload.get 拋 AttributeError（exit 1）。叢集 B 的威脅模型兩個 hook 都要防。
+        proc = subprocess.run(
+            [sys.executable, HOOK], input="[1, 2, 3]",
+            capture_output=True, text=True,
+            env={k: v for k, v in os.environ.items()
+                 if not k.startswith("CLAUDE_HOT_LIMIT_") and k != "CLAUDE_PLUGIN_DATA"},
+            timeout=30,
+        )
+        self.assertEqual(proc.returncode, 0, "非 dict payload 應 fail-open，stderr=%r" % proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "", "應靜默放行")
+
     def test_malformed_stdin_fails_open(self):
         # fail-open：壞 stdin 不應癱瘓，靜默放行
         proc = subprocess.run(
@@ -387,6 +400,24 @@ class PerModelLedgerTest(unittest.TestCase):
         row = last_ledger_row(self.data)
         self.assertEqual(row.get("model"), "unknown", "row=%r" % row)
 
+    def test_adversarial_transcript_does_not_crash_guard(self):
+        # Re-verify finding 7：guard 側 detect_model 的非 dict 防禦（叢集 B 同步修）此前零測試
+        # 覆蓋——副本漂移會讓整個 guard 靜默失效（crash = exit 1 = 非阻擋 = 不 deny 也不記帳）。
+        # 本測試把防禦釘住：壞行（bare 數字、非 dict message）混在真實行中，guard 照常運作。
+        tp = os.path.join(self.tmp.name, "adversarial.jsonl")
+        with open(tp, "w") as f:
+            f.write(json.dumps({"type": "assistant", "message": {"model": "claude-sonnet-5"}}) + "\n")
+            f.write("12345\n")  # 合法 JSON、非 dict
+            f.write(json.dumps({"type": "assistant", "message": "plain string"}) + "\n")
+        payload = {"tool_name": "Workflow", "tool_input": {}, "transcript_path": tp}
+        code, parsed, raw = run_hook(
+            tool="Workflow", env_overrides=dict(self.env, CLAUDE_HOT_LIMIT_MAX="10"), payload=payload)
+        self.assertEqual(code, 0, "adversarial transcript 不該讓 guard crash，stdout=%r" % raw)
+        self.assertFalse(is_deny(parsed))
+        row = last_ledger_row(self.data)
+        self.assertEqual(row.get("model"), "claude-sonnet-5",
+                          "應跳過壞行、往前找到真實 model，row=%r" % row)
+
     def test_effort_captured_from_payload(self):
         _, parsed, raw = self.fire_with_model(
             ["claude-sonnet-5"], extra={"CLAUDE_HOT_LIMIT_MAX": "10"}, effort="xhigh")
@@ -483,6 +514,17 @@ class PerModelHeatNudgeTest(unittest.TestCase):
         self.seed_trip(model=None, age=5)  # 舊格式列
         _, parsed, raw = self.fire_workflow_as("claude-opus-4-8")
         self.assertIsNotNone(parsed, "舊格式列應保守計入任何 model，stdout=%r" % raw)
+        self.assertIn("systemMessage", parsed)
+
+    def test_corrupt_line_in_trips_does_not_silence_nudge(self):
+        # Re-verify finding 9：trips-raw.jsonl 內一行合法但非 dict 的 JSON（如 12345）
+        # 舊版在 o.get() 拋 AttributeError 被外層 except 吞掉 → return None → 所有 nudge 靜默。
+        # 正確行為：跳過壞行，其餘近期 trip 照常觸發 nudge。
+        with open(os.path.join(self.data, "trips-raw.jsonl"), "a") as f:
+            f.write("12345\n")  # 壞行（合法 JSON、非 dict）
+        self.seed_trip(model="claude-opus-4-8", age=5)
+        _, parsed, raw = self.fire_workflow_as("claude-opus-4-8")
+        self.assertIsNotNone(parsed, "一行壞資料不該靜默全部 nudge，stdout=%r" % raw)
         self.assertIn("systemMessage", parsed)
 
     def test_launch_side_unknown_still_nudges(self):
