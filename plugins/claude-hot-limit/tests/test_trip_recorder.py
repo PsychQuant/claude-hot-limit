@@ -236,6 +236,19 @@ class PerModelTripRecordTest(unittest.TestCase):
         rows = self.raw_rows()
         self.assertEqual(rows[-1].get("model"), "claude-opus-4-8")
 
+    def test_fifo_transcript_does_not_block_dump(self):
+        # Re-verify finding 3：transcript_path 指向 FIFO（無 writer 的 open 永久 block）時，
+        # model 偵測不可卡住 raw dump——「dump 先於一切」也要防 blocking I/O，不只防 exception。
+        fifo = os.path.join(self.data, "transcript.fifo")
+        os.mkfifo(fifo)
+        code, _, _ = run_hook({"hook_event_name": "StopFailure", "error": "rate_limit",
+                               "transcript_path": fifo},
+                              {"CLAUDE_HOT_LIMIT_DATA": self.data})
+        self.assertEqual(code, 0, "FIFO transcript 不該 block（run_hook timeout=30 會抓到）")
+        rows = self.raw_rows()
+        self.assertEqual(len(rows), 1, "trip 必須照常記錄")
+        self.assertEqual(rows[-1].get("model"), "unknown", "非一般檔案 → fail-open 記 unknown")
+
     def test_non_dict_stdin_payload_still_dumped(self):
         # Verify 叢集 B（DA repro 2）：stdin 是合法 JSON 但非 dict（[1,2,3]）——
         # 改動前能正常 dump（json.dumps 接受任何型別、payload.get 在 dump 之後），

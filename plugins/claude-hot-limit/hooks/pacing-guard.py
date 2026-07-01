@@ -132,6 +132,8 @@ def detect_model(transcript_path):
     if not transcript_path:
         return None
     try:
+        if not os.path.isfile(transcript_path):
+            return None  # FIFO / 特殊檔案的 open 可能永久 block；只讀一般檔案（finding 3，兩副本同步）
         size = os.path.getsize(transcript_path)
         with open(transcript_path, "rb") as f:
             if size > _TRANSCRIPT_TAIL_BYTES:
