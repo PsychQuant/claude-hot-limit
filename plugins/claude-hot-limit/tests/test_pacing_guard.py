@@ -370,6 +370,35 @@ class RateStateHeatNudgeTest(unittest.TestCase):
         _, parsed, raw = self.fire(tool="Agent", extra={"CLAUDE_HOT_LIMIT_RATE_STATE_MIN_REQUESTS": "10"})
         self.assertEqual(raw, "", "Agent 不該觸發 workflow 寬度提醒，stdout=%r" % raw)
 
+    def fire_as(self, model, tool="Workflow", extra=None):
+        tp = make_transcript(self.tmp.name, [model])
+        payload = {"tool_name": tool, "tool_input": {}, "transcript_path": tp}
+        return run_hook(tool=tool, env_overrides=dict(self.env, **(extra or {})), payload=payload)
+
+    def test_rate_state_heat_scoped_to_current_bucket(self):
+        # #4/D4：只有 opus 桶的低 remaining 記錄，當前是 sonnet-5 → 跨桶，不該 nudge。
+        # 無 bucket 過濾的實作會用最後一筆（opus）判熱 → 誤 nudge，故此測試 RED。
+        self.seed_rate_state(age=5, model="claude-opus-4-8", rl_requests_remaining=1)
+        _, parsed, raw = self.fire_as("claude-sonnet-5",
+                                      extra={"CLAUDE_HOT_LIMIT_RATE_STATE_MIN_REQUESTS": "10"})
+        self.assertEqual(raw, "", "opus 桶的 rate-state 不該讓 sonnet-5 的 nudge 誤判，stdout=%r" % raw)
+
+    def test_rate_state_same_bucket_nudges(self):
+        # 同桶（sonnet-4-5 記錄、當前 sonnet-4-6）→ 應 nudge。
+        self.seed_rate_state(age=5, model="claude-sonnet-4-5", rl_requests_remaining=1)
+        _, parsed, raw = self.fire_as("claude-sonnet-4-6",
+                                      extra={"CLAUDE_HOT_LIMIT_RATE_STATE_MIN_REQUESTS": "10"})
+        self.assertIsNotNone(parsed, "同 sonnet-4 桶的 rate-state 偏低應 nudge，stdout=%r" % raw)
+        self.assertIn("systemMessage", parsed)
+
+    def test_legacy_rate_state_without_model_counts_as_unscoped(self):
+        # 舊格式 rate-state 記錄（無 model 欄，proxy 加 model 前寫的）→ unscoped，計入任何桶。
+        self.seed_rate_state(age=5, rl_requests_remaining=1)  # 無 model 欄
+        _, parsed, raw = self.fire_as("claude-sonnet-5",
+                                      extra={"CLAUDE_HOT_LIMIT_RATE_STATE_MIN_REQUESTS": "10"})
+        self.assertIsNotNone(parsed, "無 model 的舊 rate-state 記錄應 unscoped 計入，stdout=%r" % raw)
+        self.assertIn("systemMessage", parsed)
+
 
 class PerModelLedgerTest(unittest.TestCase):
     """v1.4.0：ledger 按 model 分桶記錄與計數。官方文檔證實 Opus / Sonnet 5 / Sonnet 4.x /
@@ -470,6 +499,34 @@ class PerModelLedgerTest(unittest.TestCase):
         self.assertFalse(is_deny(parsed))
         row = last_ledger_row(self.data)
         self.assertEqual(row.get("model"), "unknown", "非一般檔案 → fail-open 記 unknown")
+
+    def _seed_launches(self, model, n, age=5):
+        now = time.time()
+        with open(os.path.join(self.data, "launches.jsonl"), "a") as f:
+            for _ in range(n):
+                f.write(json.dumps({"ts": now - age, "tool": "Workflow", "model": model}) + "\n")
+
+    def test_same_bucket_variants_share_burst_window(self):
+        # #6：claude-sonnet-4-5 與 4-6 同屬 sonnet-4 桶。seed 2 筆 4-5、MAX=2，fire 4-6 →
+        # 應 DENY（bucket 合併計數）。exact-id 實作 count=0（4-5≠4-6）→ 放行，故此測試 RED。
+        self._seed_launches("claude-sonnet-4-5", 2)
+        _, parsed, raw = self.fire_with_model(["claude-sonnet-4-6"], extra={"CLAUDE_HOT_LIMIT_MAX": "2"})
+        self.assertTrue(is_deny(parsed), "同 sonnet-4 桶的變體應合併觸發 burst deny，stdout=%r" % raw)
+
+    def test_different_bucket_does_not_share_burst_window(self):
+        # 反向防 over-merge：sonnet-5 是獨立桶，不該被 sonnet-4 的 launch 擋。
+        self._seed_launches("claude-sonnet-4-5", 2)
+        _, parsed, raw = self.fire_with_model(["claude-sonnet-5"], extra={"CLAUDE_HOT_LIMIT_MAX": "2"})
+        self.assertFalse(is_deny(parsed), "sonnet-5 是獨立桶，不該被 sonnet-4 launch 擋，stdout=%r" % raw)
+
+    def test_legacy_ledger_row_without_model_counts_any_bucket(self):
+        # 舊格式列（無 model key）保守計入任何 bucket——bucket 化不得破壞此既有語意。
+        now = time.time()
+        with open(os.path.join(self.data, "launches.jsonl"), "a") as f:
+            for _ in range(2):
+                f.write(json.dumps({"ts": now - 5, "tool": "Workflow"}) + "\n")  # 無 model
+        _, parsed, raw = self.fire_with_model(["claude-sonnet-4-6"], extra={"CLAUDE_HOT_LIMIT_MAX": "2"})
+        self.assertTrue(is_deny(parsed), "無 model 舊列應保守計入任何 bucket，stdout=%r" % raw)
 
     def test_effort_captured_from_payload(self):
         _, parsed, raw = self.fire_with_model(
@@ -618,6 +675,20 @@ class PerModelHeatNudgeTest(unittest.TestCase):
         _, parsed, raw = self.fire_workflow_as("claude-opus-4-8")
         self.assertIsNotNone(parsed, "record 側 unknown trip 應保守計入任何 model，stdout=%r" % raw)
         self.assertIn("systemMessage", parsed)
+
+    def test_same_bucket_variant_trip_nudges(self):
+        # #6：sonnet-4-5 撞牆的 trip 應讓 sonnet-4-6 的 nudge 觸發（同 sonnet-4 桶）。
+        # exact-id 實作排除（4-5≠4-6）→ 無 nudge，故此測試 RED。
+        self.seed_trip(model="claude-sonnet-4-5", age=5)
+        _, parsed, raw = self.fire_workflow_as("claude-sonnet-4-6")
+        self.assertIsNotNone(parsed, "同 sonnet-4 桶的 trip 應觸發 nudge，stdout=%r" % raw)
+        self.assertIn("systemMessage", parsed)
+
+    def test_different_bucket_variant_trip_does_not_nudge(self):
+        # 反向防 over-merge：sonnet-4-5 的 trip 不該讓 sonnet-5（獨立桶）誤判為熱。
+        self.seed_trip(model="claude-sonnet-4-5", age=5)
+        _, parsed, raw = self.fire_workflow_as("claude-sonnet-5")
+        self.assertEqual(raw, "", "sonnet-4 的 trip 不該讓 sonnet-5 誤判為熱，stdout=%r" % raw)
 
 
 class FileOverrideTest(unittest.TestCase):

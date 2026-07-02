@@ -228,6 +228,7 @@ def recent_heat(data_dir, window, now, model=None):
     回傳 (episode_count, secs_since_last) 或 None（冷 / 無資料 / 讀取失敗 → fail-open）。
     """
     path = os.path.join(data_dir, "trips-raw.jsonl")
+    cur_bucket = model_bucket(model)  # 比對前先正規化成家族桶（#6），一次算好，迴圈內重用
     hot_ts = []
     try:
         with open(path) as f:
@@ -245,10 +246,12 @@ def recent_heat(data_dir, window, now, model=None):
                     ts = float(o.get("recorded_at", 0) or 0)
                     if now - ts > window:
                         continue
-                    trip_model = o.get("model")
-                    if (model not in (None, "unknown")
-                            and trip_model not in (None, "unknown")
-                            and trip_model != model):
+                    # bucket 比對（#6）取代 exact model-id：同族變體（sonnet-4-5/4-6）算同桶。
+                    # unscoped-unknown 語意不變——只有「兩側 bucket 都已知且不同」才排除。
+                    trip_bucket = model_bucket(o.get("model"))
+                    if (cur_bucket not in (None, "unknown")
+                            and trip_bucket not in (None, "unknown")
+                            and trip_bucket != cur_bucket):
                         continue
                     p = o.get("payload")
                     if not isinstance(p, dict):
@@ -282,14 +285,19 @@ def recent_heat(data_dir, window, now, model=None):
 _RATE_STATE_UNAVAILABLE = object()
 
 
-def _read_last_rate_state_record(data_dir):
-    """讀 rate-limit-proxy 落地的 rate-state.jsonl，回傳最後一筆能成功解析的 record（dict）。
+def _read_last_rate_state_record(data_dir, model=None):
+    """讀 rate-limit-proxy 落地的 rate-state.jsonl，回傳最後一筆「同桶」且能成功解析的 record（dict）。
 
     找不到檔案 / 整份解析不出任何一行（壞掉的 JSON、檔案被刪一半等）→ None，呼叫端視為
     「無可用真實資料」fail-open fallback 回既有 trips-raw.jsonl 啟發式。個別壞行（例如並發
     寫入切到一半的最後一行）安靜跳過，不影響前面已解析成功的行。
+
+    bucket 過濾（#4/D4）：只採「同一個家族桶」的記錄。無 model 欄 / null model 的記錄（proxy
+    加 model 擷取前寫的舊列）視為 unscoped → 計入任何桶；當前 model 未知（None/"unknown"）→
+    不過濾（unscoped-unknown 語意同 recent_heat，nudge 寧可多提醒不漏）。
     """
     path = os.path.join(data_dir, "rate-state.jsonl")
+    cur_bucket = model_bucket(model)
     last = None
     try:
         with open(path) as f:
@@ -301,8 +309,14 @@ def _read_last_rate_state_record(data_dir):
                     obj = json.loads(line)
                 except Exception:
                     continue
-                if isinstance(obj, dict):
-                    last = obj
+                if not isinstance(obj, dict):
+                    continue
+                rec_bucket = model_bucket(obj.get("model"))
+                if (cur_bucket not in (None, "unknown")
+                        and rec_bucket not in (None, "unknown")
+                        and rec_bucket != cur_bucket):
+                    continue  # 跨桶記錄不採（例：opus 的快照不代表 sonnet-5 桶的熱度）
+                last = obj
     except FileNotFoundError:
         return None
     except Exception:
@@ -310,7 +324,7 @@ def _read_last_rate_state_record(data_dir):
     return last
 
 
-def rate_state_heat(data_dir, window, now):
+def rate_state_heat(data_dir, window, now, model=None):
     """讀 rate-state.jsonl 最後一筆真實 rate-limit 快照，判斷帳號 bucket 是否真的熱。
 
     回傳三態:
@@ -323,8 +337,10 @@ def rate_state_heat(data_dir, window, now):
 
     門檻用絕對數量而非百分比：schema（見 proxy 的 rate-state.jsonl 格式）只有 remaining，沒有
     total/limit 欄位，百分比無從算起；改採絕對值，比照本檔案其他參數皆為絕對值的慣例。
+
+    model（#4/D4）：只看「同桶」的最後一筆快照，跨桶記錄不代表當前桶的熱度。
     """
-    record = _read_last_rate_state_record(data_dir)
+    record = _read_last_rate_state_record(data_dir, model)
     if record is None:
         return _RATE_STATE_UNAVAILABLE
 
@@ -415,6 +431,7 @@ def main():
     # 不分桶，純附掛記錄）---
     model = detect_model(payload.get("transcript_path")) or "unknown"
     effort = detect_effort(payload)
+    cur_bucket = model_bucket(model)  # ledger burst 計數以家族桶比對（#6），一次算好
 
     # --- critical section（flock 序列化並發 hook 行程）---
     lockf = None
@@ -442,10 +459,11 @@ def main():
                             continue
                         if now - float(e.get("ts", 0) or 0) > window:
                             continue
-                        # 分桶過濾：只算「同一個 model」的列。缺 model key（升級前寫入的舊格式列）
-                        # 一律保守計入任何 model 的窗口——寧可多算、也不要改版後頭 WINDOW 秒漏算真實 burst。
+                        # 分桶過濾（#6）：以家族桶比對而非 exact model-id——sonnet-4-5 與 4-6
+                        # 屬同一個 sonnet-4 桶，應合併計數。缺 model key（升級前寫入的舊格式列）
+                        # 一律保守計入任何桶的窗口——寧可多算、也不要改版後頭 WINDOW 秒漏算真實 burst。
                         e_model = e.get("model")
-                        if e_model is not None and e_model != model:
+                        if e_model is not None and model_bucket(e_model) != cur_bucket:
                             continue
                         entries.append(e)
                     except Exception:
@@ -532,7 +550,7 @@ def main():
     # 折衷：bucket 近期實際燙過（trip-recorder 有記）+ 這發又是 Workflow → 出聲提醒收斂並發。
     # 冷時完全安靜（訊號最純）；env CLAUDE_HOT_LIMIT_WORKFLOW_NUDGE=0 可關。fail-open。
     if tool_name == "Workflow" and os.environ.get("CLAUDE_HOT_LIMIT_WORKFLOW_NUDGE", "1") != "0":
-        rs_heat = rate_state_heat(data_dir, window, now)
+        rs_heat = rate_state_heat(data_dir, window, now, model)
         if rs_heat is _RATE_STATE_UNAVAILABLE:
             # 沒有 rate-state.jsonl（未裝/未啟用 proxy）、或資料太舊/解析失敗 → fail-open
             # fallback 回既有 trips-raw.jsonl 啟發式。model（main() 開頭已偵測）傳入分桶過濾（#2）。
