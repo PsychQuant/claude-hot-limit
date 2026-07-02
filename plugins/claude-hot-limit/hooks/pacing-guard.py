@@ -198,26 +198,31 @@ def recent_heat(data_dir, window, now, model=None):
                 line = line.strip()
                 if not line:
                     continue
+                # 整段逐行 try/except（round-2 verify MEDIUM）：任何單列異常（非 dict payload、
+                # 壞 recorded_at 等）只跳過該列——絕不讓外層 except 靜默全部 nudge。
+                # 注意讀寫一致性：trip-recorder 的叢集 B 修復會合法寫出 payload 非 dict 的列。
                 try:
                     o = json.loads(line)
+                    if not isinstance(o, dict):
+                        continue  # 合法 JSON 非 dict → 跳過該列
+                    ts = float(o.get("recorded_at", 0) or 0)
+                    if now - ts > window:
+                        continue
+                    trip_model = o.get("model")
+                    if (model not in (None, "unknown")
+                            and trip_model not in (None, "unknown")
+                            and trip_model != model):
+                        continue
+                    p = o.get("payload")
+                    if not isinstance(p, dict):
+                        p = {}  # 非 dict payload → err 落到 unknown = 保守算熱（寧記勿漏）
+                    raw = p.get("error") or p.get("error_type")
+                    err = (str(raw).strip().lower() if raw else "unknown")
+                    if err in _BENIGN_ERRORS:
+                        continue
+                    hot_ts.append(ts)
                 except Exception:
                     continue
-                if not isinstance(o, dict):
-                    continue  # 一行壞資料（合法 JSON 非 dict）只跳過該行，不讓外層 except 靜默全部 nudge（finding 9）
-                ts = float(o.get("recorded_at", 0) or 0)
-                if now - ts > window:
-                    continue
-                trip_model = o.get("model")
-                if (model not in (None, "unknown")
-                        and trip_model not in (None, "unknown")
-                        and trip_model != model):
-                    continue
-                p = o.get("payload", {}) or {}
-                raw = p.get("error") or p.get("error_type")
-                err = (str(raw).strip().lower() if raw else "unknown")
-                if err in _BENIGN_ERRORS:
-                    continue
-                hot_ts.append(ts)
     except FileNotFoundError:
         return None
     except Exception:
@@ -391,18 +396,23 @@ def main():
                     line = line.strip()
                     if not line:
                         continue
+                    # 整段逐行 try/except（round-2 verify MEDIUM，DA reproduced）：一行非 dict
+                    # JSON 或壞 ts 若讓 AttributeError/ValueError 逸出（critical section 只有
+                    # finally 沒有 except），guard 會**永久**失效（帳本 append-only 不自癒）。
                     try:
                         e = json.loads(line)
+                        if not isinstance(e, dict):
+                            continue
+                        if now - float(e.get("ts", 0) or 0) > window:
+                            continue
+                        # 分桶過濾：只算「同一個 model」的列。缺 model key（升級前寫入的舊格式列）
+                        # 一律保守計入任何 model 的窗口——寧可多算、也不要改版後頭 WINDOW 秒漏算真實 burst。
+                        e_model = e.get("model")
+                        if e_model is not None and e_model != model:
+                            continue
+                        entries.append(e)
                     except Exception:
                         continue
-                    if now - float(e.get("ts", 0)) > window:
-                        continue
-                    # 分桶過濾：只算「同一個 model」的列。缺 model key（升級前寫入的舊格式列）
-                    # 一律保守計入任何 model 的窗口——寧可多算、也不要改版後頭 WINDOW 秒漏算真實 burst。
-                    e_model = e.get("model")
-                    if e_model is not None and e_model != model:
-                        continue
-                    entries.append(e)
         except FileNotFoundError:
             pass
 

@@ -151,6 +151,23 @@ class GuardBehaviorTest(unittest.TestCase):
             _, parsed, raw = self.fire(extra={"CLAUDE_HOT_LIMIT_MAX": "1"})
             self.assertFalse(is_deny(parsed), "disabled 旗標應放行，stdout=%r" % raw)
 
+    def test_corrupt_ledger_line_does_not_kill_guard(self):
+        # Round-2 verify MEDIUM（DA，reproduced）：launches.jsonl 一行非 dict JSON（12345）
+        # 讓 e.get("ts") 拋 AttributeError 逸出 main()（critical section 只有 finally 沒有
+        # except）→ 每次 launch 都 exit 1 → deny/記帳/nudge 全死，且帳本 append-only =
+        # **永久**失效直到手動修檔。這是本 PR 唯一漏掉加固的 JSONL reader。
+        os.makedirs(self.data, exist_ok=True)
+        with open(os.path.join(self.data, "launches.jsonl"), "w") as f:
+            f.write("12345\n")  # 毒列
+            # 3 筆近期有效 launch，MAX=1 應該要 deny
+            now = __import__("time").time()
+            for dt in (5, 10, 15):
+                f.write(json.dumps({"ts": now - dt, "tool": "Workflow"}) + "\n")
+        code, parsed, raw = self.fire(extra={"CLAUDE_HOT_LIMIT_MAX": "1"})
+        self.assertEqual(code, 0, "毒列不該讓 guard crash，stdout=%r" % raw)
+        self.assertTrue(is_deny(parsed),
+                        "毒列只跳過，有效 entries 仍應觸發 burst deny，stdout=%r" % raw)
+
     def test_min_gap_sleeps_and_reports(self):
         # MAX 放寬避免 burst deny；MIN_GAP=2 → 兩發太近，第 2 發應 sleep 並回報
         _, parsed, _ = self.fire(extra={"CLAUDE_HOT_LIMIT_MAX": "10", "CLAUDE_HOT_LIMIT_MIN_GAP": "2"})
@@ -515,6 +532,29 @@ class PerModelHeatNudgeTest(unittest.TestCase):
         _, parsed, raw = self.fire_workflow_as("claude-opus-4-8")
         self.assertIsNotNone(parsed, "舊格式列應保守計入任何 model，stdout=%r" % raw)
         self.assertIn("systemMessage", parsed)
+
+    def test_non_dict_payload_row_does_not_silence_nudge(self):
+        # Round-2 verify MEDIUM（logic，live repro）：trip-recorder 叢集 B 修復會合法寫出
+        # payload 為非 dict 的列（{"recorded_at":…,"model":"unknown","payload":[1,2,3]}）——
+        # recent_heat 的 p.get("error") 對非 dict payload 拋 AttributeError 被外層 except
+        # 吞掉 → 所有 nudge 靜默。讀寫兩側必須一致：這種列要保守視為熱（寧記勿漏）。
+        with open(os.path.join(self.data, "trips-raw.jsonl"), "a") as f:
+            f.write(json.dumps({"recorded_at": time.time() - 5, "model": "unknown",
+                                "payload": [1, 2, 3]}) + "\n")
+        self.seed_trip(model="claude-opus-4-8", age=5)
+        _, parsed, raw = self.fire_workflow_as("claude-opus-4-8")
+        self.assertIsNotNone(parsed, "非 dict payload 列不該靜默全部 nudge，stdout=%r" % raw)
+        self.assertIn("systemMessage", parsed)
+
+    def test_bad_recorded_at_row_does_not_silence_nudge(self):
+        # 同 MEDIUM 的姊妹路徑（DA 指出為永久變體）：recorded_at 是非數字字串 →
+        # float() ValueError → 外層 except → 全滅。應只跳過該列。
+        with open(os.path.join(self.data, "trips-raw.jsonl"), "a") as f:
+            f.write(json.dumps({"recorded_at": "not-a-number",
+                                "payload": {"error": "rate_limit"}}) + "\n")
+        self.seed_trip(model="claude-opus-4-8", age=5)
+        _, parsed, raw = self.fire_workflow_as("claude-opus-4-8")
+        self.assertIsNotNone(parsed, "壞 recorded_at 列不該靜默全部 nudge，stdout=%r" % raw)
 
     def test_corrupt_line_in_trips_does_not_silence_nudge(self):
         # Re-verify finding 9：trips-raw.jsonl 內一行合法但非 dict 的 JSON（如 12345）
