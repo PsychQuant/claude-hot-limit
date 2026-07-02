@@ -58,11 +58,13 @@ class TripRecorderTest(unittest.TestCase):
         txt = self.log_text()
         self.assertIn("overloaded", txt, "log 應記下 error_type")
         self.assertIn("[auto]", txt, "auto 記錄應標記 [auto] 與手動區隔")
-        # 視窗計數：近60s=3(2,8,30)、近600s=5。row 應含這兩個數
+        # 視窗計數：近60s=3(2,8,30)、近600s=5。row 應含這兩個數。
+        # #5 後最後一欄是 model → 近600s 移到 cells[-2]，model（無 transcript → unknown）在 cells[-1]。
         last = [l for l in txt.splitlines() if "[auto] overloaded" in l][-1]
         cells = [c.strip() for c in last.strip("|").split("|")]
         self.assertEqual(cells[2], "3", "近60s 應為 3，row=%r" % last)
-        self.assertEqual(cells[-1], "5", "近600s 應為 5，row=%r" % last)
+        self.assertEqual(cells[-2], "5", "近600s 應為 5（model 欄後移一格），row=%r" % last)
+        self.assertEqual(cells[-1], "unknown", "無 transcript → model 欄記 unknown，row=%r" % last)
 
     def test_fail_open_on_bad_stdin(self):
         code, out, _ = run_hook("not json", {"CLAUDE_HOT_LIMIT_DATA": self.data})
@@ -258,6 +260,78 @@ class PerModelTripRecordTest(unittest.TestCase):
         rows = self.raw_rows()
         self.assertEqual(len(rows), 1, "原始 payload 仍要 dump（審計軌跡不可丟）")
         self.assertEqual(rows[-1]["payload"], [1, 2, 3])
+
+
+class CalibrationLogModelColumnTest(unittest.TestCase):
+    """#5 — calibration-log.md 校準表加 model 欄（最後一欄）。新檔表頭含該欄；既有舊表頭
+    檔一次性遷移表頭+分隔線、歷史資料列原封不動。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.data = self.tmp.name
+        self.log = os.path.join(self.data, "calibration-log.md")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def log_text(self):
+        return open(self.log).read() if os.path.exists(self.log) else ""
+
+    def make_transcript(self, model):
+        path = os.path.join(self.data, "transcript.jsonl")
+        with open(path, "w") as f:
+            f.write(json.dumps({"type": "assistant", "message": {"model": model}}) + "\n")
+        return path
+
+    def header_line(self, txt):
+        for l in txt.splitlines():
+            if l.startswith("| 時間"):
+                return l
+        return ""
+
+    def auto_rows(self, txt):
+        return [l for l in txt.splitlines() if "[auto]" in l]
+
+    def test_new_calibration_log_has_model_column(self):
+        tp = self.make_transcript("claude-sonnet-5")
+        run_hook({"hook_event_name": "StopFailure", "error": "rate_limit", "transcript_path": tp},
+                 {"CLAUDE_HOT_LIMIT_DATA": self.data})
+        txt = self.log_text()
+        self.assertIn("model", self.header_line(txt), "新檔表頭應含 model 欄，header=%r" % self.header_line(txt))
+        row = self.auto_rows(txt)[-1]
+        cells = [c.strip() for c in row.strip("|").split("|")]
+        self.assertEqual(cells[-1], "claude-sonnet-5",
+                          "新列最後一欄應是撞牆的 model，row=%r" % row)
+
+    def test_row_records_unknown_model_when_no_transcript(self):
+        run_hook({"hook_event_name": "StopFailure", "error": "rate_limit"},
+                 {"CLAUDE_HOT_LIMIT_DATA": self.data})
+        row = self.auto_rows(self.log_text())[-1]
+        cells = [c.strip() for c in row.strip("|").split("|")]
+        self.assertEqual(cells[-1], "unknown", "偵測失敗 model 欄應為 unknown，row=%r" % row)
+
+    def test_existing_old_header_migrated_and_rows_preserved(self):
+        # 預先寫一份「舊格式」calibration-log（表頭無 model 欄 + 一筆歷史資料列）
+        old = (
+            "# claude-hot-limit · 上限校準 log\n\n"
+            "撞到 429/529 時由 StopFailure hook 自動記錄（[auto]）。\n\n"
+            "## 觀測紀錄（trip 點）\n\n"
+            "| 時間 | 訊號 / 註解 | 近60s | 近180s | 近300s | 近600s |\n"
+            "|------|-------------|------:|-------:|-------:|-------:|\n"
+            "| 2020-01-01 00:00:00 | [auto] rate_limit | 1 | 2 | 3 | 4 |\n"
+        )
+        with open(self.log, "w") as f:
+            f.write(old)
+        tp = self.make_transcript("claude-opus-4-8")
+        run_hook({"hook_event_name": "StopFailure", "error": "rate_limit", "transcript_path": tp},
+                 {"CLAUDE_HOT_LIMIT_DATA": self.data})
+        txt = self.log_text()
+        self.assertIn("model", self.header_line(txt), "既有表頭應被一次性遷移加上 model 欄")
+        self.assertIn("| 2020-01-01 00:00:00 | [auto] rate_limit | 1 | 2 | 3 | 4 |", txt,
+                      "歷史資料列必須原封不動保留")
+        new_row = [l for l in self.auto_rows(txt) if "2020-01-01" not in l][-1]
+        cells = [c.strip() for c in new_row.strip("|").split("|")]
+        self.assertEqual(cells[-1], "claude-opus-4-8", "遷移後新列應帶 model，row=%r" % new_row)
 
 
 if __name__ == "__main__":

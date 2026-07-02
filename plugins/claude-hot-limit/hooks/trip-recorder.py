@@ -82,6 +82,32 @@ def detect_model(transcript_path):
     return None
 
 
+def _migrate_calibration_header_if_needed(log_path):
+    """既有 calibration-log 若表頭尾端沒有 model 欄，一次性只改寫表頭 + 分隔線兩行（#5）。
+
+    歷史資料列原封不動——markdown 對尾端缺格容忍，舊列渲染成空 model 格；model 放最後一欄
+    正是為了讓舊列的缺格落在尾端、不破壞既有欄位對齊。冪等：表頭已含 model 就跳過。
+    fail-open：讀寫異常一律靜默返回，絕不擋住下面該記的 row（呼叫端也在 try 內）。
+    """
+    try:
+        with open(log_path) as f:
+            lines = f.readlines()
+    except Exception:
+        return
+    for i, line in enumerate(lines):
+        if line.startswith("| 時間") and "model" not in line:
+            lines[i] = line.rstrip() + " model |\n"
+            # 緊接的下一行是分隔線 → 同步加一欄（左對齊，model 是文字非數字）
+            if i + 1 < len(lines) and lines[i + 1].lstrip().startswith("|-"):
+                lines[i + 1] = lines[i + 1].rstrip() + "------|\n"
+            try:
+                with open(log_path, "w") as f:
+                    f.writelines(lines)
+            except Exception:
+                pass
+            return
+
+
 def main():
     # --- 解析 StopFailure payload（fail-open）---
     try:
@@ -152,21 +178,24 @@ def main():
         sys.exit(0)
 
     stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
-    row = "| {t} | [auto] {e} | {c60} | {c180} | {c300} | {c600} |\n".format(
+    # model 放最後一欄（#5）：既有列遷移時缺格落在尾端、不破壞既有欄位對齊。
+    row = "| {t} | [auto] {e} | {c60} | {c180} | {c300} | {c600} | {model} |\n".format(
         t=stamp, e=error_type,
-        c60=counts[60], c180=counts[180], c300=counts[300], c600=counts[600])
+        c60=counts[60], c180=counts[180], c300=counts[300], c600=counts[600], model=model)
 
     # --- append 一列到 log（不存在就建表頭；append 模式單列寫入在 POSIX 為原子）---
     try:
         os.makedirs(data_dir, exist_ok=True)
         new_file = not os.path.exists(log)
+        if not new_file:
+            _migrate_calibration_header_if_needed(log)  # 舊表頭一次性補 model 欄（冪等）
         with open(log, "a") as f:
             if new_file:
                 f.write("# claude-hot-limit · 上限校準 log\n\n")
                 f.write("撞到 429/529 時由 StopFailure hook 自動記錄（[auto]）；手動補充可用 record-trip.py。\n\n")
                 f.write("## 觀測紀錄（trip 點）\n\n")
-                f.write("| 時間 | 訊號 / 註解 | 近60s | 近180s | 近300s | 近600s |\n")
-                f.write("|------|-------------|------:|-------:|-------:|-------:|\n")
+                f.write("| 時間 | 訊號 / 註解 | 近60s | 近180s | 近300s | 近600s | model |\n")
+                f.write("|------|-------------|------:|-------:|-------:|-------:|------|\n")
             f.write(row)
     except Exception:
         sys.exit(0)
