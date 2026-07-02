@@ -435,6 +435,19 @@ class PerModelLedgerTest(unittest.TestCase):
         self.assertEqual(row.get("model"), "claude-sonnet-5",
                           "應跳過壞行、往前找到真實 model，row=%r" % row)
 
+    def test_fifo_transcript_does_not_block_guard(self):
+        # Round-2 verify INFO（finding 14）：guard 側 detect_model 的 FIFO 防禦（6370e48
+        # 兩副本同步修）此前只在 trip-recorder 側有測試——補上 guard 側的覆蓋釘。
+        fifo = os.path.join(self.tmp.name, "transcript.fifo")
+        os.mkfifo(fifo)
+        payload = {"tool_name": "Workflow", "tool_input": {}, "transcript_path": fifo}
+        code, parsed, raw = run_hook(
+            tool="Workflow", env_overrides=dict(self.env, CLAUDE_HOT_LIMIT_MAX="10"), payload=payload)
+        self.assertEqual(code, 0, "FIFO transcript 不該 block guard")
+        self.assertFalse(is_deny(parsed))
+        row = last_ledger_row(self.data)
+        self.assertEqual(row.get("model"), "unknown", "非一般檔案 → fail-open 記 unknown")
+
     def test_effort_captured_from_payload(self):
         _, parsed, raw = self.fire_with_model(
             ["claude-sonnet-5"], extra={"CLAUDE_HOT_LIMIT_MAX": "10"}, effort="xhigh")
@@ -648,6 +661,15 @@ class FileOverrideTest(unittest.TestCase):
         code, parsed, raw = self.fire()
         self.assertEqual(code, 0, "負值不該 crash，stdout=%r" % raw)
         self.assertTrue(is_deny(parsed), "負值視同全擋，stdout=%r" % raw)
+
+    def test_fifo_override_without_disabled_does_not_block(self):
+        # Round-2 verify LOW（logic，reproduced >8s block）：FIFO max-override 且**沒有**
+        # disabled 旗標時，每次 launch 都會卡到 hook timeout——finding-3 的 isfile 原則
+        # 必須同樣套用到 override 檔這個新讀取點。
+        os.mkfifo(os.path.join(self.data, "max-override"))
+        code, parsed, raw = self.fire(extra={"CLAUDE_HOT_LIMIT_MAX": "10"})
+        self.assertEqual(code, 0, "FIFO override 不該 block（timeout=30 會抓到）")
+        self.assertFalse(is_deny(parsed), "應 fallback env MAX=10 正常放行，stdout=%r" % raw)
 
     def test_disabled_flag_rescues_before_override_reads(self):
         # Re-verify finding 4：disabled kill-switch 必須在 override 檔讀取「之前」檢查——

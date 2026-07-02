@@ -94,7 +94,10 @@ def file_override_int(data_dir, filename, env_name, default):
     讀取有界（64 bytes，比照 _TRANSCRIPT_TAIL_BYTES 的 bounded-read 紀律，finding 5）。
     """
     try:
-        with open(os.path.join(data_dir, filename)) as f:
+        path = os.path.join(data_dir, filename)
+        if not os.path.isfile(path):
+            return env_int(env_name, default)  # FIFO/特殊檔案的 open 可能永久 block（finding-3 原則同樣適用此讀取點）
+        with open(path) as f:
             return int(f.read(64).strip())
     except FileNotFoundError:
         pass  # 無 override 檔 = 正常情況，靜默
