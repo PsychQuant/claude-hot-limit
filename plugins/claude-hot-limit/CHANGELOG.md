@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.7.0
+
+- **feat（家族桶正規化 `model_bucket()`，#6）**：先前 per-model 過濾用 **exact model-id 字串相等**
+  判斷同桶，但 Anthropic rate-limit 桶是**家族級**——`claude-sonnet-4-5` 與 `claude-sonnet-4-6`
+  共用 Sonnet 4.x 桶、`claude-sonnet-5` 才獨立。新增模組級純函式 `model_bucket(model_id)`
+  （`^claude-(opus|sonnet|haiku)-(\d+)` → `<family>-<major>`；`None`/`"unknown"` passthrough 保持
+  unscoped；**未知格式 id 保守回自身、絕不 over-merge 兩個真實桶**），作為 `recent_heat()`、
+  launches ledger burst 迴圈、`rate_state_heat()` 三處**共同消費的單一 source of truth**——同族
+  變體現在正確合併計數、`sonnet-4` vs `sonnet-5` 保持分離。
+- **feat（rate-state 分桶，#4）**：`rate-limit-proxy` 解析**請求** body 的 top-level `model`（方向
+  與既有 header/usage 擷取相反：那些讀回應、這個讀請求）寫進 `rate-state.jsonl`，fail-open（非
+  JSON / 無 model / 解析失敗 → `null`，轉發位元不變）；`rate_state_heat()` 依 bucket 過濾（同桶才
+  計入、跨桶不計；無 model 欄的舊列 unscoped 計入任何桶）。裝了 proxy 時的 nudge 主路徑**不再是
+  跨 model**（補上 #2 遺留的 cross-model 缺口）。
+- **feat（calibration-log model 欄，#5）**：`trip-recorder` 寫 `calibration-log.md` 校準表時加
+  `model` 為最後一欄；既有舊表頭檔一次性遷移表頭+分隔線兩行（冪等）、歷史資料列原封不動（model
+  放最後一欄正是讓舊列缺格落在尾端、不破壞欄位對齊）。
+- **test**：全套 **101 tests 綠**（+21：`test_model_bucket.py` 7、bucket burst/heat/rate-state
+  分桶、proxy 請求 model 擷取、calibration-log model 欄+遷移，皆先 RED 證明問題真實再 GREEN）。
+- **spectra**：三個耦合 issue（#4 #5 #6）合併成單一 Spectra change `per-model-bucket-normalization`
+  （proposal → design → specs → tasks），每組 commit 以 `Refs #N` 標對應 issue。
+
 ## 1.6.0
 
 - **feat（trip-recorder / heat-nudge 補齊 per-model 分桶，#2）**：v1.4.0 只把 `launches.jsonl`
