@@ -1,7 +1,7 @@
 {
   "name": "claude-hot-limit",
   "description": "致敬「最燙的 bucket」— PreToolUse hook 守住 Workflow/Agent fan-out 的啟動節奏，防止 back-to-back 暴衝撞上 Anthropic 的 acceleration-limit / short-burst 節流（429/529）。含執行期硬擋 hook（pacing-guard）+ 設計期 pacing-playbook skill。",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "author": {
     "name": "Che Cheng"
   }

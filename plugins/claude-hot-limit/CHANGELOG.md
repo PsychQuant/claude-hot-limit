@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.9.0
+
+- **fix（proxy state 檔尊重 `CLAUDE_HOT_LIMIT_DATA`，#9）**：`rate-limit-proxy.py` 的
+  `_state_file()` 寫死 `~/.cache/...`、不讀 `CLAUDE_HOT_LIMIT_DATA`，但消費端 `rate_state_heat()`
+  從該 data dir 找檔 → 使用者覆寫 data dir 時 proxy 寫 A、guard 讀 B 的 split-brain。新增
+  `resolve_state_file()`（呼叫時讀 env，mirror `resolve_upstream()`）。**與消費端逐字一致**：
+  刻意不對 env 值做 `expanduser`（`pacing-guard` / `proxy-launcher` 都不做）——否則
+  `CLAUDE_HOT_LIMIT_DATA=~/foo` 會讓 proxy 展開、消費端不展開，二度 split-brain。path-identity
+  是不變量，非「更正確的 tilde 處理」（verify 自身抓到並修正）。
+- **feat（opt-in `RATE_LIMIT_PROXY_DEBUG_HEADERS` 診斷 dump，#12）**：觀測期第一批 1134 筆真實
+  資料顯示 **rate-limit header 0/1134 命中**（usage 3%、model 100%）。診斷（含官方 docs）指向
+  `anthropic-ratelimit-*` 是 API-platform 功能、Max subscription（OAuth）auth 可能不回傳——但
+  need 真實 header 樣本才能分辨「可修 bug」vs「subscription 固有邊界」。本 flag（預設關 → 零影響）
+  把回應 header 名單 + `anthropic-*` 值寫進 `<data>/proxy-headers-debug.jsonl`（機密 header 只
+  留名不留值、fail-open），供 daemon 空閒時抓一筆真實 header 定案。掛在 streaming +
+  non-streaming 兩條擷取路徑。
+- **test**：全套 **117 tests 綠**（+4：#9 data-dir + consumer-parity；#12 debug dump off/on/
+  no-secret-leak）。
+- **注意**：#12 的最終 root-cause resolution 仍 pending 確認實驗；本版只交付確認工具。
+
 ## 1.8.0
 
 - **feat（Phase 1 proxy 部署：launcher + SessionStart hook，#8）**：v1.5.0 的 rate-limit-proxy
