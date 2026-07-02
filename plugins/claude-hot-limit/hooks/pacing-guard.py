@@ -145,7 +145,11 @@ def detect_model(transcript_path):
     except Exception:
         return None
 
-    for line in reversed(text.splitlines()):
+    # split("\n") 而非 splitlines()：transcript 是 newline-delimited JSONL，一筆記錄一條物理行。
+    # splitlines() 額外在 U+2028/U+2029 等 Unicode line separator 斷行（JSON 允許這些字元不
+    # escape 地出現在字串內容裡），會把某行內容嵌的 {"model":...} 片段當成獨立記錄冒充真實
+    # model（round-2 verify security finding）。只以 \n 為記錄邊界（兩份 detect_model 副本同步）。
+    for line in reversed(text.split("\n")):
         line = line.strip()
         if not line:
             continue
