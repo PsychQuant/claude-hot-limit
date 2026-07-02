@@ -88,9 +88,12 @@ proxy 是**選配、opt-in**：部署拆成兩個時序不同的關注點——
    `<data>/proxy.log`、pidfile `<data>/proxy.pid`；手動管理：`proxy-launcher.py stop|status`。
 
 **⚠️ dead-port 風險（部署層頭號風險）**：`ANTHROPIC_BASE_URL` 指向沒起來的 proxy = **所有
-API 流量無法送出**。proxy 內部的 fail-open 救不了「proxy 根本沒在跑」。緩解：launcher 起
-不來時 **fail-loud**（SessionStart stdout 進 session context）+ **一鍵退回**（從 settings.json
-移除 `ANTHROPIC_BASE_URL` 那行、重啟 session）。mid-session daemon 死掉 → 流量斷到下次
+API 流量無法送出**。proxy 內部的 fail-open 救不了「proxy 根本沒在跑」。緩解：**fail-loud 覆蓋
+全部靜默死路**（#8 verify findings 2/3/5/17）——spawn 失敗、kill-switch 生效但導流還在、
+`ANTHROPIC_BASE_URL` 的 port 與 `RATE_LIMIT_PROXY_PORT` 不一致且目標 port 無人聽、`https://`
+指向 plaintext proxy，四種情境都在 SessionStart stdout 警告（進 session context）+ **一鍵退回**
+（從 settings.json 移除 `ANTHROPIC_BASE_URL` 那行、重啟 session）。`RATE_LIMIT_PROXY_UPSTREAM`
+（proxy 打的上游）與 `ANTHROPIC_BASE_URL`（Claude Code 打的入口）刻意分離，不會自我迴圈。mid-session daemon 死掉 → 流量斷到下次
 session start 自動 re-ensure（v1 接受；要 mid-session auto-restart 可自行掛 launchd `KeepAlive`）。
 kill-switch（`CLAUDE_HOT_LIMIT_OFF=1` / `<data>/disabled`）優先於 opt-in。
 

@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.8.0
+
+- **feat（Phase 1 proxy 部署：launcher + SessionStart hook，#8）**：v1.5.0 的 rate-limit-proxy
+  一直是「code-complete, zero-deployment」——無啟動機制、`rate-state.jsonl` 零資料（#7 的
+  gating precondition 無從驗證）。新增 `proxy/proxy-launcher.py`（`ensure`/`stop`/`status`）：
+  **導流設定本身就是 opt-in 訊號**（`ANTHROPIC_BASE_URL` 指向本機 `RATE_LIMIT_PROXY_PORT` 才
+  動作，沒設的使用者零打擾）；`fcntl.flock` + 鎖內二次探測防並發 session race；daemon detached
+  跨 session 共用單一實例；SessionStart hook（`startup|resume|clear|compact`）每 session 冪等
+  re-ensure。導流本身（settings.json env）永遠是使用者手動 opt-in，plugin 絕不代寫。
+- **fix（fail-loud 覆蓋全部靜默死路，#8 verify findings 2/3/5/17）**：dead-port（導流指向沒人
+  聽的本機 port = 全流量斷）是部署層頭號風險，但初版只在 spawn 失敗時警告——verify ensemble
+  找出三條繞過警告的靜默死路：kill-switch 生效但導流還在、URL port 與 `RATE_LIMIT_PROXY_PORT`
+  不一致且目標 port 死、`https://` 指向 plaintext proxy（gate 過、daemon 健康、TLS 必敗）。
+  三條全部補上 SessionStart stdout 警告（RED→GREEN）。
+- **fix（stop() 身分驗證，findings 10/11）**：pidfile pid 可能被 OS reuse 成無關 process——
+  SIGTERM 前查 command line 含 `rate-limit-proxy` 才殺；是別人 → 不殺、警告、只清 stale
+  pidfile（測試用真實 victim process 證明修前確實會誤殺）。
+- **docs**：CLAUDE.md「Proxy 部署」段（兩時序關注點：導流=啟動前 env、daemon=session start）
+  + README opt-in quickstart + proxy env 表（`RATE_LIMIT_PROXY_PORT` 一致性要求、
+  `RATE_LIMIT_PROXY_UPSTREAM` 自我迴圈分離）。
+- **test**：全套 **112 tests 綠**（+11：opt-in gate 兩路徑、冪等、stop 清理、fail-loud bind 失敗、
+  kill-switch、三條靜默死路警告、foreign-pid 不誤殺）。
+
 ## 1.7.0
 
 - **feat（家族桶正規化 `model_bucket()`，#6）**：先前 per-model 過濾用 **exact model-id 字串相等**
