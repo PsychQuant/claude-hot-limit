@@ -72,6 +72,31 @@ _RATE_LIMIT_HEADER_MAP = {
 }
 
 
+def maybe_debug_dump_headers(state_file_path, resp_headers):
+    """opt-in（`RATE_LIMIT_PROXY_DEBUG_HEADERS` in {1,true}）診斷 dump（#12）。
+
+    把回應的 header **名單** + `anthropic-*` header 的**值**寫進 `<state dir>/proxy-headers-debug.jsonl`，
+    用來確認真實回應到底帶不帶 `anthropic-ratelimit-*`（分辨「可修的擷取 bug」vs「subscription auth
+    的固有邊界」）。預設關 → 完全 no-op、對正常轉發零影響。
+
+    安全：只記 `anthropic-*` 的值（rate-limit / metadata，非機密）；Authorization / Cookie 等
+    其他 header **只留名不留值**。fail-open：任何異常靜默返回，絕不擾動轉發。"""
+    if os.environ.get("RATE_LIMIT_PROXY_DEBUG_HEADERS", "") not in ("1", "true", "True"):
+        return
+    try:
+        names = [k for k, _ in resp_headers]
+        anthropic = {k: v for k, v in resp_headers if k.lower().startswith("anthropic-")}
+        rec = {"ts": time.time(), "header_names": names, "anthropic_headers": anthropic}
+        path = os.path.join(os.path.dirname(state_file_path), "proxy-headers-debug.jsonl")
+        d = os.path.dirname(path)
+        if d and not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
 def extract_rate_limit_fields(resp_headers):
     """resp_headers: list[(key, value)]。回傳狀態檔要記錄的 rl_* dict，缺的欄位補 null。"""
     lower = {k.lower(): v for k, v in resp_headers}
@@ -211,6 +236,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self._forward_buffered(status, resp_headers, resp_body)
 
     def _record_state(self, resp_headers, resp_body, req_model=None):
+        maybe_debug_dump_headers(self._state_file(), resp_headers)  # #12 opt-in 診斷（預設 no-op）
         record = {"ts": time.time(), "model": req_model}
         record.update(extract_rate_limit_fields(resp_headers))
         record["usage"] = extract_usage_from_body(resp_body)
@@ -260,6 +286,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(b"0\r\n\r\n")
         self.wfile.flush()
 
+        maybe_debug_dump_headers(self._state_file(), resp_headers)  # #12 opt-in 診斷（streaming 路徑）
         record = {"ts": time.time(), "model": req_model}
         record.update(extract_rate_limit_fields(resp_headers))
         record["usage"] = usage_acc or None

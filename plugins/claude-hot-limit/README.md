@@ -77,6 +77,7 @@ proxy 相關 env（與上面「設定」表的 hook env 分開）：
 | `RATE_LIMIT_PROXY_PORT` | `8787` | proxy 監聽 port。**自訂時必須與 `ANTHROPIC_BASE_URL` 的 port 一致**，否則 launcher 視為非本 plugin 的導流、不會起 daemon（會警告） |
 | `RATE_LIMIT_PROXY_UPSTREAM` | `https://api.anthropic.com` | proxy 轉發的上游。**與 `ANTHROPIC_BASE_URL` 刻意分離**——導流改的是 Claude Code 打哪裡，proxy 自己打上游走這個變數，不會自我迴圈 |
 | `CLAUDE_HOT_LIMIT_PROXY` | — | 設 `1` 強制 opt-in（測試／預熱用；正常走 `ANTHROPIC_BASE_URL` 即可） |
+| `RATE_LIMIT_PROXY_DEBUG_HEADERS` | — | 設 `1` 時把每筆回應的 header **名單** + `anthropic-*` header 的**值**寫進 `<data>/proxy-headers-debug.jsonl`（診斷「rate-limit header 到底在不在回應上」用；#12）。只記 `anthropic-*` 的值，Authorization/Cookie 等只留名。**預設關 → 零影響**。查完記得關 |
 
 ## 設定
 

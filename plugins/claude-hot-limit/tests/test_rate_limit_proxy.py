@@ -462,6 +462,65 @@ class StateFileDataDirTest(unittest.TestCase):
                 os.environ["CLAUDE_HOT_LIMIT_DATA"] = prev
 
 
+class DebugHeaderDumpTest(unittest.TestCase):
+    """#12 — opt-in debug dump：確認真實回應到底帶不帶 anthropic-ratelimit-* header。
+
+    RATE_LIMIT_PROXY_DEBUG_HEADERS=1 時，把回應 header 名單 + anthropic-* header 的值寫進
+    <state dir>/proxy-headers-debug.jsonl（名 = 全部；值 = 只記非機密的 anthropic-*，
+    Authorization/Cookie 等只留名不留值）。預設關 → 完全 no-op、零影響。"""
+
+    def setUp(self):
+        self.mock, self.mock_url = start_mock_upstream()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state_file = os.path.join(self.tmp.name, "rate-state.jsonl")
+        self.debug_file = os.path.join(self.tmp.name, "proxy-headers-debug.jsonl")
+
+    def tearDown(self):
+        self.mock.shutdown()
+        self.tmp.cleanup()
+
+    def _fire(self, env_overrides):
+        MockUpstreamHandler.response_status = 200
+        MockUpstreamHandler.response_headers = {
+            "Content-Type": "application/json",
+            "anthropic-ratelimit-requests-remaining": "42",
+            "Authorization": "SECRET-SHOULD-NOT-BE-LOGGED",
+        }
+        MockUpstreamHandler.response_body = json.dumps({"usage": {"input_tokens": 1}}).encode()
+        MockUpstreamHandler.sse_chunks = None
+        proxy_server, proxy_url, _ = start_proxy(self.mock_url, self.state_file, env_overrides=env_overrides)
+        try:
+            req = urllib.request.Request(proxy_url + "/v1/messages", data=b'{"model":"x"}', method="POST")
+            urllib.request.urlopen(req).read()
+            time.sleep(0.1)
+        finally:
+            proxy_server.shutdown()
+
+    def test_off_by_default_writes_nothing(self):
+        self._fire(env_overrides={})  # 無 flag
+        self.assertFalse(os.path.exists(self.debug_file),
+                         "debug 預設關，不該寫 proxy-headers-debug.jsonl")
+
+    def test_on_dumps_header_names_and_anthropic_values(self):
+        self._fire(env_overrides={"RATE_LIMIT_PROXY_DEBUG_HEADERS": "1"})
+        self.assertTrue(os.path.exists(self.debug_file), "flag 開時應寫 debug 檔")
+        rows = read_jsonl(self.debug_file)
+        self.assertEqual(len(rows), 1)
+        names_lower = [n.lower() for n in rows[0]["header_names"]]
+        # 全部 header 名都在（含機密 header 的「名」）——這正是要確認「有沒有 ratelimit header」
+        self.assertIn("anthropic-ratelimit-requests-remaining", names_lower)
+        self.assertIn("authorization", names_lower)
+        # anthropic-* 的「值」有記（非機密，正是要看的）
+        anthropic = {k.lower(): v for k, v in rows[0]["anthropic_headers"].items()}
+        self.assertEqual(anthropic.get("anthropic-ratelimit-requests-remaining"), "42")
+
+    def test_on_never_logs_secret_header_values(self):
+        self._fire(env_overrides={"RATE_LIMIT_PROXY_DEBUG_HEADERS": "1"})
+        raw = open(self.debug_file).read()
+        self.assertNotIn("SECRET-SHOULD-NOT-BE-LOGGED", raw,
+                         "Authorization 等機密 header 的『值』絕不可寫進 debug 檔（只留名）")
+
+
 class FailOpenErrorPassthroughTest(unittest.TestCase):
     """2.3 — 上游錯誤原樣轉發，不吞不重試，且仍記錄狀態檔一筆。"""
 
