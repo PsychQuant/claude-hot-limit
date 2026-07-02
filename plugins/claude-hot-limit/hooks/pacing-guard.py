@@ -49,6 +49,7 @@ heat-aware nudge（補盲區）:
 """
 import sys
 import os
+import re
 import json
 import time
 
@@ -178,6 +179,35 @@ def detect_effort(payload):
         if level:
             return str(level)
     return "unknown"
+
+
+# model-id → rate-limit 家族桶的正規化 regex（#6）。Anthropic 桶是家族級的，非逐 model-id。
+_MODEL_BUCKET_RE = re.compile(r"^claude-(opus|sonnet|haiku)-(\d+)")
+
+
+def model_bucket(model_id):
+    """把 Anthropic model-id 正規化成 rate-limit 家族桶（#6）。
+
+    Anthropic rate-limit 桶是家族級：Opus 4.x 合併、Sonnet 4.x 合併、Sonnet 5 獨立、
+    Haiku 獨立（官方文檔）。`recent_heat` / launches ledger / `rate_state_heat` 三個 reader
+    都用本函式把 model 收斂成桶再比對，取代 exact model-id 相等——否則 `claude-sonnet-4-5`
+    與 `claude-sonnet-4-6` 被當兩桶（nudge under-match 靜默警告、ledger 少擋 burst）。
+
+    - `None` → `None`、`"unknown"`（不命中 regex）→ 原樣回傳：保住呼叫端的 unscoped-unknown 語意。
+    - 命中 `claude-<family>-<major>[-...]`（family ∈ opus/sonnet/haiku）→ `"<family>-<major>"`，
+      忽略 minor / date 後綴（`claude-haiku-4-5-20251001` → `haiku-4`）。
+    - 不命中（舊命名 scheme 如 `claude-3-5-sonnet-*`、他廠、亂碼）→ 回原值本身（保守
+      fall-through，只與自己相等，絕不 over-merge 兩個真實桶 → 不產生假的「熱」訊號）。
+    - 非字串非 None（防禦性，實務不該發生）→ 原樣回傳，絕不 raise（fail-open 紀律）。
+    """
+    if model_id is None:
+        return None
+    if not isinstance(model_id, str):
+        return model_id
+    m = _MODEL_BUCKET_RE.match(model_id.lower())
+    if m:
+        return "{family}-{major}".format(family=m.group(1), major=m.group(2))
+    return model_id
 
 
 def recent_heat(data_dir, window, now, model=None):
