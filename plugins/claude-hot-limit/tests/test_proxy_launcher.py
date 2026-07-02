@@ -126,12 +126,62 @@ class ProxyLauncherTest(unittest.TestCase):
         self.assertIn("ANTHROPIC_BASE_URL", out, "警告應含退回指引（提到導流 env），stdout=%r" % out)
 
     def test_disabled_kill_switch_wins_over_opt_in(self):
-        # <data>/disabled 檔案旗標 → 即使 opt-in 也靜默 no-op（與 pacing-guard kill-switch 一致）
+        # <data>/disabled 檔案旗標 → 即使 opt-in（無導流 env）也靜默 no-op（與 pacing-guard 一致）。
+        # 注意：這裡只設 CLAUDE_HOT_LIMIT_PROXY=1、沒設 ANTHROPIC_BASE_URL——沒有導流就沒有
+        # dead-port 風險，kill-switch 保持完全靜默是對的。有導流的警告見下一個測試。
         open(os.path.join(self.data, "disabled"), "w").close()
         code, out, err = run_launcher("ensure", self.opted())
         self.assertEqual(code, 0)
-        self.assertEqual(out, "", "kill-switch 下應靜默，stdout=%r" % out)
+        self.assertEqual(out, "", "kill-switch 下（無導流）應靜默，stdout=%r" % out)
         self.assertFalse(port_up(self.port), "kill-switch 下不該起 daemon")
+
+    # --- verify-fix（#8 verify findings 2/3/5/17：靜默 dead-port cluster 必須 fail-loud）---
+
+    def test_kill_switch_with_routing_warns_dead_port(self):
+        # [3][5] kill-switch 先於 opt-in 的靜默退出：若使用者導流 env 還在、port 又沒人聽，
+        # 「停用」等於靜默把全部 API 流量斷掉 → 必須警告（仍 exit 0、仍不起 daemon）。
+        open(os.path.join(self.data, "disabled"), "w").close()
+        env = dict(self.env, ANTHROPIC_BASE_URL="http://127.0.0.1:%d" % self.port)
+        code, out, err = run_launcher("ensure", env)
+        self.assertEqual(code, 0)
+        self.assertFalse(port_up(self.port), "kill-switch 下仍不該起 daemon")
+        self.assertIn("ANTHROPIC_BASE_URL", out,
+                      "kill-switch + 導流 + dead port → 必須警告，stdout=%r" % out)
+
+    def test_port_mismatch_warns_when_target_down(self):
+        # [2] URL 指向本機「另一個」port 且該 port 沒人聽：launcher 不管它（非 opt-in），
+        # 但這正是文件說的頭號風險情境 → 不可靜默，要提示 RATE_LIMIT_PROXY_PORT 對齊。
+        other = free_port()
+        env = dict(self.env, ANTHROPIC_BASE_URL="http://127.0.0.1:%d" % other)
+        code, out, err = run_launcher("ensure", env)
+        self.assertEqual(code, 0)
+        self.assertFalse(port_up(self.port), "mismatch 下不該起 launcher 管理的 daemon")
+        self.assertFalse(port_up(other), "mismatch 下也不該去佔別人的 port")
+        self.assertIn("RATE_LIMIT_PROXY_PORT", out,
+                      "port mismatch + target down → 必須提示對齊方式，stdout=%r" % out)
+
+    def test_https_scheme_warns_but_daemon_starts(self):
+        # [17] https:// 指向 plaintext proxy：gate 會過、daemon 健康、但 TLS handshake 必敗
+        # → daemon 照起（port/host 正確），另外警告 scheme。
+        env = dict(self.env, ANTHROPIC_BASE_URL="https://127.0.0.1:%d" % self.port)
+        code, out, err = run_launcher("ensure", env)
+        self.assertEqual(code, 0)
+        self.assertTrue(port_up(self.port), "host/port 正確，daemon 應照起")
+        self.assertIn("http://", out, "https scheme → 必須警告改用 http://，stdout=%r" % out)
+
+    def test_stop_does_not_kill_foreign_pid(self):
+        # [10][11] pidfile 的 pid 被 reuse 成無關 process → stop 不可誤殺；清 pidfile + 警告。
+        victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            with open(os.path.join(self.data, "proxy.pid"), "w") as f:
+                f.write(str(victim.pid))
+            code, out, err = run_launcher("stop", self.env)
+            self.assertEqual(code, 0)
+            self.assertIsNone(victim.poll(), "stop 誤殺了非 proxy 的 process（PID reuse 情境）")
+            self.assertIsNone(self.read_pid(), "stale pidfile 應被清除")
+        finally:
+            victim.kill()
+            victim.wait()
 
 
 if __name__ == "__main__":

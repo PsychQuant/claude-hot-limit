@@ -66,20 +66,32 @@ def kill_switch_on(d):
     return os.environ.get("CLAUDE_HOT_LIMIT_OFF") == "1" or os.path.exists(os.path.join(d, "disabled"))
 
 
+def _local_base_url():
+    """解析 ANTHROPIC_BASE_URL；指向本機（127.0.0.1/localhost）→ (scheme, host, port)，否則 None。
+
+    這是「使用者已把流量導到本機某 port」的事實訊號——不論那個 port 是不是我們管的。
+    verify findings 2/3/5：所有「導流存在但 launcher 決定不服務」的分支都必須據此 fail-loud，
+    不能靜默留下 dead-port（= 全流量斷，部署層頭號風險）。解析失敗 → None（保守）。"""
+    base = os.environ.get("ANTHROPIC_BASE_URL", "")
+    if not base:
+        return None
+    try:
+        u = urlparse(base)
+        host = (u.hostname or "").lower()
+        if host in ("127.0.0.1", "localhost"):
+            return (u.scheme or "http", host, u.port)
+    except Exception:
+        pass
+    return None
+
+
 def opted_in(port):
     """opt-in 訊號：ANTHROPIC_BASE_URL 指向本機 proxy port（主要路徑——導流設定即訊號），
     或 CLAUDE_HOT_LIMIT_PROXY=1 強制（測試 / 手動預熱用）。"""
     if os.environ.get("CLAUDE_HOT_LIMIT_PROXY") == "1":
         return True
-    base = os.environ.get("ANTHROPIC_BASE_URL", "")
-    if not base:
-        return False
-    try:
-        u = urlparse(base)
-        host = (u.hostname or "").lower()
-        return host in ("127.0.0.1", "localhost") and u.port == port
-    except Exception:
-        return False  # 解析不了的 URL 不當 opt-in（保守；絕不因壞 env 起 daemon）
+    base = _local_base_url()
+    return base is not None and base[2] == port
 
 
 def _pid_path(d):
@@ -105,10 +117,37 @@ def _fail_loud(port, log_path):
 def ensure():
     d = data_dir()
     port = proxy_port()
+    base = _local_base_url()
     if kill_switch_on(d):
-        return 0  # kill-switch 優先於 opt-in（與 pacing-guard 的 disabled 語意一致）
+        # kill-switch 優先於 opt-in（與 pacing-guard 的 disabled 語意一致）——但若使用者的
+        # 導流 env 還指著一個沒人聽的本機 port，「停用」等於靜默斷掉全部 API 流量
+        # （verify findings 3/5：kill-switch 的爆炸半徑從「關掉保護」變成「斷流量」）→ 警告。
+        if base is not None and base[2] is not None and not port_up(base[2]):
+            print(
+                "[claude-hot-limit] ⚠️ kill-switch（CLAUDE_HOT_LIMIT_OFF / disabled 檔）生效，"
+                "proxy daemon 不會啟動——但 ANTHROPIC_BASE_URL 仍指向本機 port {p} 且該 port "
+                "無人服務，所有 API 請求將無法送出。退回：移除 settings.json env 的 "
+                "ANTHROPIC_BASE_URL，或解除 kill-switch 後重啟 session。".format(p=base[2]))
+        return 0
     if not opted_in(port):
-        return 0  # 未 opt-in：完全靜默，絕不打擾沒用 proxy 的使用者
+        # 未 opt-in：對沒導流的使用者完全靜默。但「導流指向本機另一個 port 且那個 port 沒人聽」
+        # 是文件標明的頭號風險情境（verify finding 2：port mismatch 靜默 dead-port）→ 提示對齊。
+        if (base is not None and base[2] is not None
+                and base[2] != port and not port_up(base[2])):
+            print(
+                "[claude-hot-limit] ⚠️ ANTHROPIC_BASE_URL 指向本機 port {b}，但 launcher 管理的是 "
+                "RATE_LIMIT_PROXY_PORT={p}（不一致，daemon 不會啟動），且 port {b} 目前無人服務"
+                "——所有 API 請求將無法送出。若要用本 plugin 的 proxy：設 RATE_LIMIT_PROXY_PORT={b} "
+                "或把 URL 改成 port {p}。若 port {b} 是其他工具的 gateway，請確認它有啟動"
+                "（此警告可忽略）。".format(b=base[2], p=port))
+        return 0
+    if base is not None and base[0] == "https":
+        # verify finding 17：https:// 指向 plaintext proxy——gate 會過、daemon 健康，
+        # 但 Claude Code 對它做 TLS handshake 必敗。daemon 照起（host/port 正確），警告 scheme。
+        print(
+            "[claude-hot-limit] ⚠️ ANTHROPIC_BASE_URL 用 https:// 指向本機 proxy，但 proxy 是 "
+            "plaintext HTTP——TLS handshake 會失敗，所有請求無法送出。請改成 "
+            "http://127.0.0.1:{p}。".format(p=port))
     if port_up(port):
         return 0  # 已有 daemon（本 session 或別的 session 起的）→ 冪等 no-op
 
@@ -168,19 +207,40 @@ def ensure():
                 pass
 
 
+def _pid_command(pid):
+    """回傳 pid 的 command line（`ps -o command=`），查不到 / 平台無 ps → None（unknown）。"""
+    try:
+        out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() or None
+    except Exception:
+        return None
+
+
 def stop():
-    """SIGTERM pidfile 記錄的 daemon 並清 pidfile。冪等：無 pidfile / process 已死都安靜成功。"""
+    """SIGTERM pidfile 記錄的 daemon 並清 pidfile。冪等：無 pidfile / process 已死都安靜成功。
+
+    身分驗證（verify findings 10/11）：pidfile 可能因 daemon 死亡 + OS PID reuse 而指向無關
+    process——SIGTERM 前先看 command line 含 rate-limit-proxy 才殺；確認是別人 → 不殺、警告、
+    只清 stale pidfile。查不到 command（unknown，如無 ps 的平台）→ 沿用舊行為照殺（保守的
+    另一面：讓 stop 在 degraded 平台仍能運作）。"""
     d = data_dir()
     port = proxy_port()
     pid = _read_pid(d)
     if pid is not None:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
-        deadline = time.time() + 2.0
-        while time.time() < deadline and port_up(port):
-            time.sleep(0.05)
+        cmd = _pid_command(pid)
+        if cmd is not None and "rate-limit-proxy" not in cmd:
+            print("[claude-hot-limit] ⚠️ pidfile 的 pid {pid} 不是 rate-limit-proxy"
+                  "（command: {cmd}；PID reuse？）——不 kill，僅清除 stale pidfile。".format(
+                      pid=pid, cmd=cmd[:120]))
+        else:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+            deadline = time.time() + 2.0
+            while time.time() < deadline and port_up(port):
+                time.sleep(0.05)
     try:
         os.remove(_pid_path(d))
     except FileNotFoundError:
