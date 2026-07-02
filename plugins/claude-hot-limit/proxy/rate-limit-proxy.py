@@ -84,6 +84,25 @@ def extract_usage_from_body(resp_body):
     return usage if isinstance(usage, dict) else None
 
 
+def extract_model_from_request(req_body):
+    """從【請求】body（Anthropic Messages API，JSON，頂層有 model）取 model（#4）。
+
+    方向與 rate-limit header / usage 擷取相反——那些讀「回應」，這個讀「請求」，好讓
+    rate_state_heat() 能按 model 分桶（見 pacing-guard.py model_bucket()）。fail-open：
+    body 非 JSON、無 model 鍵、或非字串 → None（呼叫端記成 null），絕不影響轉發。
+    """
+    if not req_body:
+        return None
+    try:
+        obj = json.loads(req_body)
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    model = obj.get("model")
+    return model if isinstance(model, str) else None
+
+
 def accumulate_usage_from_sse_event(event_bytes, usage_acc):
     """一個完整 SSE event（不含結尾 \\n\\n）：逐行找 `data: {...}`，把裡面的 usage
     merge 進 usage_acc（後面事件的欄位覆蓋前面——例如 message_delta 的 output_tokens
@@ -152,6 +171,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle(self):
         body = self._read_request_body()
+        req_model = extract_model_from_request(body)  # #4：請求 body 的 model，供 rate_state_heat 分桶
         url = self._upstream().rstrip("/") + self.path
         req = urllib.request.Request(url, data=body if body else None,
                                       method=self.command, headers=self._forward_headers())
@@ -164,20 +184,20 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             status = e.code
             resp_headers = list(e.headers.items()) if e.headers else []
             resp_body = e.read()
-            self._record_state(resp_headers, resp_body)
+            self._record_state(resp_headers, resp_body, req_model)
             self._forward_buffered(status, resp_headers, resp_body)
             return
 
         content_type = dict((k.lower(), v) for k, v in resp_headers).get("content-type", "")
         if content_type.startswith("text/event-stream"):
-            self._forward_streaming(status, resp_headers, upstream_resp)
+            self._forward_streaming(status, resp_headers, upstream_resp, req_model)
         else:
             resp_body = upstream_resp.read()
-            self._record_state(resp_headers, resp_body)
+            self._record_state(resp_headers, resp_body, req_model)
             self._forward_buffered(status, resp_headers, resp_body)
 
-    def _record_state(self, resp_headers, resp_body):
-        record = {"ts": time.time()}
+    def _record_state(self, resp_headers, resp_body, req_model=None):
+        record = {"ts": time.time(), "model": req_model}
         record.update(extract_rate_limit_fields(resp_headers))
         record["usage"] = extract_usage_from_body(resp_body)
         write_state_record(self._state_file(), record)
@@ -192,7 +212,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(resp_body)
 
-    def _forward_streaming(self, status, resp_headers, upstream_resp):
+    def _forward_streaming(self, status, resp_headers, upstream_resp, req_model=None):
         """逐 byte 讀、逐 byte 轉發（HTTP chunked encoding），保證不整段 buffer 才轉發。
 
         側路（不影響轉發時序）累積每個 SSE event 的 usage 欄位；串流結束（EOF）後才把
@@ -226,7 +246,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(b"0\r\n\r\n")
         self.wfile.flush()
 
-        record = {"ts": time.time()}
+        record = {"ts": time.time(), "model": req_model}
         record.update(extract_rate_limit_fields(resp_headers))
         record["usage"] = usage_acc or None
         write_state_record(self._state_file(), record)

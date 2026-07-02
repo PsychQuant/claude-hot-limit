@@ -485,5 +485,62 @@ class FailOpenStateFileWriteTest(unittest.TestCase):
                           "狀態檔理應寫不出來（父路徑被檔案佔用）")
 
 
+class RequestModelCaptureTest(unittest.TestCase):
+    """#4 — proxy 解析【請求】body 取 top-level model 寫進狀態檔記錄（方向與 header/usage
+    擷取相反：那些讀回應，這個讀請求）。fail-open：非 JSON / 無 model → null，轉發不受影響。"""
+
+    def setUp(self):
+        self.mock, self.mock_url = start_mock_upstream()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state_file = os.path.join(self.tmp.name, "rate-state.jsonl")
+        MockUpstreamHandler.response_status = 200
+        MockUpstreamHandler.response_headers = {"Content-Type": "application/json"}
+        MockUpstreamHandler.response_body = b'{"hello": "world"}'
+        MockUpstreamHandler.sse_chunks = None
+
+    def tearDown(self):
+        self.mock.shutdown()
+        self.tmp.cleanup()
+
+    def _post(self, data_bytes, content_type="application/json"):
+        proxy_server, proxy_url, _ = start_proxy(self.mock_url, self.state_file)
+        try:
+            req = urllib.request.Request(
+                proxy_url + "/v1/messages", data=data_bytes, method="POST",
+                headers={"Content-Type": content_type})
+            resp = urllib.request.urlopen(req)
+            body = resp.read()
+            time.sleep(0.1)  # 讓狀態檔寫入完成
+            return resp, body
+        finally:
+            proxy_server.shutdown()
+
+    def test_request_model_captured_into_state_record(self):
+        resp, body = self._post(b'{"model": "claude-sonnet-5", "messages": []}')
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(body, b'{"hello": "world"}', "轉發不受 model 擷取影響")
+        records = read_jsonl(self.state_file)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].get("model"), "claude-sonnet-5",
+                          "請求 body 的 top-level model 應寫進狀態檔記錄，record=%r" % records[0])
+
+    def test_request_without_model_records_null(self):
+        resp, body = self._post(b'{"messages": [], "max_tokens": 10}')
+        self.assertEqual(resp.status, 200)
+        records = read_jsonl(self.state_file)
+        self.assertEqual(len(records), 1)
+        self.assertIsNone(records[0].get("model"),
+                          "合法 JSON 但無 model → 記 null，record=%r" % records[0])
+
+    def test_non_json_request_body_records_null_and_forwards(self):
+        resp, body = self._post(b'not json at all', content_type="text/plain")
+        self.assertEqual(resp.status, 200, "非 JSON 請求仍應正常轉發")
+        self.assertEqual(body, b'{"hello": "world"}', "非 JSON body 不該影響轉發")
+        records = read_jsonl(self.state_file)
+        self.assertEqual(len(records), 1)
+        self.assertIsNone(records[0].get("model"),
+                          "非 JSON 請求 body → model 記 null，record=%r" % records[0])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
