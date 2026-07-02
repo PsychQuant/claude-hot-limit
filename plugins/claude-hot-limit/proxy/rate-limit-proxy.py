@@ -52,11 +52,12 @@ def resolve_state_file():
     與 hooks（pacing-guard / trip-recorder）+ proxy-launcher 的 data-dir 慣例對齊
     （`CLAUDE_HOT_LIMIT_DATA` or `~/.cache/claude-hot-limit`）——消費端 `rate_state_heat()`
     正是從這個 data dir 找檔，寫死 `~/.cache` 會在使用者覆寫 data dir 時 split-brain。
-    在呼叫時（非 import 時）讀 env，測試 / 多環境隔離才生效。"""
-    data = os.environ.get("CLAUDE_HOT_LIMIT_DATA")
-    if data:
-        return os.path.join(os.path.expanduser(data), "rate-state.jsonl")
-    return DEFAULT_STATE_FILE
+    在呼叫時（非 import 時）讀 env，測試 / 多環境隔離才生效。**解析式與消費端逐字相同**
+    （`pacing-guard.py` / `proxy-launcher.py` 皆 `os.environ.get(...) or expanduser(~/.cache/...)`，
+    且**不**對 env 值做 expanduser）——刻意不對 env 值 expanduser，否則 `CLAUDE_HOT_LIMIT_DATA=~/foo`
+    會讓 proxy（展開）與消費端（不展開）再度 split-brain。path-identity 才是本函式的不變量。"""
+    data_dir = os.environ.get("CLAUDE_HOT_LIMIT_DATA") or os.path.expanduser("~/.cache/claude-hot-limit")
+    return os.path.join(data_dir, "rate-state.jsonl")
 
 
 # 官方 rate-limit response header → 狀態檔欄位名。三組（requests/input-tokens/

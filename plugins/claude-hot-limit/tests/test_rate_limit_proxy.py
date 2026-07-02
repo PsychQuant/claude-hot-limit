@@ -443,6 +443,24 @@ class StateFileDataDirTest(unittest.TestCase):
         finally:
             proxy_server.shutdown()
 
+    def test_env_value_not_expanduser_ed_matches_consumer(self):
+        # #9 verify catch：消費端（pacing-guard:406 / launcher data_dir()）對 env 值**不**做
+        # expanduser（只對 ~/.cache 預設做）。proxy 必須逐字一致，否則 CLAUDE_HOT_LIMIT_DATA=~/foo
+        # 時 proxy 展開、消費端不展開 → 再度 split-brain。path-identity 是不變量，不是「更正確的
+        # tilde 處理」。
+        prev = os.environ.get("CLAUDE_HOT_LIMIT_DATA")
+        os.environ["CLAUDE_HOT_LIMIT_DATA"] = "~/literal-tilde-dir"
+        try:
+            rlp = _load_proxy_module()
+            self.assertEqual(rlp.resolve_state_file(),
+                             os.path.join("~/literal-tilde-dir", "rate-state.jsonl"),
+                             "env 值不可被 expanduser（須與 pacing-guard / launcher 逐字一致）")
+        finally:
+            if prev is None:
+                os.environ.pop("CLAUDE_HOT_LIMIT_DATA", None)
+            else:
+                os.environ["CLAUDE_HOT_LIMIT_DATA"] = prev
+
 
 class FailOpenErrorPassthroughTest(unittest.TestCase):
     """2.3 — 上游錯誤原樣轉發，不吞不重試，且仍記錄狀態檔一筆。"""
