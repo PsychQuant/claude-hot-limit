@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.6.0
+
+- **feat（trip-recorder / heat-nudge 補齊 per-model 分桶，#2）**：v1.4.0 只把 `launches.jsonl`
+  的 burst 計數 per-model，`trips-raw.jsonl` 與 `recent_heat()` 的 Workflow 寬度提醒仍全模型混記。
+  本版讓 StopFailure trip 透過 transcript-tail 偵測標註撞牆 model、`recent_heat()` 按 model 過濾
+  （`"unknown"`/缺欄位兩側視為 **unscoped**——只有「兩側都是已知且不同的真實 model」才排除，
+  避免偵測失敗靜默所有 nudge）。舊格式列保守計入任何 model 窗口。
+- **feat（MAX / MIN_GAP 檔案旗標即時切換，#3）**：新增 `<data_dir>/max-override`、
+  `min-gap-override`，每次 hook 執行重讀（檔案 → env → code default，fail-open）。env var 不
+  hot-reload，檔案旗標讓觀測↔保護模式免重開 session 即時切換。`disabled` kill-switch 檢查提前於
+  override 讀取，FIFO override 時仍能救援。
+- **fix（robustness hardening，3 輪對抗性驗證）**：兩個 JSONL reader（`recent_heat()` + launches
+  ledger）改逐行整段 try/except——非 dict payload 列 / 毒列只跳過該列，不再讓一行壞資料靜默所有
+  nudge 或**永久**殺死整個 guard；`detect_model()` 對非 dict JSON `isinstance` 防禦（兩副本同步）、
+  只讀一般檔案（`os.path.isfile`，FIFO 不 block dump）、`split("\n")` 取代 `splitlines()`（U+2028/
+  U+2029 內嵌片段不再冒充 model）；`max-override` ≤ 0 給正常 deny 不再 IndexError crash、deny 訊息
+  改「凍結」指引；`file_override_int` 有界讀取 + 壞內容 stderr 警告。
+- **test**：全套 **80/80 綠**（每個 fix 先寫 RED 測試證明問題真實——含兩個 FIFO 測試 RED 時實際
+  block 30 秒、U+2028 測試 RED 時實際冒充成 spoofed-evil）。
+- **deferred**：finding 9（exact model-id 相等 ≠ rate-limit bucket 相等，同族變體互不計入）→ issue
+  **#6**（需 model→bucket taxonomy 設計，與 #4 同主題）。
+
 ## 1.5.0
 
 - **feat（rate-limit-proxy，Phase 1 純觀測）**：新增 `proxy/rate-limit-proxy.py`——本地 HTTP
