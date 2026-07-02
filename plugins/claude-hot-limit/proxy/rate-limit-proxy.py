@@ -46,6 +46,19 @@ def resolve_upstream():
     return os.environ.get("RATE_LIMIT_PROXY_UPSTREAM", DEFAULT_UPSTREAM)
 
 
+def resolve_state_file():
+    """rate-state.jsonl 路徑：尊重 `CLAUDE_HOT_LIMIT_DATA`（#9），未設才落 DEFAULT。
+
+    與 hooks（pacing-guard / trip-recorder）+ proxy-launcher 的 data-dir 慣例對齊
+    （`CLAUDE_HOT_LIMIT_DATA` or `~/.cache/claude-hot-limit`）——消費端 `rate_state_heat()`
+    正是從這個 data dir 找檔，寫死 `~/.cache` 會在使用者覆寫 data dir 時 split-brain。
+    在呼叫時（非 import 時）讀 env，測試 / 多環境隔離才生效。"""
+    data = os.environ.get("CLAUDE_HOT_LIMIT_DATA")
+    if data:
+        return os.path.join(os.path.expanduser(data), "rate-state.jsonl")
+    return DEFAULT_STATE_FILE
+
+
 # 官方 rate-limit response header → 狀態檔欄位名。三組（requests/input-tokens/
 # output-tokens）都各自獨立擷取 remaining 與 reset，缺欄位一律記 null（寧記勿漏）。
 _RATE_LIMIT_HEADER_MAP = {
@@ -160,7 +173,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         return self.upstream_base_url or resolve_upstream()
 
     def _state_file(self):
-        return self.state_file_path or DEFAULT_STATE_FILE
+        return self.state_file_path or resolve_state_file()
 
     def _read_request_body(self):
         length = int(self.headers.get("Content-Length", 0) or 0)

@@ -397,6 +397,53 @@ class TokenUsageCaptureTest(unittest.TestCase):
             proxy_server.shutdown()
 
 
+class StateFileDataDirTest(unittest.TestCase):
+    """#9 — state 檔預設路徑須尊重 CLAUDE_HOT_LIMIT_DATA，不可寫死 ~/.cache。
+
+    消費端（pacing-guard 的 rate_state_heat）從 CLAUDE_HOT_LIMIT_DATA 解析 data dir 找
+    rate-state.jsonl；proxy 若寫死 ~/.cache 就 split-brain（proxy 寫 A、guard 讀 B）。
+    測試刻意同時覆寫 HOME + CLAUDE_HOT_LIMIT_DATA 到不同 temp dir：RED 時記錄落在
+    HOME/.cache（DEFAULT），GREEN 時落在 CLAUDE_HOT_LIMIT_DATA——兩者都在 temp，
+    絕不污染真實 ~/.cache 的觀測資料集。"""
+
+    def setUp(self):
+        self.mock, self.mock_url = start_mock_upstream()
+        self.tmp_home = tempfile.TemporaryDirectory()
+        self.tmp_data = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.mock.shutdown()
+        self.tmp_home.cleanup()
+        self.tmp_data.cleanup()
+
+    def test_state_written_under_data_dir_env(self):
+        MockUpstreamHandler.response_status = 200
+        MockUpstreamHandler.response_headers = {"Content-Type": "application/json"}
+        MockUpstreamHandler.response_body = json.dumps({"usage": {"input_tokens": 1, "output_tokens": 1}}).encode()
+        MockUpstreamHandler.sse_chunks = None
+
+        # state_file=None → 走 _state_file() 的預設解析（正是本 issue 要修的路徑）
+        proxy_server, proxy_url, _ = start_proxy(
+            self.mock_url, state_file=None,
+            env_overrides={"HOME": self.tmp_home.name,
+                           "CLAUDE_HOT_LIMIT_DATA": self.tmp_data.name})
+        try:
+            req = urllib.request.Request(proxy_url + "/v1/messages", data=b'{"model":"x"}', method="POST")
+            urllib.request.urlopen(req).read()
+            time.sleep(0.1)
+
+            expected = os.path.join(self.tmp_data.name, "rate-state.jsonl")
+            self.assertTrue(os.path.exists(expected),
+                            "state 應寫進 CLAUDE_HOT_LIMIT_DATA/rate-state.jsonl，實際不存在（寫死 ~/.cache?）")
+            self.assertEqual(len(read_jsonl(expected)), 1)
+            # 不該落在寫死的 HOME/.cache 預設路徑
+            leaked = os.path.join(self.tmp_home.name, ".cache", "claude-hot-limit", "rate-state.jsonl")
+            self.assertFalse(os.path.exists(leaked),
+                             "state 不該落在寫死的 ~/.cache 預設（split-brain），實際落在 %r" % leaked)
+        finally:
+            proxy_server.shutdown()
+
+
 class FailOpenErrorPassthroughTest(unittest.TestCase):
     """2.3 — 上游錯誤原樣轉發，不吞不重試，且仍記錄狀態檔一筆。"""
 
