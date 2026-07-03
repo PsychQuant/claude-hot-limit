@@ -666,5 +666,92 @@ class RequestModelCaptureTest(unittest.TestCase):
                           "非 JSON 請求 body → model 記 null，record=%r" % records[0])
 
 
+class StatusCodeCaptureTest(unittest.TestCase):
+    """#13 — 把 HTTP response status code 寫進狀態檔記錄。
+
+    429（rate-limit）的 status 恆在 upstream 回應的 status line 上（proxy 的 HTTPError
+    分支 e.code），與 anthropic-ratelimit-* header 是否回傳無關——所以就算 Max 訂閱下
+    header 全 null（#12），status==429 仍是可靠的「撞牆偵測」訊號，零 header 依賴。
+    proxy 已把 429 route 進 _record_state，先前只是沒記 status；本測試釘住三條路徑
+    （buffered 200 / HTTPError 429 / streaming）都寫出 status。reactive-only 邊界：
+    status 記的是「撞到了」，不含 remaining budget（predictive 見 #7 Residue）。"""
+
+    def setUp(self):
+        self.mock, self.mock_url = start_mock_upstream()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state_file = os.path.join(self.tmp.name, "rate-state.jsonl")
+
+    def tearDown(self):
+        self.mock.shutdown()
+        self.tmp.cleanup()
+
+    def test_success_status_recorded(self):
+        MockUpstreamHandler.response_status = 200
+        MockUpstreamHandler.response_headers = {"Content-Type": "application/json"}
+        MockUpstreamHandler.response_body = b'{"ok": true}'
+        MockUpstreamHandler.sse_chunks = None
+
+        proxy_server, proxy_url, _ = start_proxy(self.mock_url, self.state_file)
+        try:
+            req = urllib.request.Request(proxy_url + "/v1/messages", data=b'{"model":"x"}', method="POST")
+            urllib.request.urlopen(req).read()
+            time.sleep(0.1)
+            rows = read_jsonl(self.state_file)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].get("status"), 200,
+                              "buffered 成功回應的 status 應寫進記錄，record=%r" % rows[0])
+        finally:
+            proxy_server.shutdown()
+
+    def test_rate_limit_429_status_recorded(self):
+        # 核心案例：429 走 HTTPError 分支（e.code），header 即使缺失（Max 邊界）status 仍在。
+        MockUpstreamHandler.response_status = 429
+        MockUpstreamHandler.response_headers = {"Content-Type": "application/json"}  # 刻意無 ratelimit header
+        MockUpstreamHandler.response_body = b'{"error": {"type": "rate_limit_error"}}'
+        MockUpstreamHandler.sse_chunks = None
+
+        proxy_server, proxy_url, _ = start_proxy(self.mock_url, self.state_file)
+        try:
+            req = urllib.request.Request(proxy_url + "/v1/messages", data=b'{"model":"x"}', method="POST")
+            try:
+                urllib.request.urlopen(req)
+                self.fail("預期 429 會 raise HTTPError")
+            except urllib.error.HTTPError as e:
+                self.assertEqual(e.code, 429)
+            time.sleep(0.1)
+            rows = read_jsonl(self.state_file)
+            self.assertEqual(len(rows), 1, "429 仍應記錄一筆")
+            self.assertEqual(rows[0].get("status"), 429,
+                              "429 撞牆的 status 應寫進記錄（零 header 依賴），record=%r" % rows[0])
+            # 補釘 reactive-only 邊界：header 缺失時 rl_* 仍為 null，status 卻已捕捉撞牆
+            self.assertIsNone(rows[0].get("rl_requests_remaining"),
+                              "本案例刻意無 ratelimit header → rl_* null，但 status 已記到 429")
+        finally:
+            proxy_server.shutdown()
+
+    def test_streaming_status_recorded(self):
+        MockUpstreamHandler.sse_chunks = [
+            b'data: {"type": "message_start"}\n\n',
+            b'data: {"type": "message_stop"}\n\n',
+        ]
+        MockUpstreamHandler.chunk_delay = 0
+        MockUpstreamHandler.response_status = 200
+        MockUpstreamHandler.response_headers = {}
+
+        proxy_server, proxy_url, _ = start_proxy(self.mock_url, self.state_file)
+        try:
+            req = urllib.request.Request(proxy_url + "/v1/messages",
+                                          data=b'{"model":"x","stream":true}', method="POST")
+            urllib.request.urlopen(req).read()
+            time.sleep(0.1)
+            rows = read_jsonl(self.state_file)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].get("status"), 200,
+                              "streaming 路徑也應記 status，record=%r" % rows[0])
+        finally:
+            MockUpstreamHandler.sse_chunks = None
+            proxy_server.shutdown()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

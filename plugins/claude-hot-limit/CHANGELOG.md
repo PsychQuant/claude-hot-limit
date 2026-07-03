@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.10.0
+
+- **feat（proxy 記錄 HTTP response `status`，#13）**：Claude Code 2.1.200 更新後在 UI 顯式顯示
+  429 rate-limit 重試（`attempt N/10` + 退避秒數，`CLAUDE_CODE_MAX_RETRIES` 預設 10 ↔ 觀察到的
+  `/10`）。issue #13 想確認這能否成為**不依賴 header** 的觀測管道 —— 直接呼應 #12 的頭號負面結果
+  （Max 訂閱下 `anthropic-ratelimit-*` header 0/1134 命中）。recon（WebFetch 官方 telemetry 文檔
+  + 讀 proxy 原始碼）發現 **proxy 早已把 429 route 進 `_record_state`，只是沒記 status** → 429
+  落進與「成功但無 header」無法區分的 record，訊號被吞。本版把 `status` thread 進 `_record_state`
+  + streaming inline record（三條路徑：buffered 200 / HTTPError 429 / streaming）。429 恆在
+  `HTTPError.e.code`，**零 header 依賴 → 直接補 #12 缺口**；且 proxy 在 request 路徑上，每次
+  retry 是獨立 request 穿過它 → 抓得到 OTel（`claude_code.api_error` 終局事件）看不到的中間態 429。
+- **誠實邊界（reactive-only）**：`status` 記的是「撞到了」，**不含** remaining budget → 補的是「撞牆
+  偵測」，**非** #7 想要的 predictive 排程（撞牆前）。predictive on Max 仍卡在 #12 的 header 缺口
+  （#13 diagnosis Residue 明確標記）。OTel 作為 proxy-independent 管道留待另開 follow-up（官方、
+  結構化，但需架 OTLP collector）。
+- **test（+3，proxy 套件 22 綠）**：`StatusCodeCaptureTest` 釘住三路徑；429 案例刻意無 ratelimit
+  header 以證明 status 與 header 解耦（rl_* null 但 status==429）。既有 fail-open / 轉發時序測試無回歸。
+
 ## 1.9.0
 
 - **fix（proxy state 檔尊重 `CLAUDE_HOT_LIMIT_DATA`，#9）**：`rate-limit-proxy.py` 的

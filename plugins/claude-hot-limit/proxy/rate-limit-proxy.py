@@ -219,11 +219,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             status = upstream_resp.status
             resp_headers = list(upstream_resp.headers.items())
         except urllib.error.HTTPError as e:
-            # upstream 回非 2xx：urlopen 會 raise，但這仍是一個要「原樣轉發」的真實回應。
+            # upstream 回非 2xx（含 429 撞牆）：urlopen 會 raise，但這仍是一個要「原樣轉發」
+            # 的真實回應。e.code 即 HTTP status——429 恆在此，與 ratelimit header 是否回傳
+            # 無關（#13：Max 訂閱下 header 全 null 時，status 仍是可靠的撞牆偵測訊號）。
             status = e.code
             resp_headers = list(e.headers.items()) if e.headers else []
             resp_body = e.read()
-            self._record_state(resp_headers, resp_body, req_model)
+            self._record_state(status, resp_headers, resp_body, req_model)
             self._forward_buffered(status, resp_headers, resp_body)
             return
 
@@ -232,12 +234,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self._forward_streaming(status, resp_headers, upstream_resp, req_model)
         else:
             resp_body = upstream_resp.read()
-            self._record_state(resp_headers, resp_body, req_model)
+            self._record_state(status, resp_headers, resp_body, req_model)
             self._forward_buffered(status, resp_headers, resp_body)
 
-    def _record_state(self, resp_headers, resp_body, req_model=None):
+    def _record_state(self, status, resp_headers, resp_body, req_model=None):
         maybe_debug_dump_headers(self._state_file(), resp_headers)  # #12 opt-in 診斷（預設 no-op）
-        record = {"ts": time.time(), "model": req_model}
+        # status（#13）：reactive「撞牆偵測」訊號——429 恆記到，零 header 依賴（補 #12 缺口）。
+        # 記的是「撞到了」，不含 remaining budget（predictive 排程見 #7，結構上另一條路）。
+        record = {"ts": time.time(), "model": req_model, "status": status}
         record.update(extract_rate_limit_fields(resp_headers))
         record["usage"] = extract_usage_from_body(resp_body)
         write_state_record(self._state_file(), record)
@@ -287,7 +291,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.flush()
 
         maybe_debug_dump_headers(self._state_file(), resp_headers)  # #12 opt-in 診斷（streaming 路徑）
-        record = {"ts": time.time(), "model": req_model}
+        record = {"ts": time.time(), "model": req_model, "status": status}  # status（#13）：同 _record_state
         record.update(extract_rate_limit_fields(resp_headers))
         record["usage"] = usage_acc or None
         write_state_record(self._state_file(), record)
