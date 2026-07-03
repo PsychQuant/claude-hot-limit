@@ -239,8 +239,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
     def _record_state(self, status, resp_headers, resp_body, req_model=None):
         maybe_debug_dump_headers(self._state_file(), resp_headers)  # #12 opt-in 診斷（預設 no-op）
-        # status（#13）：reactive「撞牆偵測」訊號——429 恆記到，零 header 依賴（補 #12 缺口）。
-        # 記的是「撞到了」，不含 remaining budget（predictive 排程見 #7，結構上另一條路）。
+        # status（#13）：**admission-time** 非-2xx 撞牆訊號——upstream 直接回 HTTP 429/529 時，
+        # status 由 HTTPError.e.code 取得、零 header 依賴（補 #12 缺口）。**涵蓋邊界（誠實）**：
+        # 只捕捉 admission-time HTTP status；**不含** ① mid-stream SSE in-band error（HTTP 200 +
+        # error event，status 仍 200）② transport failure（URLError，無 HTTP status，該 request
+        # 不寫 record）③ client-side local throttle。也不含 remaining budget（predictive 見 #7）。
         record = {"ts": time.time(), "model": req_model, "status": status}
         record.update(extract_rate_limit_fields(resp_headers))
         record["usage"] = extract_usage_from_body(resp_body)

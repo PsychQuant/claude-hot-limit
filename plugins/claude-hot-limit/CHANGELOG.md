@@ -11,10 +11,15 @@
   + streaming inline record（三條路徑：buffered 200 / HTTPError 429 / streaming）。429 恆在
   `HTTPError.e.code`，**零 header 依賴 → 直接補 #12 缺口**；且 proxy 在 request 路徑上，每次
   retry 是獨立 request 穿過它 → 抓得到 OTel（`claude_code.api_error` 終局事件）看不到的中間態 429。
-- **誠實邊界（reactive-only）**：`status` 記的是「撞到了」，**不含** remaining budget → 補的是「撞牆
-  偵測」，**非** #7 想要的 predictive 排程（撞牆前）。predictive on Max 仍卡在 #12 的 header 缺口
-  （#13 diagnosis Residue 明確標記）。OTel 作為 proxy-independent 管道留待另開 follow-up（官方、
-  結構化，但需架 OTLP collector）。
+- **誠實邊界（reactive-only + admission-time；verify DA+Codex 跨模型收斂降調）**：`status` 記的是
+  「撞到了」，**不含** remaining budget → 補的是「**admission-time** 撞牆偵測」（upstream 直接回 HTTP
+  429/529），**非** #7 想要的 predictive 排程（撞牆前）。**涵蓋邊界**：不含 ① mid-stream SSE in-band
+  error（HTTP 200 後才出錯，status 仍 200）② transport failure（`URLError`，無 HTTP status）③ client
+  local throttle。predictive on Max 仍卡在 #12 的 header 缺口（#13 diagnosis Residue 明確標記）。OTel
+  作為 proxy-independent 管道留待另開 follow-up（官方、結構化，但需架 OTLP collector）。
+- **test 補強（verify Codex 建議）**：加 529 test（證明非-429 非-2xx 也記 status）+ retry-sequence
+  test（429→429→200 三獨立 request → 三筆 record，釘死「每次 retry 獨立穿過 proxy」宣稱）。proxy
+  套件 **24 tests 綠**。streaming in-band error 的偵測缺口 + transport-failure 記錄留 follow-up。
 - **test（+3，proxy 套件 22 綠）**：`StatusCodeCaptureTest` 釘住三路徑；429 案例刻意無 ratelimit
   header 以證明 status 與 header 解耦（rl_* null 但 status==429）。既有 fail-open / 轉發時序測試無回歸。
 

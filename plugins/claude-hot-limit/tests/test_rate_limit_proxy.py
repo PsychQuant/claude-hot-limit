@@ -45,6 +45,7 @@ class MockUpstreamHandler(http.server.BaseHTTPRequestHandler):
     sse_chunks = None  # list[bytes]，設定時走 streaming 模式，忽略 response_body
     received = []  # list[dict]，每筆 {"method", "path", "headers", "body"}
     chunk_delay = 0  # 每個 SSE chunk 之間的人工延遲（秒），測 streaming 時序用
+    status_sequence = None  # list[int]（#13 retry-sequence test）；設定時每個 request 依序 pop 一個 status，None → 用 response_status（既有行為不變）
 
     def log_message(self, *args):
         pass  # 安靜，不要污染測試輸出
@@ -58,8 +59,12 @@ class MockUpstreamHandler(http.server.BaseHTTPRequestHandler):
             "headers": dict(self.headers.items()),
             "body": body,
         })
+        # #13：per-request status 序列（模擬 429→429→200 的 retry 序列）；未設定時退回 response_status。
+        status = self.response_status
+        if MockUpstreamHandler.status_sequence:
+            status = MockUpstreamHandler.status_sequence.pop(0)
         if MockUpstreamHandler.sse_chunks is not None:
-            self.send_response(self.response_status)
+            self.send_response(status)
             self.send_header("Content-Type", "text/event-stream")
             for k, v in self.response_headers.items():
                 self.send_header(k, v)
@@ -70,7 +75,7 @@ class MockUpstreamHandler(http.server.BaseHTTPRequestHandler):
                 if self.chunk_delay:
                     time.sleep(self.chunk_delay)
             return
-        self.send_response(self.response_status)
+        self.send_response(status)
         for k, v in self.response_headers.items():
             self.send_header(k, v)
         self.send_header("Content-Length", str(len(self.response_body)))
@@ -671,10 +676,15 @@ class StatusCodeCaptureTest(unittest.TestCase):
 
     429（rate-limit）的 status 恆在 upstream 回應的 status line 上（proxy 的 HTTPError
     分支 e.code），與 anthropic-ratelimit-* header 是否回傳無關——所以就算 Max 訂閱下
-    header 全 null（#12），status==429 仍是可靠的「撞牆偵測」訊號，零 header 依賴。
-    proxy 已把 429 route 進 _record_state，先前只是沒記 status；本測試釘住三條路徑
-    （buffered 200 / HTTPError 429 / streaming）都寫出 status。reactive-only 邊界：
-    status 記的是「撞到了」，不含 remaining budget（predictive 見 #7 Residue）。"""
+    header 全 null（#12），status==429 仍是可靠的 **admission-time 撞牆偵測**訊號，零
+    header 依賴。proxy 已把 429 route 進 _record_state，先前只是沒記 status；本測試釘住
+    三條路徑（buffered 200 / HTTPError 429 / streaming）都寫出 status，另加 529（非-429
+    非-2xx 也記）+ retry-sequence（429→429→200 三獨立 request → 三筆 record）。
+
+    **涵蓋邊界（verify DA+Codex 跨模型收斂）**：本機制只捕捉 admission-time HTTP status，
+    **不含** mid-stream SSE in-band error（HTTP 200 後才出錯，status 仍 200）與 transport
+    failure（URLError 無 HTTP status）——那兩個缺口留 follow-up，非本 test 範疇。
+    reactive-only：status 記「撞到了」不含 remaining budget（predictive 見 #7 Residue）。"""
 
     def setUp(self):
         self.mock, self.mock_url = start_mock_upstream()
@@ -750,6 +760,54 @@ class StatusCodeCaptureTest(unittest.TestCase):
                               "streaming 路徑也應記 status，record=%r" % rows[0])
         finally:
             MockUpstreamHandler.sse_chunks = None
+            proxy_server.shutdown()
+
+    def test_overloaded_529_status_recorded(self):
+        # 非-429 非-2xx 也應記 status（docs 提 429/529，先前只測 429）。529 同走 HTTPError.e.code。
+        MockUpstreamHandler.response_status = 529
+        MockUpstreamHandler.response_headers = {"Content-Type": "application/json"}
+        MockUpstreamHandler.response_body = b'{"error": {"type": "overloaded_error"}}'
+        MockUpstreamHandler.sse_chunks = None
+
+        proxy_server, proxy_url, _ = start_proxy(self.mock_url, self.state_file)
+        try:
+            req = urllib.request.Request(proxy_url + "/v1/messages", data=b'{"model":"x"}', method="POST")
+            try:
+                urllib.request.urlopen(req)
+                self.fail("預期 529 會 raise HTTPError")
+            except urllib.error.HTTPError as e:
+                self.assertEqual(e.code, 529)
+            time.sleep(0.1)
+            rows = read_jsonl(self.state_file)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].get("status"), 529,
+                              "529 overload 也應記 status（非只 429），record=%r" % rows[0])
+        finally:
+            proxy_server.shutdown()
+
+    def test_retry_sequence_records_each_request(self):
+        # 釘死 CHANGELOG 宣稱「每次 retry 是獨立 request 穿過 proxy → 抓得到中間態 429」。
+        # mock 依序回 429→429→200；client 送 3 次 → state file 應有 3 筆，status 各為 429/429/200。
+        MockUpstreamHandler.status_sequence = [429, 429, 200]
+        MockUpstreamHandler.response_headers = {"Content-Type": "application/json"}
+        MockUpstreamHandler.response_body = b'{"ok": true}'
+        MockUpstreamHandler.sse_chunks = None
+
+        proxy_server, proxy_url, _ = start_proxy(self.mock_url, self.state_file)
+        try:
+            for _ in range(3):
+                req = urllib.request.Request(proxy_url + "/v1/messages", data=b'{"model":"x"}', method="POST")
+                try:
+                    urllib.request.urlopen(req).read()
+                except urllib.error.HTTPError:
+                    pass  # 429 會 raise，忽略——重點是 proxy 記了 record
+            time.sleep(0.15)
+            rows = read_jsonl(self.state_file)
+            statuses = [r.get("status") for r in rows]
+            self.assertEqual(statuses, [429, 429, 200],
+                              "三個獨立 request（含中間態 429）應各記一筆，statuses=%r" % statuses)
+        finally:
+            MockUpstreamHandler.status_sequence = None
             proxy_server.shutdown()
 
 
