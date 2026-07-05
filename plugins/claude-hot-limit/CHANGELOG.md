@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.12.0
+
+- **feat（Workflow fan-out 寬度 → dispatch model 建議，#19）**：launch `Workflow` 時 pacing-guard 顯示靜態估的 fan-out 寬度 + 建議 pin 便宜 model。根因：script 裡沒 pin `model` 的 `agent()` 繼承 session main-loop model → 寬 fan-out × 貴 model = 燒 token / 撞牆。新增 `estimate_workflow_fanout(tool_input)`：inline `script` 直接 parse、`scriptPath` bounded 讀檔（`_WORKFLOW_SCRIPT_MAX_BYTES`）、name/resume 估不到 → None。**寬**（`parallel`/`pipeline` 或 ≥4 `agent()`）→ `systemMessage` 提醒 `agent(..., {model:'sonnet'})`。**只顯示不擋**（hook 改不了 model）、**靜態估**（明講 runtime 可能更寬，dynamic/budget-scaled 估不到）、fail-open、同受 `_WORKFLOW_NUDGE` 開關、只 `Workflow`。
+- **empirical grounding（zero-exec）**：掃 238 個真實 Workflow tool_use → inline `script` 24% / `scriptPath` 66% / name·resume 11% → 只讀 `script` 會漏 76%（含最該提醒的寬 workflow）故必讀 `scriptPath`。官方 hooks 文檔確認 PreToolUse `tool_input` 完整、輸入端無 truncation。
+- **doctrine 配套（out-of-repo）**：「決定 model」的機制放 `~/.claude/CLAUDE.md`（always-on author doctrine）+ 本 plugin `skills/pacing-playbook`——hook 是 runtime backstop，doctrine 是 author-time 決策點。**Residue**：精確 agent 計數 + auto-switch model，PreToolUse hook 結構上辦不到。
+- **test（+9，套件 77 綠）**：`WorkflowFanoutAdvisoryTest` 釘住 wide-inline / wide-scriptPath / narrow / name-only-fail-open / missing-file-fail-open / NUDGE=0 / Agent 七類。既有 68 tests 無回歸。
+
 ## 1.11.0
 
 - **feat（fable × Workflow gate，#18）**：**Fable 5 session 開 `Workflow` → 預設 `deny`**（`permissionDecision: deny`，archive-first 同款）。根因（診斷確立）：Workflow fan out ~74 個並發 subagent，script 裡沒 pin `model` 的 `agent()` **繼承 session 的 main-loop model**（Workflow tool 文檔逐字保證）→ fable5（頂階/貴 model）× N 並發 = 瞬間 token/session-limit 炸（idd-verify #205 失效模式：Fable 級 session 燒 563k–1M subagent token、撞死 lens agent）。新增 module 級 `is_fable()`（prefix `claude-fable`，涵蓋未來變體，獨立於 `model_bucket`）+ gate 分支（放 model 偵測後、flock critical section 前 → 不碰 ledger、deny 不記錄被擋這發、第一發就擋、無條件於 burst/heat）。

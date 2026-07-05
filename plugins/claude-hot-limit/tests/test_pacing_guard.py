@@ -887,5 +887,86 @@ class FableWorkflowGateTest(unittest.TestCase):
                          "CLAUDE_HOT_LIMIT_OFF=1 應先攔、天然 bypass fable-gate，stdout=%r" % raw)
 
 
+class WorkflowFanoutAdvisoryTest(unittest.TestCase):
+    """#19 — 依 Workflow fan-out 寬度給 dispatch-model 建議（顯示，不擋）。
+
+    hook 從 tool_input 估 fan-out 寬度：inline `script`（24%）直接 parse；`scriptPath`
+    （66%）bounded 讀檔；name/resume（11%）估不到 → 不注入。寬（parallel/pipeline 或
+    ≥4 agent()）→ systemMessage 建議 pin sonnet。靜態估（dynamic 估不到），fail-open。
+    無 transcript → model unknown → 非 fable → 通過 #18 gate → 到達本段。"""
+
+    WIDE_PARALLEL = "export const meta={};\nconst r = await parallel(items.map(x => () => agent('go')));"
+    WIDE_MANY = "agent('a'); agent('b'); agent('c'); agent('d'); agent('e');"
+    NARROW = "export const meta={};\nconst x = await agent('single task');"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = {
+            "CLAUDE_HOT_LIMIT_DATA": os.path.join(self.tmp.name, "account"),
+            "CLAUDE_HOT_LIMIT_MAX": "999",   # 不讓 burst 干擾
+            "CLAUDE_HOT_LIMIT_MIN_GAP": "0",
+        }
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _wf(self, script=None, script_path=None, tool="Workflow"):
+        ti = {}
+        if script is not None:
+            ti["script"] = script
+        if script_path is not None:
+            ti["scriptPath"] = script_path
+        return {"tool_name": tool, "tool_input": ti}  # 無 transcript_path → model unknown
+
+    def _msg(self, parsed):
+        return (parsed or {}).get("systemMessage", "") if parsed else ""
+
+    def test_wide_inline_parallel_advises_sonnet(self):
+        _, parsed, raw = run_hook(payload=self._wf(script=self.WIDE_PARALLEL), env_overrides=self.base)
+        self.assertFalse(is_deny(parsed), "純顯示、不該 deny，stdout=%r" % raw)
+        self.assertIn("sonnet", self._msg(parsed), "寬 fan-out 應建議 pin sonnet，stdout=%r" % raw)
+
+    def test_wide_inline_many_agents_advises_sonnet(self):
+        _, parsed, raw = run_hook(payload=self._wf(script=self.WIDE_MANY), env_overrides=self.base)
+        self.assertIn("sonnet", self._msg(parsed), "≥4 agent() 應算寬並建議 sonnet，stdout=%r" % raw)
+
+    def test_narrow_inline_no_advisory(self):
+        _, parsed, raw = run_hook(payload=self._wf(script=self.NARROW), env_overrides=self.base)
+        self.assertNotIn("sonnet", self._msg(parsed), "窄 fan-out 不該建議切 model，stdout=%r" % raw)
+
+    def test_wide_scriptpath_read_from_file(self):
+        sp = os.path.join(self.tmp.name, "wf.js")
+        with open(sp, "w") as f:
+            f.write(self.WIDE_PARALLEL)
+        _, parsed, raw = run_hook(payload=self._wf(script_path=sp), env_overrides=self.base)
+        self.assertIn("sonnet", self._msg(parsed), "scriptPath 也應讀檔估寬度並建議，stdout=%r" % raw)
+
+    def test_narrow_scriptpath_no_advisory(self):
+        sp = os.path.join(self.tmp.name, "narrow.js")
+        with open(sp, "w") as f:
+            f.write(self.NARROW)
+        _, parsed, raw = run_hook(payload=self._wf(script_path=sp), env_overrides=self.base)
+        self.assertNotIn("sonnet", self._msg(parsed), "窄 scriptPath 不該建議，stdout=%r" % raw)
+
+    def test_name_only_fail_open_no_advisory(self):
+        # 無 script / scriptPath（name / resume）→ 估不到 → 不注入（fail-open）
+        _, parsed, raw = run_hook(payload=self._wf(), env_overrides=self.base)
+        self.assertNotIn("sonnet", self._msg(parsed), "估不到寬度時應 fail-open 不注入，stdout=%r" % raw)
+
+    def test_missing_scriptpath_file_fail_open(self):
+        _, parsed, raw = run_hook(payload=self._wf(script_path="/nonexistent/wf.js"), env_overrides=self.base)
+        self.assertFalse(is_deny(parsed))
+        self.assertNotIn("sonnet", self._msg(parsed), "scriptPath 讀不到應 fail-open，stdout=%r" % raw)
+
+    def test_nudge_disabled_by_env_suppresses_advisory(self):
+        env = dict(self.base, CLAUDE_HOT_LIMIT_WORKFLOW_NUDGE="0")
+        _, parsed, raw = run_hook(payload=self._wf(script=self.WIDE_PARALLEL), env_overrides=env)
+        self.assertNotIn("sonnet", self._msg(parsed), "NUDGE=0 應關閉寬度建議，stdout=%r" % raw)
+
+    def test_agent_tool_not_advised(self):
+        _, parsed, raw = run_hook(payload=self._wf(script=self.WIDE_PARALLEL, tool="Agent"), env_overrides=self.base)
+        self.assertNotIn("sonnet", self._msg(parsed), "只對 Workflow 建議，Agent 不觸發，stdout=%r" % raw)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

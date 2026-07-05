@@ -217,6 +217,41 @@ def is_fable(model):
     return isinstance(model, str) and model.startswith("claude-fable")
 
 
+_WORKFLOW_SCRIPT_MAX_BYTES = 200_000  # #19 bounded read for scriptPath（比照 _TRANSCRIPT_TAIL_BYTES 紀律）
+
+
+def estimate_workflow_fanout(tool_input):
+    """#19 — 從 Workflow tool_input 粗估 fan-out 寬度。回傳 (agent_calls, has_parallel_pipeline) 或 None。
+
+    實測 238 個真實 Workflow 呼叫：inline `script` 24%（直接讀）、`scriptPath` 66%（bounded 讀檔）、
+    name/resume 11%（無 script → None 估不到）。**靜態估**：dynamic loop / budget-scaled fleet /
+    args-driven 數量 runtime 才定，靜態只給下限訊號、不給假精確。
+    fail-open：非 dict / 讀不到 / parse 例外 → None（不注入訊息、不擾動放行）。"""
+    if not isinstance(tool_input, dict):
+        return None
+    src = None
+    script = tool_input.get("script")
+    if isinstance(script, str) and script:
+        src = script
+    else:
+        sp = tool_input.get("scriptPath")
+        if isinstance(sp, str) and sp:
+            try:
+                if os.path.isfile(sp):  # FIFO/特殊檔案不 block（比照 detect_model finding-3）
+                    with open(sp, "rb") as f:
+                        src = f.read(_WORKFLOW_SCRIPT_MAX_BYTES).decode("utf-8", "replace")
+            except Exception:
+                return None
+    if not src:
+        return None
+    try:
+        agent_calls = len(re.findall(r"\bagent\s*\(", src))
+        has_pp = bool(re.search(r"\b(?:parallel|pipeline)\s*\(", src))
+        return (agent_calls, has_pp)
+    except Exception:
+        return None
+
+
 def recent_heat(data_dir, window, now, model=None):
     """讀 trip-recorder 落地的 trips-raw.jsonl，回傳 window 內「撞牆 episode」資訊。
 
@@ -606,6 +641,24 @@ def main():
                 "workflow 內部 fan-out 不經過本 guard 計數，是 bucket 殺手。".format(detail=rs_heat)
             )
         # else: rs_heat is None → 有近期真實資料且各欄位都健康，確認冷，保持安靜（不 fallback）。
+
+        # --- fan-out 寬度 → dispatch model 建議（#19；靜態估、只顯示不擋）---
+        # 寬 fan-out（parallel/pipeline 或 ≥4 個 agent()）→ 提醒在 script 裡把 agent() pin 到便宜 model，
+        # 否則沒 pin 會繼承 session model（fable5 已由 #18 硬擋；此處是「一般寬 fan-out 選便宜 model」的顯示）。
+        # 與 heat nudge 獨立（看寬度不看熱），同受 WORKFLOW_NUDGE 開關。fail-open（估不到 → 不注入）。
+        fanout = estimate_workflow_fanout(payload.get("tool_input"))
+        if fanout is not None:
+            agent_calls, has_pp = fanout
+            if has_pp or agent_calls >= 4:
+                detail = "{n} 個 agent() 呼叫".format(n=agent_calls)
+                if has_pp:
+                    detail += " + parallel/pipeline"
+                messages.append(
+                    "[claude-hot-limit] ⚠️ 這發 Workflow 靜態估寬 fan-out（{d}；runtime 可能更寬——"
+                    "dynamic loop / budget-scaled fleet 估不到）。建議在 script 裡把 agent() pin 到便宜 "
+                    "model（agent(..., {{'model':'sonnet'}})）避免燒 token/撞牆——沒 pin 會繼承 session "
+                    "model。".format(d=detail)
+                )
 
     if messages:
         allow_with_message("\n".join(messages))
