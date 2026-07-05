@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.11.0
+
+- **feat（fable × Workflow gate，#18）**：**Fable 5 session 開 `Workflow` → 預設 `deny`**（`permissionDecision: deny`，archive-first 同款）。根因（診斷確立）：Workflow fan out ~74 個並發 subagent，script 裡沒 pin `model` 的 `agent()` **繼承 session 的 main-loop model**（Workflow tool 文檔逐字保證）→ fable5（頂階/貴 model）× N 並發 = 瞬間 token/session-limit 炸（idd-verify #205 失效模式：Fable 級 session 燒 563k–1M subagent token、撞死 lens agent）。新增 module 級 `is_fable()`（prefix `claude-fable`，涵蓋未來變體，獨立於 `model_bucket`）+ gate 分支（放 model 偵測後、flock critical section 前 → 不碰 ledger、deny 不記錄被擋這發、第一發就擋、無條件於 burst/heat）。
+- **override + fail 紀律**：`CLAUDE_HOT_LIMIT_FABLE_WORKFLOW`（`deny` 預設 / `warn` 只警告 / `off` 關閉）—— 放行「fable5 + agent 全 pin 便宜 model」的安全情境。**fail-open**：model 偵測不到（unknown）→ 不擋。**fail-safe**：typo / 不認得值 → deny（保護值，不 crash）。既有 `CLAUDE_HOT_LIMIT_OFF` / `disabled` flag 在 gate 之前 → 天然 bypass。只鎖 `Workflow`（單一 `Agent` 不 fan-out、不擋）。**Residue**：精準「只擋 unpinned 的 fable5 Workflow、放行全 pin 的」PreToolUse hook 靜態辦不到 → blanket deny + override 近似（見 #18 diagnosis）。
+- **test（+8，套件 68 綠）**：`FableWorkflowGateTest` 釘住 deny/warn/off/typo-fail-safe/非-fable/Agent/model-unknown-fail-open/off-switch-bypass 八路徑。既有 60 tests 無回歸。
+
 ## 1.10.0
 
 - **feat（proxy 記錄 HTTP response `status`，#13）**：Claude Code 2.1.200 更新後在 UI 顯式顯示

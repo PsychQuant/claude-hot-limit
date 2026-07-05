@@ -210,6 +210,13 @@ def model_bucket(model_id):
     return model_id
 
 
+def is_fable(model):
+    """#18 — 是否為 Fable model（頂階/貴）。用 prefix 比對，涵蓋未來 fable 變體
+    （`claude-fable-5` / `claude-fable-6`…）。獨立判斷、不進 model_bucket 計數邏輯。
+    非字串（None / "unknown" / 偵測失敗）→ False → fail-open（不擋）。"""
+    return isinstance(model, str) and model.startswith("claude-fable")
+
+
 def recent_heat(data_dir, window, now, model=None):
     """讀 trip-recorder 落地的 trips-raw.jsonl，回傳 window 內「撞牆 episode」資訊。
 
@@ -432,6 +439,34 @@ def main():
     model = detect_model(payload.get("transcript_path")) or "unknown"
     effort = detect_effort(payload)
     cur_bucket = model_bucket(model)  # ledger burst 計數以家族桶比對（#6），一次算好
+
+    # --- fable × Workflow gate (#18)：頂階 model 開 Workflow 的 fan-out 會繼承 fable → 必炸 ---
+    # Workflow fan out 大量並發 subagent；script 裡沒 pin model 的 agent() 繼承 session model，
+    # fable5（頂階/貴）× N 並發 = 瞬間 token/session-limit 炸（idd-verify #205 失效模式）。
+    # 放在 model 偵測後、flock critical section 前 → 不碰 ledger、deny 不記錄被擋這發、第一發就擋、
+    # 無條件於 burst/heat。CLAUDE_HOT_LIMIT_OFF / disabled flag 都在其上已 allow_silent → 天然 bypass。
+    if tool_name == "Workflow" and is_fable(model):
+        mode = os.environ.get("CLAUDE_HOT_LIMIT_FABLE_WORKFLOW", "deny").strip().lower()
+        if mode == "off":
+            pass  # 明確關閉此 gate（fable5 + agent 全 pin 便宜 model 的安全情境）
+        elif mode == "warn":
+            allow_with_message(
+                "[claude-hot-limit] ⚠️ Fable 5 session 開 Workflow。Workflow fan out 大量並發 "
+                "subagent，沒 pin model 的 agent() 會繼承 fable5（頂階 model）→ 幾乎必然撞 "
+                "429/session-limit（見 #205）。建議：/model 切 sonnet/opus，或在 script 裡把每個 "
+                "agent() pin model（agent(..., {'model':'sonnet'})）。"
+            )
+        else:  # "deny"（預設）或任何不認得的值 → fail-safe deny（config 打錯給保護值，不 crash）
+            deny(
+                "[claude-hot-limit] FABLE×WORKFLOW GUARD — 你在 Fable 5 session 開 Workflow。"
+                "Workflow fan out 大量並發 subagent，沒 pin model 的 agent() 會繼承 fable5"
+                "（頂階/貴 model）→ N 個並發頂階 agent 幾乎必然撞 429/session-limit 全滅（見 #205）。",
+                "怎麼辦（擇一）:\n"
+                "  1. /model 切到便宜 model（sonnet / opus）再開 Workflow。\n"
+                "  2. 在 script 裡把每個 agent() 都 pin model：agent(..., {'model':'sonnet'})。\n"
+                "  3. 確定要放行：export CLAUDE_HOT_LIMIT_FABLE_WORKFLOW=warn（只警告）或 =off，\n"
+                "     或全域 export CLAUDE_HOT_LIMIT_OFF=1 / touch <data_dir>/disabled。"
+            )
 
     # --- critical section（flock 序列化並發 hook 行程）---
     lockf = None

@@ -814,5 +814,78 @@ class FileOverrideTest(unittest.TestCase):
         self.assertIn("systemMessage", parsed, "應回報已間隔，stdout=%r" % raw)
 
 
+class FableWorkflowGateTest(unittest.TestCase):
+    """#18 — Fable 5 session 開 Workflow → deny（預設）/ warn / off。
+
+    機制：Workflow fan-out 的 unpinned agent 繼承 session model；fable5（頂階/貴 model）
+    × N 個並發 = 瞬間 token/session-limit 炸（idd-verify #205 失效模式）。gate 在 model
+    偵測後、burst critical section 前，無條件於 burst/heat。MAX 設高 → 確保測到 fable-gate
+    而非 burst-deny。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.account_dir = os.path.join(self.tmp.name, "account")
+        self.base = {
+            "CLAUDE_HOT_LIMIT_DATA": self.account_dir,
+            "CLAUDE_HOT_LIMIT_MAX": "999",   # 高 → 不讓 burst-deny 干擾 fable-gate 測試
+            "CLAUDE_HOT_LIMIT_MIN_GAP": "0",  # 不卡 sleep
+        }
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _payload(self, tool, models):
+        tp = make_transcript(self.tmp.name, models)
+        return {"tool_name": tool, "tool_input": {}, "transcript_path": tp}
+
+    def test_fable_workflow_denied_by_default(self):
+        _, parsed, raw = run_hook(payload=self._payload("Workflow", ["claude-fable-5"]),
+                                  env_overrides=self.base)
+        self.assertTrue(is_deny(parsed), "fable5 + Workflow 預設應 deny，stdout=%r" % raw)
+
+    def test_fable_workflow_warn_mode(self):
+        env = dict(self.base, CLAUDE_HOT_LIMIT_FABLE_WORKFLOW="warn")
+        _, parsed, raw = run_hook(payload=self._payload("Workflow", ["claude-fable-5"]),
+                                  env_overrides=env)
+        self.assertFalse(is_deny(parsed), "warn 模式不應 deny，stdout=%r" % raw)
+        self.assertIsNotNone(parsed, "warn 應有 systemMessage，stdout=%r" % raw)
+        self.assertIn("systemMessage", parsed, "warn 應走 systemMessage，stdout=%r" % raw)
+
+    def test_fable_workflow_off_mode(self):
+        env = dict(self.base, CLAUDE_HOT_LIMIT_FABLE_WORKFLOW="off")
+        _, parsed, raw = run_hook(payload=self._payload("Workflow", ["claude-fable-5"]),
+                                  env_overrides=env)
+        self.assertFalse(is_deny(parsed), "off 模式應放行（不 deny），stdout=%r" % raw)
+
+    def test_fable_workflow_typo_fails_safe_deny(self):
+        env = dict(self.base, CLAUDE_HOT_LIMIT_FABLE_WORKFLOW="deney")  # typo
+        _, parsed, raw = run_hook(payload=self._payload("Workflow", ["claude-fable-5"]),
+                                  env_overrides=env)
+        self.assertTrue(is_deny(parsed), "不認得的值應 fail-safe deny（不 crash），stdout=%r" % raw)
+
+    def test_non_fable_workflow_not_blocked(self):
+        _, parsed, raw = run_hook(payload=self._payload("Workflow", ["claude-opus-4-8"]),
+                                  env_overrides=self.base)
+        self.assertFalse(is_deny(parsed), "非-fable + Workflow 不應被 fable-gate 擋，stdout=%r" % raw)
+
+    def test_fable_agent_not_blocked(self):
+        _, parsed, raw = run_hook(payload=self._payload("Agent", ["claude-fable-5"]),
+                                  env_overrides=self.base)
+        self.assertFalse(is_deny(parsed), "fable5 + Agent 不 fan-out、不應被擋，stdout=%r" % raw)
+
+    def test_model_unknown_workflow_not_blocked(self):
+        # 只有 <synthetic> turn → detect_model 回 unknown → fail-open 不擋
+        _, parsed, raw = run_hook(payload=self._payload("Workflow", [None]),
+                                  env_overrides=self.base)
+        self.assertFalse(is_deny(parsed), "model unknown 時應 fail-open 不擋，stdout=%r" % raw)
+
+    def test_global_off_switch_bypasses_fable_gate(self):
+        env = dict(self.base, CLAUDE_HOT_LIMIT_OFF="1")
+        _, parsed, raw = run_hook(payload=self._payload("Workflow", ["claude-fable-5"]),
+                                  env_overrides=env)
+        self.assertFalse(is_deny(parsed),
+                         "CLAUDE_HOT_LIMIT_OFF=1 應先攔、天然 bypass fable-gate，stdout=%r" % raw)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
