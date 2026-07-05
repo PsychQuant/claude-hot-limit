@@ -219,17 +219,40 @@ def is_fable(model):
 
 _WORKFLOW_SCRIPT_MAX_BYTES = 200_000  # #19 bounded read for scriptPath（比照 _TRANSCRIPT_TAIL_BYTES 紀律）
 
+# #19-followup(F1)：慣用的 dynamic fan-out（`Promise.all` + `.map/.forEach/.flatMap`）會把單一
+# literal `agent(` 在 runtime 展開成 N 個並發——靜態計數看不到。偵測到這種跡象時標為「不確定」，
+# 讓 advisory 不要對這種 case 保持靜默（silence 會被誤讀成「窄」= 假安心，6-AI verify 的 F1）。
+_DYNAMIC_FANOUT_RE = re.compile(r"Promise\s*\.\s*all|\.\s*(?:map|forEach|flatMap)\s*\(")
+
+
+def _strip_comments_and_strings(src):
+    """#19-followup(F2)：粗略剝除 JS 註解與字串字面，避免把註解／字串裡的 `agent(` 誤數成呼叫。
+    先剝字串（中和字串內的 `//`，免得被當註解）→ 再剝 block/line 註解。啟發式 regex（非完整
+    lexer），無法完美處理跨界跳脫；呼叫端對例外做 fallback 回 raw（頂多退回舊的 over-count）。"""
+    src = re.sub(r"'(?:\\.|[^'\\])*'", "''", src)   # 單引號字串
+    src = re.sub(r'"(?:\\.|[^"\\])*"', '""', src)   # 雙引號字串
+    src = re.sub(r"`(?:\\.|[^`\\])*`", "``", src)   # template literal
+    src = re.sub(r"/\*.*?\*/", " ", src, flags=re.DOTALL)  # block 註解
+    src = re.sub(r"//[^\n]*", " ", src)             # line 註解
+    return src
+
 
 def estimate_workflow_fanout(tool_input):
-    """#19 — 從 Workflow tool_input 粗估 fan-out 寬度。回傳 (agent_calls, has_parallel_pipeline) 或 None。
+    """#19 — 從 Workflow tool_input 粗估 fan-out 寬度。回傳 (agent_calls, has_parallel_pipeline, uncertain) 或 None。
 
     實測 238 個真實 Workflow 呼叫：inline `script` 24%（直接讀）、`scriptPath` 66%（bounded 讀檔）、
     name/resume 11%（無 script → None 估不到）。**靜態估**：dynamic loop / budget-scaled fleet /
     args-driven 數量 runtime 才定，靜態只給下限訊號、不給假精確。
+
+    `uncertain`（6-AI verify follow-up）：靜態估「看似窄」但其實看不全時為 True——(F1) 偵測到
+    dynamic fan-out 跡象（`Promise.all`/`.map` + `agent(`），或 (F3) scriptPath 檔 > cap 被截斷。
+    讓 advisory 對這種 case 出一句 caveat 而非保持靜默（silence ≠ 窄）。
+    計數前先剝註解／字串（F2）避免 over-count。
     fail-open：非 dict / 讀不到 / parse 例外 → None（不注入訊息、不擾動放行）。"""
     if not isinstance(tool_input, dict):
         return None
     src = None
+    truncated = False
     script = tool_input.get("script")
     if isinstance(script, str) and script:
         src = script
@@ -238,6 +261,7 @@ def estimate_workflow_fanout(tool_input):
         if isinstance(sp, str) and sp:
             try:
                 if os.path.isfile(sp):  # FIFO/特殊檔案不 block（比照 detect_model finding-3）
+                    truncated = os.path.getsize(sp) > _WORKFLOW_SCRIPT_MAX_BYTES  # F3：截斷 → 估不全
                     with open(sp, "rb") as f:
                         src = f.read(_WORKFLOW_SCRIPT_MAX_BYTES).decode("utf-8", "replace")
             except Exception:
@@ -245,9 +269,15 @@ def estimate_workflow_fanout(tool_input):
     if not src:
         return None
     try:
-        agent_calls = len(re.findall(r"\bagent\s*\(", src))
-        has_pp = bool(re.search(r"\b(?:parallel|pipeline)\s*\(", src))
-        return (agent_calls, has_pp)
+        try:
+            scan = _strip_comments_and_strings(src)  # F2：剝註解／字串再數
+        except Exception:
+            scan = src  # fail-open：剝除失敗退回 raw（不惡化於舊行為）
+        agent_calls = len(re.findall(r"\bagent\s*\(", scan))
+        has_pp = bool(re.search(r"\b(?:parallel|pipeline)\s*\(", scan))
+        dynamic = agent_calls >= 1 and bool(_DYNAMIC_FANOUT_RE.search(scan))  # F1
+        uncertain = truncated or dynamic
+        return (agent_calls, has_pp, uncertain)
     except Exception:
         return None
 
@@ -648,7 +678,7 @@ def main():
         # 與 heat nudge 獨立（看寬度不看熱），同受 WORKFLOW_NUDGE 開關。fail-open（估不到 → 不注入）。
         fanout = estimate_workflow_fanout(payload.get("tool_input"))
         if fanout is not None:
-            agent_calls, has_pp = fanout
+            agent_calls, has_pp, uncertain = fanout
             if has_pp or agent_calls >= 4:
                 detail = "{n} 個 agent() 呼叫".format(n=agent_calls)
                 if has_pp:
@@ -658,6 +688,14 @@ def main():
                     "dynamic loop / budget-scaled fleet 估不到）。建議在 script 裡把 agent() pin 到便宜 "
                     "model（agent(..., {{'model':'sonnet'}})）避免燒 token/撞牆——沒 pin 會繼承 session "
                     "model。".format(d=detail)
+                )
+            elif uncertain:
+                # F1/F3：靜態估看似窄，但偵測到 dynamic fan-out 跡象或 script 被截斷——silence 會被
+                # 誤讀成「真的窄」= 假安心。出一句 caveat 而非保持靜默（不擋、不算寬，只誠實標示估不全）。
+                messages.append(
+                    "[claude-hot-limit] ℹ️ 這發 Workflow 靜態估看似窄，但偵測到 dynamic fan-out 跡象"
+                    "（loop / .map / Promise.all）或 script 過大被截斷——實際可能更寬、靜態估看不到。"
+                    "若真的寬，把 agent() pin 到便宜 model（agent(..., {'model':'sonnet'}）避免燒 token/撞牆。"
                 )
 
     if messages:

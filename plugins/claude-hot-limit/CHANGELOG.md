@@ -5,7 +5,12 @@
 - **feat（Workflow fan-out 寬度 → dispatch model 建議，#19）**：launch `Workflow` 時 pacing-guard 顯示靜態估的 fan-out 寬度 + 建議 pin 便宜 model。根因：script 裡沒 pin `model` 的 `agent()` 繼承 session main-loop model → 寬 fan-out × 貴 model = 燒 token / 撞牆。新增 `estimate_workflow_fanout(tool_input)`：inline `script` 直接 parse、`scriptPath` bounded 讀檔（`_WORKFLOW_SCRIPT_MAX_BYTES`）、name/resume 估不到 → None。**寬**（`parallel`/`pipeline` 或 ≥4 `agent()`）→ `systemMessage` 提醒 `agent(..., {model:'sonnet'})`。**只顯示不擋**（hook 改不了 model）、**靜態估**（明講 runtime 可能更寬，dynamic/budget-scaled 估不到）、fail-open、同受 `_WORKFLOW_NUDGE` 開關、只 `Workflow`。
 - **empirical grounding（zero-exec）**：掃 238 個真實 Workflow tool_use → inline `script` 24% / `scriptPath` 66% / name·resume 11% → 只讀 `script` 會漏 76%（含最該提醒的寬 workflow）故必讀 `scriptPath`。官方 hooks 文檔確認 PreToolUse `tool_input` 完整、輸入端無 truncation。
 - **doctrine 配套（out-of-repo）**：「決定 model」的機制放 `~/.claude/CLAUDE.md`（always-on author doctrine）+ 本 plugin `skills/pacing-playbook`——hook 是 runtime backstop，doctrine 是 author-time 決策點。**Residue**：精確 agent 計數 + auto-switch model，PreToolUse hook 結構上辦不到。
-- **test（+9，套件 77 綠）**：`WorkflowFanoutAdvisoryTest` 釘住 wide-inline / wide-scriptPath / narrow / name-only-fail-open / missing-file-fail-open / NUDGE=0 / Agent 七類。既有 68 tests 無回歸。
+- **verify-driven hardening（6-AI ensemble 抓到，同版修；`IDD_AGENT_MODEL=sonnet` dogfood #19 自己的原則）**：
+  - **F1（假安心，DA repro）**：靜態估對慣用 dynamic fan-out（`Promise.all` + `.map/.forEach` + `agent(`，也就是 ~74 並發 subagent 的真實寫法）會回 `(1, …)` → **完全靜默**，而 silence 與「真的窄」無法區分。新增 `uncertain` 訊號，narrow-but-uncertain 出一句 caveat（「靜態估看似窄，但偵測到 dynamic 跡象／被截斷，可能更寬」）而非沉默。
+  - **F2（regex over-count，Logic+Codex 跨模型收斂）**：計數前先剝 JS 註解／字串字面（`_strip_comments_and_strings`，先剝字串再剝註解、fail-open 回 raw）→ 註解或字串裡的 `agent(` 不再誤報寬。
+  - **F3（head-read 盲區，Logic repro）**：`scriptPath` 檔 > `_WORKFLOW_SCRIPT_MAX_BYTES` 時 `truncated` → `uncertain`（head-read 看不到 byte 200k 之後的呼叫）。
+  - `estimate_workflow_fanout` 回傳升為 3-tuple `(agent_calls, has_pp, uncertain)`；wide 分支優先於 uncertain caveat（`elif` 互斥，不雙發）。**follow-up（未修）**：F4 已 pin 仍提醒、F5 threshold 非 env-tunable、F6 fable-gate off-path 未測、F7 `scriptPath` allowlist、F8 `sub_agent(`/alias false-neg、F9 doc/test 精度。
+- **test（+14，套件 82 綠）**：`WorkflowFanoutAdvisoryTest` 釘住原 wide-inline / wide-scriptPath / narrow / name-only-fail-open / missing-file-fail-open / NUDGE=0 / Agent 七類 + verify-driven 五類（comment/string 不誤數、dynamic-loop caveat、plain-narrow 靜默、truncated-scriptPath caveat）。既有 68 tests 無回歸。
 
 ## 1.11.0
 

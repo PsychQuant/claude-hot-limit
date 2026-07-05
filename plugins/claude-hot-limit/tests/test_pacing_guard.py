@@ -967,6 +967,61 @@ class WorkflowFanoutAdvisoryTest(unittest.TestCase):
         _, parsed, raw = run_hook(payload=self._wf(script=self.WIDE_PARALLEL, tool="Agent"), env_overrides=self.base)
         self.assertNotIn("sonnet", self._msg(parsed), "只對 Workflow 建議，Agent 不觸發，stdout=%r" % raw)
 
+    # --- verify-driven follow-up fixes（6-AI ensemble 抓到；#19 F1/F2/F3）---
+
+    # F1 caveat 的辨識標記（wide advisory 不含此字串，只有 narrow-but-uncertain 才印）
+    CAVEAT_MARK = "估看似窄"
+
+    # F2 — 註解裡的 agent( 不該被數成呼叫
+    COMMENT_ONLY_AGENTS = (
+        "// example: agent('a'); agent('b'); agent('c'); agent('d');\n"
+        "export const meta={};\nconst x = await agent('one real task');"
+    )
+    # F2 — 字串字面裡的 agent( 不該被數成呼叫
+    STRING_LITERAL_AGENTS = (
+        "const doc = 'call agent() then agent() then agent() then agent()';\n"
+        "const x = await agent('one real task');"
+    )
+    # F1 — 慣用 dynamic fan-out：Promise.all + .map + 單一 literal agent(（靜態只數到 1）
+    DYNAMIC_LOOP = (
+        "export const meta={};\n"
+        "const rs = await Promise.all(tasks.map(t => agent('go ' + t)));"
+    )
+
+    def test_comment_agents_not_counted(self):
+        # F2：4 個 agent( 在註解裡 + 1 個真呼叫 → 剝除後只剩 1（窄）→ 不該誤報寬
+        _, parsed, raw = run_hook(payload=self._wf(script=self.COMMENT_ONLY_AGENTS), env_overrides=self.base)
+        self.assertFalse(is_deny(parsed))
+        self.assertNotIn("sonnet", self._msg(parsed), "註解裡的 agent( 不該被數成寬 fan-out，stdout=%r" % raw)
+
+    def test_string_literal_agents_not_counted(self):
+        # F2：字串字面裡的 agent( 同樣不該被數
+        _, parsed, raw = run_hook(payload=self._wf(script=self.STRING_LITERAL_AGENTS), env_overrides=self.base)
+        self.assertNotIn("sonnet", self._msg(parsed), "字串裡的 agent( 不該被數成寬 fan-out，stdout=%r" % raw)
+
+    def test_dynamic_loop_flagged_uncertain(self):
+        # F1：Promise.all/map 動態 fan-out 靜態估看似窄 → 應印「可能更寬」的 caveat（silence 是假安心）
+        _, parsed, raw = run_hook(payload=self._wf(script=self.DYNAMIC_LOOP), env_overrides=self.base)
+        self.assertFalse(is_deny(parsed))
+        self.assertIn(self.CAVEAT_MARK, self._msg(parsed),
+                      "dynamic loop fan-out 不該完全靜默，應標示靜態估看不到，stdout=%r" % raw)
+
+    def test_plain_narrow_stays_silent(self):
+        # F1 反面：真的窄（無 dynamic 跡象、無截斷）→ 完全不印 caveat（避免 advisory fatigue）
+        _, parsed, raw = run_hook(payload=self._wf(script=self.NARROW), env_overrides=self.base)
+        self.assertNotIn(self.CAVEAT_MARK, self._msg(parsed),
+                         "真的窄的 script 不該印 dynamic caveat，stdout=%r" % raw)
+
+    def test_truncated_scriptpath_flagged_uncertain(self):
+        # F3：scriptPath 檔 > 200KB（head-read 截斷）→ 就算 head 看似窄也標示不確定
+        sp = os.path.join(self.tmp.name, "big.js")
+        with open(sp, "w") as f:
+            f.write("x" * 201000)   # 超過 _WORKFLOW_SCRIPT_MAX_BYTES → 讀取截斷
+        _, parsed, raw = run_hook(payload=self._wf(script_path=sp), env_overrides=self.base)
+        self.assertFalse(is_deny(parsed))
+        self.assertIn(self.CAVEAT_MARK, self._msg(parsed),
+                      "過大 scriptPath 被截斷時應標示估算不完整，stdout=%r" % raw)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
