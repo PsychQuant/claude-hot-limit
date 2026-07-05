@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.12.1
+
+- **fix（#18 fable×Workflow gate 的 verify-driven 修復；retroactive 6-AI ensemble FAIL）**：#18 v1.11.0 上線後補跑的 6-AI verify（`IDD_AGENT_MODEL=sonnet`）判定 FAIL，修掉 live production 的行為 bug——
+  - **F1（warn 比 off 更沒保護；Regression+Logic HIGH + Codex，3-way 跨模型跨 lens 收斂）**：`CLAUDE_HOT_LIMIT_FABLE_WORKFLOW=warn` 原本呼叫 `allow_with_message()` → `sys.exit(0)` **早退**，在 ledger 寫入、min-gap、#19 fan-out advisory 之前 → warn 模式的 fable Workflow 不記帳（後續 burst 窗口低估）、也拿不到最該看的 pin-sonnet 建議。改成攜帶 `fable_warn_msg` **fall-through**，末端併入 `messages`。
+  - **F2（逃生門 mid-session 失效；DA HIGH，code docstring 佐證）**：deny 訊息叫使用者 `export CLAUDE_HOT_LIMIT_FABLE_WORKFLOW=off`，但 env var 對 running session 不 hot-reload（`file_override_int` docstring 已載明）→ 被擋的人唯一能當場生效的是核彈級 `touch disabled`。新增 `file_override_str()`（比照 `file_override_int`）讀 `<data_dir>/fable-workflow` 檔案 → env → default；deny 訊息改指向 `echo off > <data_dir>/fable-workflow`（每次 hook 重讀、免重開）。
+  - **F3（fail-safe deny 訊息無法分辨 typo；DA HIGH）**：deny reason 原本全靜態，打錯 override 值與預設 deny 訊息一模一樣。改成 interpolate 打錯的 `mode` 值（「'dney' 不是認得的值，已 fail-safe 當 deny」）。
+  - **F4（is_fable 沒 lowercase；Logic MEDIUM + 2 reviewer）**：`model.startswith("claude-fable")` 改 `model.lower().startswith(...)`，比照 `model_bucket` 的 case 正規化——大小寫變異不該讓安全 gate fail-open。
+  - **F6**：deny/warn 訊息「幾乎必然...全滅」的過度確定措辭軟化為「很可能」（width-blind 的 blanket deny 不該對 1-pinned-agent 也宣稱必炸）。
+  - **follow-up（未修）**：F5（並行 Agent tool-use 不受 fable-gate 管，只 Workflow）、F7（is_fable prefix 無 word boundary）、F8（fable⇒expensive 無 tier gate）、F10（既有 burst-deny 訊息洩漏絕對路徑/username）。
+- **test（+6，套件 88 綠）**：`FableWorkflowGateTest` 補 warn-records-ledger / warn-still-gets-#19-advisory / file-override-off / file-override-beats-env / typo-names-value / uppercase-gated。修復過程中 `.format()` 撞上 context 內字面 `{'model':'sonnet'}` 的 `KeyError`（會 crash 每個 fable deny）被既有 `test_fable_workflow_denied_by_default` 當場逮到——TDD 擋掉「用 bug 換 crash」。
+
 ## 1.12.0
 
 - **feat（Workflow fan-out 寬度 → dispatch model 建議，#19）**：launch `Workflow` 時 pacing-guard 顯示靜態估的 fan-out 寬度 + 建議 pin 便宜 model。根因：script 裡沒 pin `model` 的 `agent()` 繼承 session main-loop model → 寬 fan-out × 貴 model = 燒 token / 撞牆。新增 `estimate_workflow_fanout(tool_input)`：inline `script` 直接 parse、`scriptPath` bounded 讀檔（`_WORKFLOW_SCRIPT_MAX_BYTES`）、name/resume 估不到 → None。**寬**（`parallel`/`pipeline` 或 ≥4 `agent()`）→ `systemMessage` 提醒 `agent(..., {model:'sonnet'})`。**只顯示不擋**（hook 改不了 model）、**靜態估**（明講 runtime 可能更寬，dynamic/budget-scaled 估不到）、fail-open、同受 `_WORKFLOW_NUDGE` 開關、只 `Workflow`。

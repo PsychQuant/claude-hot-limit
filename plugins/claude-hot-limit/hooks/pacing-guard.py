@@ -111,6 +111,28 @@ def file_override_int(data_dir, filename, env_name, default):
     return env_int(env_name, default)
 
 
+def file_override_str(data_dir, filename, env_name, default):
+    """檔案旗標優先的字串參數（#18 verify F2；比照 file_override_int 契約）：
+    <data_dir>/<filename> → env var → code default。
+
+    為什麼要檔案這層：env var 改動對已在跑的 session 不會 hot-reload（file_override_int
+    docstring 已實測記載）；被 fable-gate 擋下的使用者若只能 `export ...=off` 就得重開
+    session 才生效——形同逃生門失效。檔案跟既有 disabled 旗標一樣每次 hook 執行重讀磁碟，
+    `echo off > 檔案` 立即生效。bounded read（64 bytes）、空檔/讀不到 → fallback env，
+    全程 fail-open（讀取異常不癱瘓 gate）。**必須在 disabled 旗標檢查之後呼叫**（finding-3
+    原則：FIFO/卡死掛載點的 open() 可能永久 block）。"""
+    try:
+        path = os.path.join(data_dir, filename)
+        if os.path.isfile(path):
+            with open(path) as f:
+                val = f.read(64).strip()
+            if val:
+                return val
+    except Exception:
+        pass  # fail-open：讀取異常一律退回 env/default，不讓參數讀取癱瘓 gate
+    return os.environ.get(env_name, default)
+
+
 # 明確「不是 bucket 燙」的 API error（與 trip-recorder 的 SKIP_TYPES 一致）→ 不算熱。
 # 其餘（rate_limit / overloaded / server_error / None→unknown）一律算熱（ambiguous 寧算勿漏）。
 _BENIGN_ERRORS = {
@@ -213,8 +235,10 @@ def model_bucket(model_id):
 def is_fable(model):
     """#18 — 是否為 Fable model（頂階/貴）。用 prefix 比對，涵蓋未來 fable 變體
     （`claude-fable-5` / `claude-fable-6`…）。獨立判斷、不進 model_bucket 計數邏輯。
-    非字串（None / "unknown" / 偵測失敗）→ False → fail-open（不擋）。"""
-    return isinstance(model, str) and model.startswith("claude-fable")
+    非字串（None / "unknown" / 偵測失敗）→ False → fail-open（不擋）。
+    lower() 再比對（#18 verify F4）：比照 model_bucket 的 case 正規化——大小寫變異不該讓
+    安全 gate fail-open（`Claude-Fable-5` 也要擋）。"""
+    return isinstance(model, str) and model.lower().startswith("claude-fable")
 
 
 _WORKFLOW_SCRIPT_MAX_BYTES = 200_000  # #19 bounded read for scriptPath（比照 _TRANSCRIPT_TAIL_BYTES 紀律）
@@ -504,6 +528,7 @@ def main():
     model = detect_model(payload.get("transcript_path")) or "unknown"
     effort = detect_effort(payload)
     cur_bucket = model_bucket(model)  # ledger burst 計數以家族桶比對（#6），一次算好
+    fable_warn_msg = None  # #18 verify F1：warn 模式攜帶訊息 fall-through（不早退），末端併入 messages
 
     # --- fable × Workflow gate (#18)：頂階 model 開 Workflow 的 fan-out 會繼承 fable → 必炸 ---
     # Workflow fan out 大量並發 subagent；script 裡沒 pin model 的 agent() 繼承 session model，
@@ -511,26 +536,47 @@ def main():
     # 放在 model 偵測後、flock critical section 前 → 不碰 ledger、deny 不記錄被擋這發、第一發就擋、
     # 無條件於 burst/heat。CLAUDE_HOT_LIMIT_OFF / disabled flag 都在其上已 allow_silent → 天然 bypass。
     if tool_name == "Workflow" and is_fable(model):
-        mode = os.environ.get("CLAUDE_HOT_LIMIT_FABLE_WORKFLOW", "deny").strip().lower()
+        # 檔案 override 優先於 env（#18 verify F2）：env 對 running session 不 hot-reload，
+        # 被擋的人才能靠 `echo off > <data_dir>/fable-workflow` 當場放行、免重開 session。
+        mode = file_override_str(
+            data_dir, "fable-workflow", "CLAUDE_HOT_LIMIT_FABLE_WORKFLOW", "deny"
+        ).strip().lower()
         if mode == "off":
             pass  # 明確關閉此 gate（fable5 + agent 全 pin 便宜 model 的安全情境）
         elif mode == "warn":
-            allow_with_message(
+            # #18 verify F1：攜帶訊息 fall-through（不早退）——讓 ledger 記錄、min-gap、#19
+            # fan-out advisory 全照跑。早退版本讓 warn 反而比 off 更沒保護（3-reviewer 收斂）。
+            fable_warn_msg = (
                 "[claude-hot-limit] ⚠️ Fable 5 session 開 Workflow。Workflow fan out 大量並發 "
-                "subagent，沒 pin model 的 agent() 會繼承 fable5（頂階 model）→ 幾乎必然撞 "
+                "subagent，沒 pin model 的 agent() 會繼承 fable5（頂階 model）→ 很可能撞 "
                 "429/session-limit（見 #205）。建議：/model 切 sonnet/opus，或在 script 裡把每個 "
                 "agent() pin model（agent(..., {'model':'sonnet'})）。"
             )
         else:  # "deny"（預設）或任何不認得的值 → fail-safe deny（config 打錯給保護值，不 crash）
-            deny(
+            reason = (
                 "[claude-hot-limit] FABLE×WORKFLOW GUARD — 你在 Fable 5 session 開 Workflow。"
                 "Workflow fan out 大量並發 subagent，沒 pin model 的 agent() 會繼承 fable5"
-                "（頂階/貴 model）→ N 個並發頂階 agent 幾乎必然撞 429/session-limit 全滅（見 #205）。",
+                "（頂階/貴 model）→ N 個並發頂階 agent 很可能撞 429/session-limit（見 #205）。"
+            )
+            if mode and mode != "deny":
+                # #18 verify F3：點名打錯的值，讓使用者分辨「typo → fail-safe deny」vs「預設 deny」。
+                reason += (
+                    "（註：CLAUDE_HOT_LIMIT_FABLE_WORKFLOW='%s' 不是認得的值，"
+                    "已 fail-safe 當 deny 處理——想放行請用 off / warn。）" % mode
+                )
+            deny(
+                reason,
+                # #18 verify F2：逃生門指到「每次 hook 重讀」的檔案，本 session 立即生效、免重開。
                 "怎麼辦（擇一）:\n"
                 "  1. /model 切到便宜 model（sonnet / opus）再開 Workflow。\n"
-                "  2. 在 script 裡把每個 agent() 都 pin model：agent(..., {'model':'sonnet'})。\n"
-                "  3. 確定要放行：export CLAUDE_HOT_LIMIT_FABLE_WORKFLOW=warn（只警告）或 =off，\n"
-                "     或全域 export CLAUDE_HOT_LIMIT_OFF=1 / touch <data_dir>/disabled。"
+                "  2. 在 script 裡把每個 agent() 都 pin model：agent(..., {{'model':'sonnet'}})。\n"
+                "  3. 確定要放行（本 session 立即生效、免重開）:\n"
+                "       echo warn > {ff}   # 只警告、仍記帳\n"
+                "       echo off  > {ff}   # 關閉此 gate\n"
+                "     （env CLAUDE_HOT_LIMIT_FABLE_WORKFLOW 需重開 session 才 hot-reload；\n"
+                "      或全域 touch {dis} 關掉所有保護。）".format(
+                    ff=os.path.join(data_dir, "fable-workflow"),
+                    dis=os.path.join(data_dir, "disabled"))
             )
 
     # --- critical section（flock 序列化並發 hook 行程）---
@@ -640,6 +686,10 @@ def main():
             slept = int(round(need))
 
     messages = []
+    if fable_warn_msg:
+        # #18 verify F1：warn 模式的 fable 提醒放最前（最急）；fall-through 已讓 ledger/min-gap
+        # 照跑，這裡只負責把提醒併回輸出（後面 #19 advisory 也會照常評估寬度）。
+        messages.append(fable_warn_msg)
     if slept:
         messages.append(
             "[claude-hot-limit] 距上一個 fan-out 太近，已自動間隔 {s}s 再放行（防 short-burst）。".format(s=slept)

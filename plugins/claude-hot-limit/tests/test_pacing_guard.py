@@ -886,6 +886,61 @@ class FableWorkflowGateTest(unittest.TestCase):
         self.assertFalse(is_deny(parsed),
                          "CLAUDE_HOT_LIMIT_OFF=1 應先攔、天然 bypass fable-gate，stdout=%r" % raw)
 
+    # --- verify-driven fixes（6-AI ensemble FAIL；#18 F1/F2/F3/F4）---
+
+    def test_warn_mode_records_ledger(self):
+        # F1：warn 應 fall-through 而非早退——launch 要記進 ledger（否則後續 burst 窗口低估）
+        env = dict(self.base, CLAUDE_HOT_LIMIT_FABLE_WORKFLOW="warn")
+        _, parsed, raw = run_hook(payload=self._payload("Workflow", ["claude-fable-5"]), env_overrides=env)
+        self.assertFalse(is_deny(parsed))
+        ledger = os.path.join(self.account_dir, "launches.jsonl")
+        self.assertTrue(os.path.isfile(ledger), "warn 模式應 fall-through 記 ledger，stdout=%r" % raw)
+        row = last_ledger_row(self.account_dir)
+        self.assertEqual((row or {}).get("tool"), "Workflow", "ledger 應記這發 Workflow launch")
+
+    def test_warn_mode_still_gets_fanout_advisory(self):
+        # F1：warn 的寬 fable Workflow 應仍收到 #19 fan-out advisory（早退版本吞掉了它）
+        env = dict(self.base, CLAUDE_HOT_LIMIT_FABLE_WORKFLOW="warn")
+        tp = make_transcript(self.tmp.name, ["claude-fable-5"])
+        payload = {"tool_name": "Workflow",
+                   "tool_input": {"script": "const r = await parallel(items.map(x=>()=>agent('go')))"},
+                   "transcript_path": tp}
+        _, parsed, raw = run_hook(payload=payload, env_overrides=env)
+        msg = (parsed or {}).get("systemMessage", "")
+        self.assertIn("靜態估寬 fan-out", msg,
+                      "warn 模式的寬 Workflow 應仍收到 #19 fan-out advisory，stdout=%r" % raw)
+
+    def test_file_override_off_takes_effect(self):
+        # F2：<data_dir>/fable-workflow 檔案 override（mid-session 生效，不像 env 需重開）
+        os.makedirs(self.account_dir, exist_ok=True)
+        with open(os.path.join(self.account_dir, "fable-workflow"), "w") as f:
+            f.write("off")
+        _, parsed, raw = run_hook(payload=self._payload("Workflow", ["claude-fable-5"]), env_overrides=self.base)
+        self.assertFalse(is_deny(parsed), "fable-workflow 檔=off 應放行（file override），stdout=%r" % raw)
+
+    def test_file_override_beats_env(self):
+        # F2：檔案 override 優先於 env（比照 file_override_int 契約）
+        os.makedirs(self.account_dir, exist_ok=True)
+        with open(os.path.join(self.account_dir, "fable-workflow"), "w") as f:
+            f.write("off")
+        env = dict(self.base, CLAUDE_HOT_LIMIT_FABLE_WORKFLOW="deny")  # env 說 deny、檔案說 off
+        _, parsed, raw = run_hook(payload=self._payload("Workflow", ["claude-fable-5"]), env_overrides=env)
+        self.assertFalse(is_deny(parsed), "檔案 override 應優先於 env，stdout=%r" % raw)
+
+    def test_typo_deny_message_names_the_value(self):
+        # F3：fail-safe deny 訊息要點名打錯的值，讓使用者分辨「typo」vs「預設 deny」
+        env = dict(self.base, CLAUDE_HOT_LIMIT_FABLE_WORKFLOW="deney")  # typo
+        _, parsed, raw = run_hook(payload=self._payload("Workflow", ["claude-fable-5"]), env_overrides=env)
+        self.assertTrue(is_deny(parsed))
+        reason = (parsed or {}).get("hookSpecificOutput", {}).get("permissionDecisionReason", "")
+        self.assertIn("deney", reason, "typo 的 override 值應出現在 deny 訊息裡以區分預設，stdout=%r" % raw)
+
+    def test_uppercase_fable_model_still_gated(self):
+        # F4：is_fable 應 lowercase 再比對（大小寫變異不該讓安全 gate fail-open）
+        _, parsed, raw = run_hook(payload=self._payload("Workflow", ["Claude-Fable-5"]), env_overrides=self.base)
+        self.assertTrue(is_deny(parsed),
+                        "大小寫變異的 fable id 仍應被 gate（is_fable 需 lowercase），stdout=%r" % raw)
+
 
 class WorkflowFanoutAdvisoryTest(unittest.TestCase):
     """#19 — 依 Workflow fan-out 寬度給 dispatch-model 建議（顯示，不擋）。
