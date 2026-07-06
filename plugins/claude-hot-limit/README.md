@@ -25,7 +25,7 @@ pacing-guard 掛在 `Workflow` 與 `Agent` 兩個 fan-out 入口的 **PreToolUse
 
 | 級別 | 行為 | 觸發條件 | 動作 | 可調 |
 |------|------|----------|------|------|
-| 🔴 **硬擋（deny）** | **Burst guard** | 滾動窗口（預設 10 分鐘）內同一 model 桶的啟動數 ≥ 上限（預設 3）| `permissionDecision: deny`，提示改串行／等回填／怎麼 override | `_MAX` / `_WINDOW` |
+| 🔴 **硬擋（deny）** | **Burst guard** | 滾動窗口（預設 10 分鐘）內**同一 model 桶**的啟動數 ≥ 門檻（單一值，預設 3；見下方註）| `permissionDecision: deny`，提示改串行／等回填／怎麼 override | `_MAX` / `_WINDOW` |
 | 🔴 **硬擋（deny）** | **Fable × Workflow gate** | **Fable 5（頂階/貴 model）session 開 `Workflow`** | 預設 `deny`（fan-out 的 unpinned agent 會繼承 fable5 → N 並發幾乎必撞 429/session-limit）| `_FABLE_WORKFLOW`（`deny`/`warn`/`off`）|
 | 🟡 **軟延遲（sleep）** | **Min-gap** | 距上一發 < 最小間隔（預設 20s）| 自動 `sleep` 補足間隔後**放行**（防 short-burst）| `_MIN_GAP` / `_SLEEP_CAP` |
 | 🔵 **只提醒（不擋）** | **Fan-out 寬度建議** | 寬 `Workflow`（`parallel`/`pipeline` 或 ≥ 門檻個 `agent()`，門檻預設 4）且未全 pin 便宜 model | `systemMessage` 建議在 script 裡把 `agent()` pin 到 sonnet/haiku，別繼承 session 貴 model | `_FANOUT_WIDE_MIN` |
@@ -36,7 +36,8 @@ pacing-guard 掛在 `Workflow` 與 `Agent` 兩個 fan-out 入口的 **PreToolUse
 - **只看主迴圈的啟動**；workflow 內部自 spawn 的 subagent 由 workflow runtime 管，不雙重計數。
 - **fail-open**：hook 自身任何異常一律放行，絕不癱瘓正常工作。model 偵測失敗 → fail-open（不硬擋）；`_FABLE_WORKFLOW` 打錯值 → fail-safe（deny，給保護值）。
 - **flock 序列化**：同一訊息平行發多個 Agent 時計數仍精確。
-- **per-model 分桶**：Opus / Sonnet 5 / Sonnet 4.x / Haiku 是各自獨立的 rate-limit 桶（官方文檔證實），計數按 model 家族桶過濾，不同 model 連發互不相剋。
+- **per-model 分桶（計數）**：Opus / Sonnet 5 / Sonnet 4.x / Haiku 是各自獨立的 rate-limit 桶（官方文檔證實），**計數**按 model 家族桶過濾——不同 model 的連發互不相剋。
+- **⚠️ 門檻是單一值、非各 model 實測上限**：`_MAX`（預設 3）/ `_MIN_GAP` / `_FANOUT_WIDE_MIN` 是**一組值套用到所有 model 桶**，不是各 model 量到的真實 acceleration limit。3 是保守的 burst-pacing 起始值（真實 rate limit 各 model 不同）。要按 model 精細調不同門檻，目前 plugin 不支援（只能手動整組調，或改 model 前後改 env）；per-model 門檻是可能的 roadmap。
 - 單一 `Agent`（非 fan-out）不受 Fable gate / 寬度建議影響；只有 `Workflow` 觸發那兩條。
 
 帳本存在 **帳號級固定路徑** `~/.cache/claude-hot-limit/launches.jsonl`，**所有安裝來源 / 並發
@@ -94,7 +95,7 @@ proxy 相關 env（與上面「設定」表的 hook env 分開）：
 | 變數 | 預設 | 意義 |
 |------|------|------|
 | `CLAUDE_HOT_LIMIT_WINDOW` | `600` | 滾動窗口秒數 |
-| `CLAUDE_HOT_LIMIT_MAX` | `3` | 窗口內允許的啟動數（第 MAX+1 發被擋） |
+| `CLAUDE_HOT_LIMIT_MAX` | `3` | 窗口內允許的啟動數（第 MAX+1 發被擋）。**單一值套用到所有 model 桶**、保守起始值，非各 model 實測上限——按你常用 model 的實際節流表現自行調整 |
 | `CLAUDE_HOT_LIMIT_MIN_GAP` | `20` | 兩發最小間隔秒數 |
 | `CLAUDE_HOT_LIMIT_SLEEP_CAP` | `45` | hook 內單次 sleep 上限 |
 | `CLAUDE_HOT_LIMIT_FABLE_WORKFLOW` | `deny` | Fable 5 開 `Workflow` 的處置：`deny`（硬擋）/ `warn`（只警告仍記帳）/ `off`（關閉此 gate） |
