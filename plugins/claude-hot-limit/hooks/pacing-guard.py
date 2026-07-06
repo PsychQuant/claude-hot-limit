@@ -261,6 +261,24 @@ def _strip_comments_and_strings(src):
     return src
 
 
+def _strip_comments_only(src):
+    """#20 verify-F4：只剝 JS 註解、**保留**字串字面（才看得到 `model:` 的值）。給 cheap-pin
+    偵測用——註解裡的 `model:` 剝掉，避免假 suppress；call-site 與 cheap-pin 都在此同源計數。"""
+    src = re.sub(r"/\*.*?\*/", " ", src, flags=re.DOTALL)
+    src = re.sub(r"//[^\n]*", " ", src)
+    return src
+
+
+# #20 verify-hardened F4：只認「pin 到**便宜** model（sonnet/haiku）」的 agent 呼叫。
+# `[^)]*?` 停在第一個 `)` → 大致把 `model:` 限制在同一個 `agent(...)` 引數內（value-aware +
+# call-site-bound 兩修一起）：pin 到 opus/fable 不算 cheap（那更該提醒）；raw src 任意位置的
+# `model:`（註解已剝、別的 config 物件不在 agent( 引數內）不算。
+_CHEAP_PINNED_RE = re.compile(
+    r"\b(?:sub_agent|agent)\s*\([^)]*?model['\"]?\s*:\s*['\"]?(?:claude-)?(?:sonnet|haiku)",
+    re.IGNORECASE,
+)
+
+
 def estimate_workflow_fanout(tool_input):
     """#19 — 從 Workflow tool_input 粗估 fan-out 寬度。回傳 (agent_calls, has_parallel_pipeline, uncertain, all_pinned) 或 None。
 
@@ -287,7 +305,7 @@ def estimate_workflow_fanout(tool_input):
             # 邊界，Workflow runtime 本來就會讀它）。刻意不加 path allowlist——合法的 scriptPath 常落在
             # 變動的 temp/session 目錄，allowlist 會誤擋、反而 fail-open 靜默漏掉 advisory。讀取已
             # bounded（200KB）、內容只 regex 計數從不回傳、例外 fail-open——殘餘風險（讀任意
-            # user-readable regular file 一次）判定可接受。詳見 #21。
+            # user-readable regular file 一次）判定可接受。詳見 #22。
             try:
                 if os.path.isfile(sp):  # FIFO/特殊檔案不 block（比照 detect_model finding-3）
                     truncated = os.path.getsize(sp) > _WORKFLOW_SCRIPT_MAX_BYTES  # F3：截斷 → 估不全
@@ -308,11 +326,18 @@ def estimate_workflow_fanout(tool_input):
         has_pp = bool(re.search(r"\b(?:parallel|pipeline)\s*\(", scan))
         dynamic = agent_calls >= 1 and bool(_DYNAMIC_FANOUT_RE.search(scan))  # F1
         uncertain = truncated or dynamic
-        # F4（#20）：偵測「已 pin model」——若 model key（quoted 或 shorthand）數 ≥ agent 數，
-        # 作者顯然已知道要 pin，advisory 就不必再嘮叨。用 **raw src** 數（strip 會把 quoted
-        # `'model'` key 剝掉）。啟發式：偵測不到 → all_pinned=False → 照舊提醒（fail-open 方向）。
-        model_keys = len(re.findall(r"""['"]?\bmodel\b['"]?\s*:""", src))
-        all_pinned = agent_calls >= 1 and model_keys >= agent_calls
+        # F4（#20 verify-hardened）：只在「**每個** agent 呼叫都 pin 到**便宜** model」時才 suppress。
+        # 初版「raw src 全域數任意 model:」被 5 reviewer + Codex + DA 打爆（value-blind → pin 到貴
+        # model 也 suppress；不綁 call-site → 註解裡的 model: 假 suppress unpinned 寬 fan-out）。
+        # 改：只剝註解、保留字串值的來源，同源數 call-site（pin_calls）與 cheap-pin（_CHEAP_PINNED_RE），
+        # 全部 cheap-pinned 才 all_pinned。字串裡的假呼叫兩者同時 +1、不破壞比例。
+        try:
+            pin_src = _strip_comments_only(src)
+        except Exception:
+            pin_src = src
+        pin_calls = len(re.findall(r"\b(?:sub_agent|agent)\s*\(", pin_src))
+        cheap_pinned = len(_CHEAP_PINNED_RE.findall(pin_src))
+        all_pinned = pin_calls >= 1 and cheap_pinned >= pin_calls
         return (agent_calls, has_pp, uncertain, all_pinned)
     except Exception:
         return None
@@ -745,9 +770,12 @@ def main():
             # `<data_dir>/fanout-wide-min` 檔（後者每次 hook 重讀、mid-session 生效），預設 4。
             wide_min = file_override_int(data_dir, "fanout-wide-min",
                                          "CLAUDE_HOT_LIMIT_FANOUT_WIDE_MIN", 4)
+            wide_min = max(1, wide_min)  # F5 guard（#20 verify）：≤0 無意義、會讓 0 agent 觸發「0 個 agent」誤報
             if has_pp or agent_calls >= wide_min:
-                if all_pinned:
-                    # F4（#20）：寬但每個 agent() 都已 pin model → 作者已知情，別再嘮叨（advisory fatigue）。
+                if all_pinned and not uncertain:
+                    # F4（#20 verify-hardened）：寬且每個 agent() 都 pin 到便宜 model **且看得全**
+                    # （非 truncated/dynamic）→ 作者已知情，別再嘮叨。uncertain 時不 suppress
+                    # （看不全的 script 無法確認未見的 agent 也 pinned，Codex LOW）。
                     pass
                 else:
                     detail = "{n} 個 agent() 呼叫".format(n=agent_calls)

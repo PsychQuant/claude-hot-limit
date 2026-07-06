@@ -4,13 +4,14 @@
 
 - **feat/fix（#20 — `estimate_workflow_fanout` 估算精度 + 可調門檻；#19 6-AI verify 的 F4-F9 follow-up）**：
   - **F5（可調門檻，使用者主訴）**：`#19` fan-out advisory 判「寬」的 `≥4` 門檻原本寫死。改用既有 `file_override_int` 機制——env `CLAUDE_HOT_LIMIT_FANOUT_WIDE_MIN`（`settings.json`，重開 session）+ `<data_dir>/fanout-wide-min` 檔（`echo 6 > 檔`，每次 hook 重讀、mid-session 生效），預設 4。**刻意不用 plugin 資料夾 `.env`**（那是 Claude Code 管理的 cache、`plugin update` 會清、hook 也沒讀 `.env`）。
-  - **F4（advisory fatigue）**：寬 script 但每個 `agent()` 都已 pin `{model:...}` → 抑制 pin-sonnet 提醒（作者已知情）。用 raw src 數 model key（strip 會剝掉 quoted `'model'` key），啟發式 + fail-open（偵測不到就照舊提醒）。`estimate_workflow_fanout` 回傳升為 4-tuple `(agent_calls, has_pp, uncertain, all_pinned)`。
-  - **F6（測試缺口）**：新增 regression test 釘住「fable + Workflow + `FABLE_WORKFLOW=off` + 寬 script → #19 advisory 可達」（gate off 時 fall-through reachability）。
-  - **F8（false-negative）**：計數 regex 補 `sub_agent(`（`\bagent` 因 `_` 無邊界而漏掉它）；**不**放寬成任意 `\w*agent(`（`myagent(` 等 false-positive）。`dispatchAgent(`/`agent?.(` 屬 accepted residue（#21）。
-  - **F7（scriptPath，accepted）**：加註 accepted-risk 註解說明為何不加 path allowlist（scriptPath 來自 assistant 自己的 Workflow 呼叫、同信任邊界；allowlist 會誤擋合法 temp/session 路徑）。
-  - **F9（doc/test 精度）**：pacing-playbook「多個 agent()」→「≥ 門檻（預設 4、可調）」+ 提及 env/檔案；測試補斷言 advisory 顯示的確切 agent 數字。
-  - **未做（accepted residue → #21）**：F7 allowlist、F8 wrapper/alias 全面放寬（false-positive 風險 > 收益）。
-- **test（+9，套件 97 綠）**：`WorkflowFanoutAdvisoryTest` 補 F4（already-pinned suppress / unpinned still-advises）+ F5（env / file / file-beats-env / boundary）+ F8（sub_agent counted）+ F9（顯示 agent 數）；`FableWorkflowGateTest` 補 F6（fable off → #19 advisory reachable）。既有 88 無回歸。
+  - **F4（advisory fatigue → value-aware + call-site-bound）**：寬 script 但每個 `agent()` 都已 pin 到**便宜** model（sonnet/haiku）**且看得全** → 抑制 pin-sonnet 提醒。`estimate_workflow_fanout` 回傳升為 4-tuple `(agent_calls, has_pp, uncertain, all_pinned)`；fail-open（偵測不到就照舊提醒）。**初版（同版內經 6-AI verify 打回重修）**用「raw src 全域數任意 `model:`」被 5 reviewer + Codex + DA repro 打爆——value-blind（pin 到貴 model/opus/fable 也被 suppress，甚至跟 #18 gate-off 複合成**最高風險 shape 完全靜默**）、不綁 call-site（註解裡的 `model:` 假 suppress unpinned 寬 fan-out）。**修正**：`_CHEAP_PINNED_RE` 只認 `agent(...model:sonnet|haiku)` 的呼叫點（value-aware + call-site-bound，只剝註解保留字串值同源計數），且 `uncertain`（truncated/dynamic）時不 suppress（看不全無法確認未見的 agent，Codex LOW）。
+  - **F5（可調門檻下界）**：`wide_min` clamp 到 `max(1, …)`——`_FANOUT_WIDE_MIN=0` 不再讓 0-agent script 觸發「0 個 agent()」誤報（verify Logic/Codex）。
+  - **F6（測試缺口）**：regression test 釘住「fable + `FABLE_WORKFLOW=off` + 寬 script → #19 advisory 可達」+ verify DA 的複合最高風險 shape（fable session + gate off + 寬 parallel + agent pin fable → 仍送 advisory、不完全靜默）。
+  - **F8（false-negative）**：計數 regex 補 `sub_agent(`（`\bagent` 因 `_` 無邊界而漏掉它）；**不**放寬成任意 `\w*agent(`（`myagent(` 等 false-positive）。`dispatchAgent(`/`agent?.(` 屬 accepted residue（**#22**）。
+  - **F7（scriptPath，accepted）**：加註 accepted-risk 註解說明為何不加 path allowlist（scriptPath 來自 assistant 自己的 Workflow 呼叫、同信任邊界；allowlist 會誤擋合法 temp/session 路徑）。accepted residue → **#22**。
+  - **F9（doc/test 精度）**：pacing-playbook「多個 agent()」→「≥ 門檻（預設 4、可調）」+ 提及 env/檔案；測試補斷言 advisory 顯示的確切 agent 數字；plugin CLAUDE.md 的 `≥4` prose 同步。
+  - **未做（accepted residue → #22）**：F7 allowlist、F8 wrapper/alias 全面放寬（false-positive 風險 > 收益）。
+- **test（+14，套件 102 綠）**：`WorkflowFanoutAdvisoryTest` 補 F5（env/file/file-beats-env/boundary/**zero-clamp**）+ F4（cheap-pin suppress / **pin-to-expensive still-advises** / **comment-spoof no-suppress** / **wide-uncertain still-warns**）+ F8（sub_agent counted）+ F9（顯示 agent 數）；`FableWorkflowGateTest` 補 F6（fable off reachable + **fable-pinned/gate-off composite**）。既有 88 無回歸。**#20 的 F4 是同版經 6-AI verify（sonnet dispatch）→ FAIL → 修對的實例：verify 抓到「初版 F4 反而拖累 feature 準確度」，避免了一個會靜默最高風險 shape 的 advisory bug 出貨。**
 
 ## 1.12.1
 
