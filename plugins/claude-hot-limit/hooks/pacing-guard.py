@@ -262,7 +262,7 @@ def _strip_comments_and_strings(src):
 
 
 def estimate_workflow_fanout(tool_input):
-    """#19 — 從 Workflow tool_input 粗估 fan-out 寬度。回傳 (agent_calls, has_parallel_pipeline, uncertain) 或 None。
+    """#19 — 從 Workflow tool_input 粗估 fan-out 寬度。回傳 (agent_calls, has_parallel_pipeline, uncertain, all_pinned) 或 None。
 
     實測 238 個真實 Workflow 呼叫：inline `script` 24%（直接讀）、`scriptPath` 66%（bounded 讀檔）、
     name/resume 11%（無 script → None 估不到）。**靜態估**：dynamic loop / budget-scaled fleet /
@@ -283,6 +283,11 @@ def estimate_workflow_fanout(tool_input):
     else:
         sp = tool_input.get("scriptPath")
         if isinstance(sp, str) and sp:
+            # F7（#20，accepted risk）：scriptPath 來自 assistant 自己的 Workflow tool 呼叫（同一信任
+            # 邊界，Workflow runtime 本來就會讀它）。刻意不加 path allowlist——合法的 scriptPath 常落在
+            # 變動的 temp/session 目錄，allowlist 會誤擋、反而 fail-open 靜默漏掉 advisory。讀取已
+            # bounded（200KB）、內容只 regex 計數從不回傳、例外 fail-open——殘餘風險（讀任意
+            # user-readable regular file 一次）判定可接受。詳見 #21。
             try:
                 if os.path.isfile(sp):  # FIFO/特殊檔案不 block（比照 detect_model finding-3）
                     truncated = os.path.getsize(sp) > _WORKFLOW_SCRIPT_MAX_BYTES  # F3：截斷 → 估不全
@@ -297,11 +302,18 @@ def estimate_workflow_fanout(tool_input):
             scan = _strip_comments_and_strings(src)  # F2：剝註解／字串再數
         except Exception:
             scan = src  # fail-open：剝除失敗退回 raw（不惡化於舊行為）
-        agent_calls = len(re.findall(r"\bagent\s*\(", scan))
+        # F8（#20）：也數 `sub_agent(`——`\bagent` 因 `sub_agent` 的 `_` 是 word char、無邊界而漏掉它。
+        # 只補這個 reviewer 具名的 case；不放寬成任意 `\w*agent(`（會誤數 `myagent(` 等 false-positive）。
+        agent_calls = len(re.findall(r"\b(?:sub_agent|agent)\s*\(", scan))
         has_pp = bool(re.search(r"\b(?:parallel|pipeline)\s*\(", scan))
         dynamic = agent_calls >= 1 and bool(_DYNAMIC_FANOUT_RE.search(scan))  # F1
         uncertain = truncated or dynamic
-        return (agent_calls, has_pp, uncertain)
+        # F4（#20）：偵測「已 pin model」——若 model key（quoted 或 shorthand）數 ≥ agent 數，
+        # 作者顯然已知道要 pin，advisory 就不必再嘮叨。用 **raw src** 數（strip 會把 quoted
+        # `'model'` key 剝掉）。啟發式：偵測不到 → all_pinned=False → 照舊提醒（fail-open 方向）。
+        model_keys = len(re.findall(r"""['"]?\bmodel\b['"]?\s*:""", src))
+        all_pinned = agent_calls >= 1 and model_keys >= agent_calls
+        return (agent_calls, has_pp, uncertain, all_pinned)
     except Exception:
         return None
 
@@ -728,17 +740,25 @@ def main():
         # 與 heat nudge 獨立（看寬度不看熱），同受 WORKFLOW_NUDGE 開關。fail-open（估不到 → 不注入）。
         fanout = estimate_workflow_fanout(payload.get("tool_input"))
         if fanout is not None:
-            agent_calls, has_pp, uncertain = fanout
-            if has_pp or agent_calls >= 4:
-                detail = "{n} 個 agent() 呼叫".format(n=agent_calls)
-                if has_pp:
-                    detail += " + parallel/pipeline"
-                messages.append(
-                    "[claude-hot-limit] ⚠️ 這發 Workflow 靜態估寬 fan-out（{d}；runtime 可能更寬——"
-                    "dynamic loop / budget-scaled fleet 估不到）。建議在 script 裡把 agent() pin 到便宜 "
-                    "model（agent(..., {{'model':'sonnet'}})）避免燒 token/撞牆——沒 pin 會繼承 session "
-                    "model。".format(d=detail)
-                )
+            agent_calls, has_pp, uncertain, all_pinned = fanout
+            # F5（#20）：「寬」門檻可調——env `CLAUDE_HOT_LIMIT_FANOUT_WIDE_MIN` 或
+            # `<data_dir>/fanout-wide-min` 檔（後者每次 hook 重讀、mid-session 生效），預設 4。
+            wide_min = file_override_int(data_dir, "fanout-wide-min",
+                                         "CLAUDE_HOT_LIMIT_FANOUT_WIDE_MIN", 4)
+            if has_pp or agent_calls >= wide_min:
+                if all_pinned:
+                    # F4（#20）：寬但每個 agent() 都已 pin model → 作者已知情，別再嘮叨（advisory fatigue）。
+                    pass
+                else:
+                    detail = "{n} 個 agent() 呼叫".format(n=agent_calls)
+                    if has_pp:
+                        detail += " + parallel/pipeline"
+                    messages.append(
+                        "[claude-hot-limit] ⚠️ 這發 Workflow 靜態估寬 fan-out（{d}；runtime 可能更寬——"
+                        "dynamic loop / budget-scaled fleet 估不到）。建議在 script 裡把 agent() pin 到便宜 "
+                        "model（agent(..., {{'model':'sonnet'}})）避免燒 token/撞牆——沒 pin 會繼承 session "
+                        "model。".format(d=detail)
+                    )
             elif uncertain:
                 # F1/F3：靜態估看似窄，但偵測到 dynamic fan-out 跡象或 script 被截斷——silence 會被
                 # 誤讀成「真的窄」= 假安心。出一句 caveat 而非保持靜默（不擋、不算寬，只誠實標示估不全）。

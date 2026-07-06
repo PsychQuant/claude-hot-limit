@@ -36,10 +36,10 @@ acceleration-limit / short-burst 節流（429 / 529）。
 
 ## 參數（env）
 
-`CLAUDE_HOT_LIMIT_WINDOW`(600) / `_MAX`(3) / `_MIN_GAP`(20) / `_SLEEP_CAP`(45) / `_DATA`(~/.cache/claude-hot-limit) / `_WORKFLOW_NUDGE`(1，0 關閉 Workflow 寬度提醒) / `_FABLE_WORKFLOW`(deny 預設；`warn` 只警告 / `off` 關閉 fable×Workflow gate) / `_OFF`(全域停用)
+`CLAUDE_HOT_LIMIT_WINDOW`(600) / `_MAX`(3) / `_MIN_GAP`(20) / `_SLEEP_CAP`(45) / `_DATA`(~/.cache/claude-hot-limit) / `_WORKFLOW_NUDGE`(1，0 關閉 Workflow 寬度提醒) / `_FABLE_WORKFLOW`(deny 預設；`warn` 只警告 / `off` 關閉 fable×Workflow gate) / `_FANOUT_WIDE_MIN`(4，#19 fan-out advisory 判「寬」的 `agent()` 數門檻，#20) / `_OFF`(全域停用)
 
 **檔案旗標（即時生效，不需重開 session——env var 不 hot-reload，檔案每次 hook 執行重讀）**：
-`<data_dir>/disabled`（存在即全域停用）/ `<data_dir>/max-override`（內容整數，優先於 `_MAX`）/ `<data_dir>/min-gap-override`（優先於 `_MIN_GAP`）。例：`echo 5 > ~/.cache/claude-hot-limit/max-override` 立即切回保護模式；`rm` 該檔回到 env var。
+`<data_dir>/disabled`（存在即全域停用）/ `<data_dir>/max-override`（內容整數，優先於 `_MAX`）/ `<data_dir>/min-gap-override`（優先於 `_MIN_GAP`）/ `<data_dir>/fanout-wide-min`（優先於 `_FANOUT_WIDE_MIN`，#20）。例：`echo 5 > ~/.cache/claude-hot-limit/max-override` 立即切回保護模式；`echo 6 > ~/.cache/claude-hot-limit/fanout-wide-min` 把 fan-out「寬」門檻調到 6；`rm` 該檔回到 env var。
 
 ## Development
 

@@ -941,6 +941,20 @@ class FableWorkflowGateTest(unittest.TestCase):
         self.assertTrue(is_deny(parsed),
                         "大小寫變異的 fable id 仍應被 gate（is_fable 需 lowercase），stdout=%r" % raw)
 
+    def test_fable_off_reaches_fanout_advisory(self):
+        # #20 F6：fable + Workflow + FABLE_WORKFLOW=off + 寬 script → fall-through 到 #19 advisory
+        # （釘住 off-path reachability——gate off 時 #19 的 fan-out 建議仍該送達）
+        env = dict(self.base, CLAUDE_HOT_LIMIT_FABLE_WORKFLOW="off")
+        tp = make_transcript(self.tmp.name, ["claude-fable-5"])
+        payload = {"tool_name": "Workflow",
+                   "tool_input": {"script": "const r = await parallel(items.map(x=>()=>agent('go')))"},
+                   "transcript_path": tp}
+        _, parsed, raw = run_hook(payload=payload, env_overrides=env)
+        msg = (parsed or {}).get("systemMessage", "") if parsed else ""
+        self.assertFalse(is_deny(parsed), "off 模式不該 deny，stdout=%r" % raw)
+        self.assertIn("靜態估寬 fan-out", msg,
+                      "fable gate off 時應 fall-through 到 #19 fan-out advisory，stdout=%r" % raw)
+
 
 class WorkflowFanoutAdvisoryTest(unittest.TestCase):
     """#19 — 依 Workflow fan-out 寬度給 dispatch-model 建議（顯示，不擋）。
@@ -1076,6 +1090,68 @@ class WorkflowFanoutAdvisoryTest(unittest.TestCase):
         self.assertFalse(is_deny(parsed))
         self.assertIn(self.CAVEAT_MARK, self._msg(parsed),
                       "過大 scriptPath 被截斷時應標示估算不完整，stdout=%r" % raw)
+
+    # --- #20 (F4/F5/F8/F9): 精度 + 可調門檻 ---
+
+    def _agents(self, n, pinned=False):
+        """產生 n 個 agent() 呼叫的 script。pinned=True → 每個都帶 {model:'sonnet'}。"""
+        call = "agent('t%d', {model:'sonnet'})" if pinned else "agent('t%d')"
+        return "; ".join(call % i for i in range(n)) + ";"
+
+    def test_threshold_env_raises_wide_bar(self):
+        # F5：門檻可用 env 調高——min=6 時 4 個 agent 不再算寬
+        env = dict(self.base, CLAUDE_HOT_LIMIT_FANOUT_WIDE_MIN="6")
+        _, parsed, raw = run_hook(payload=self._wf(script=self._agents(4)), env_overrides=env)
+        self.assertNotIn("sonnet", self._msg(parsed), "門檻=6 時 4 個 agent 不算寬，stdout=%r" % raw)
+
+    def test_threshold_env_boundary(self):
+        # F5：門檻=6 的邊界 — 5 narrow / 6 wide
+        env = dict(self.base, CLAUDE_HOT_LIMIT_FANOUT_WIDE_MIN="6")
+        _, p5, r5 = run_hook(payload=self._wf(script=self._agents(5)), env_overrides=env)
+        self.assertNotIn("sonnet", self._msg(p5), "門檻=6：5 個 agent narrow，stdout=%r" % r5)
+        _, p6, r6 = run_hook(payload=self._wf(script=self._agents(6)), env_overrides=env)
+        self.assertIn("sonnet", self._msg(p6), "門檻=6：6 個 agent wide，stdout=%r" % r6)
+
+    def test_threshold_file_override(self):
+        # F5：<data_dir>/fanout-wide-min 檔案 override（mid-session 生效）
+        os.makedirs(self.base["CLAUDE_HOT_LIMIT_DATA"], exist_ok=True)
+        with open(os.path.join(self.base["CLAUDE_HOT_LIMIT_DATA"], "fanout-wide-min"), "w") as f:
+            f.write("6")
+        _, parsed, raw = run_hook(payload=self._wf(script=self._agents(4)), env_overrides=self.base)
+        self.assertNotIn("sonnet", self._msg(parsed), "檔案門檻=6 時 4 個 agent narrow，stdout=%r" % raw)
+
+    def test_threshold_file_beats_env(self):
+        # F5：檔案 override 優先於 env（比照 file_override_int 契約）
+        os.makedirs(self.base["CLAUDE_HOT_LIMIT_DATA"], exist_ok=True)
+        with open(os.path.join(self.base["CLAUDE_HOT_LIMIT_DATA"], "fanout-wide-min"), "w") as f:
+            f.write("6")
+        env = dict(self.base, CLAUDE_HOT_LIMIT_FANOUT_WIDE_MIN="2")  # env 說 2（4 會 wide），檔案說 6（narrow）
+        _, parsed, raw = run_hook(payload=self._wf(script=self._agents(4)), env_overrides=env)
+        self.assertNotIn("sonnet", self._msg(parsed), "檔案門檻應優先於 env，stdout=%r" % raw)
+
+    def test_already_pinned_wide_suppresses_advisory(self):
+        # F4：寬 script 但每個 agent() 都已 pin 便宜 model → 不再嘮叨 pin
+        _, parsed, raw = run_hook(payload=self._wf(script=self._agents(4, pinned=True)), env_overrides=self.base)
+        self.assertNotIn("sonnet", self._msg(parsed),
+                         "已 pin model 的寬 script 不該再建議 pin（advisory fatigue），stdout=%r" % raw)
+
+    def test_unpinned_wide_still_advises(self):
+        # F4 反面：沒 pin 的寬 script 照樣提醒（別把 F4 做過頭）
+        _, parsed, raw = run_hook(payload=self._wf(script=self._agents(4, pinned=False)), env_overrides=self.base)
+        self.assertIn("sonnet", self._msg(parsed), "沒 pin 的寬 script 仍應建議 pin，stdout=%r" % raw)
+
+    def test_sub_agent_counted_as_fanout(self):
+        # F8：sub_agent( 也算 fan-out（原 \bagent 因 _ 無邊界而漏掉）
+        script = "; ".join("sub_agent('t%d')" % i for i in range(4)) + ";"
+        _, parsed, raw = run_hook(payload=self._wf(script=script), env_overrides=self.base)
+        self.assertIn("sonnet", self._msg(parsed), "sub_agent( 應被算進 fan-out（F8），stdout=%r" % raw)
+
+    def test_advisory_shows_agent_count(self):
+        # F9：advisory 顯示確切 agent 數字（原測試只斷言 'sonnet' 子字串）
+        _, parsed, raw = run_hook(payload=self._wf(script=self._agents(5)), env_overrides=self.base)
+        msg = self._msg(parsed)
+        self.assertIn("sonnet", msg)
+        self.assertIn("5 個 agent", msg, "advisory 應顯示確切 agent 數（F9），stdout=%r" % raw)
 
 
 if __name__ == "__main__":

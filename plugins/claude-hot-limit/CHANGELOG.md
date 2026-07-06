@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.12.2
+
+- **feat/fix（#20 — `estimate_workflow_fanout` 估算精度 + 可調門檻；#19 6-AI verify 的 F4-F9 follow-up）**：
+  - **F5（可調門檻，使用者主訴）**：`#19` fan-out advisory 判「寬」的 `≥4` 門檻原本寫死。改用既有 `file_override_int` 機制——env `CLAUDE_HOT_LIMIT_FANOUT_WIDE_MIN`（`settings.json`，重開 session）+ `<data_dir>/fanout-wide-min` 檔（`echo 6 > 檔`，每次 hook 重讀、mid-session 生效），預設 4。**刻意不用 plugin 資料夾 `.env`**（那是 Claude Code 管理的 cache、`plugin update` 會清、hook 也沒讀 `.env`）。
+  - **F4（advisory fatigue）**：寬 script 但每個 `agent()` 都已 pin `{model:...}` → 抑制 pin-sonnet 提醒（作者已知情）。用 raw src 數 model key（strip 會剝掉 quoted `'model'` key），啟發式 + fail-open（偵測不到就照舊提醒）。`estimate_workflow_fanout` 回傳升為 4-tuple `(agent_calls, has_pp, uncertain, all_pinned)`。
+  - **F6（測試缺口）**：新增 regression test 釘住「fable + Workflow + `FABLE_WORKFLOW=off` + 寬 script → #19 advisory 可達」（gate off 時 fall-through reachability）。
+  - **F8（false-negative）**：計數 regex 補 `sub_agent(`（`\bagent` 因 `_` 無邊界而漏掉它）；**不**放寬成任意 `\w*agent(`（`myagent(` 等 false-positive）。`dispatchAgent(`/`agent?.(` 屬 accepted residue（#21）。
+  - **F7（scriptPath，accepted）**：加註 accepted-risk 註解說明為何不加 path allowlist（scriptPath 來自 assistant 自己的 Workflow 呼叫、同信任邊界；allowlist 會誤擋合法 temp/session 路徑）。
+  - **F9（doc/test 精度）**：pacing-playbook「多個 agent()」→「≥ 門檻（預設 4、可調）」+ 提及 env/檔案；測試補斷言 advisory 顯示的確切 agent 數字。
+  - **未做（accepted residue → #21）**：F7 allowlist、F8 wrapper/alias 全面放寬（false-positive 風險 > 收益）。
+- **test（+9，套件 97 綠）**：`WorkflowFanoutAdvisoryTest` 補 F4（already-pinned suppress / unpinned still-advises）+ F5（env / file / file-beats-env / boundary）+ F8（sub_agent counted）+ F9（顯示 agent 數）；`FableWorkflowGateTest` 補 F6（fable off → #19 advisory reachable）。既有 88 無回歸。
+
 ## 1.12.1
 
 - **fix（#18 fable×Workflow gate 的 verify-driven 修復；retroactive 6-AI ensemble FAIL）**：#18 v1.11.0 上線後補跑的 6-AI verify（`IDD_AGENT_MODEL=sonnet`）判定 FAIL，修掉 live production 的行為 bug——
