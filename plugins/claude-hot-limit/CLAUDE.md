@@ -41,6 +41,8 @@ acceleration-limit / short-burst 節流（429 / 529）。
 **檔案旗標（即時生效，不需重開 session——env var 不 hot-reload，檔案每次 hook 執行重讀）**：
 `<data_dir>/disabled`（存在即全域停用）/ `<data_dir>/max-override`（內容整數，優先於 `_MAX`）/ `<data_dir>/min-gap-override`（優先於 `_MIN_GAP`）/ `<data_dir>/fanout-wide-min`（優先於 `_FANOUT_WIDE_MIN`，#20）。例：`echo 5 > ~/.cache/claude-hot-limit/max-override` 立即切回保護模式；`echo 6 > ~/.cache/claude-hot-limit/fanout-wide-min` 把 fan-out「寬」門檻調到 6；`rm` 該檔回到 env var。
 
+> **設計決策（per-model 設定以桶為單位）**：目前所有門檻是**單一值套用到所有 model 桶**（計數是 per-model 分桶的，但門檻不分）。未來要做 per-model 門檻時，**單位一律是 rate-limit 家族桶（canonical = 桶名 `opus-4`/`sonnet-5`…），model 版本名只是 alias**——因為 Anthropic 節流是家族級（`opus-4.5–4.8` 共用一桶）。完整契約見 [`.claude/rules/per-bucket-settings.md`](../../.claude/rules/per-bucket-settings.md)；roadmap #23。
+
 ## Development
 
 - 跑測試：`python3 tests/test_pacing_guard.py`（黑箱行為測試，stdlib only，pytest 亦可 discover）。
