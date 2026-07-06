@@ -9,10 +9,14 @@ Anthropic 的 **acceleration-limit / short-burst 節流**（429，以及 529
 
 | 組件 | 類型 | 作用 |
 |------|------|------|
-| **pacing-guard** | PreToolUse hook | 執行期**硬擋**：守住 `Workflow`/`Agent` 啟動節奏，超量 deny、太近 sleep |
-| **pacing-playbook** | skill | 設計期**引導**：fan-out 前讀的反 burst 規則與決策檢查表 |
+| **pacing-guard** | PreToolUse hook | 執行期守住 `Workflow`/`Agent` 啟動節奏：**硬擋**（burst 超量、Fable 5 開 Workflow）、**軟延遲**（間隔太近自動 sleep）、**只提醒**（寬 fan-out 建議 pin 便宜 model、bucket 燙時提醒收斂）|
+| **trip-recorder** | StopFailure hook | 撞牆（429/529）自動記錄，供校準上限 |
+| **rate-limit-proxy** | 選配 daemon | 本地 reverse proxy，擷取真實 rate-limit header / usage |
+| **pacing-playbook** | skill | 設計期反 burst 引導與決策檢查表 |
 
-> plugin 的完整說明見 [`plugins/claude-hot-limit/README.md`](./plugins/claude-hot-limit/README.md)。
+**會攔截／提醒什麼**（＝「會檔到你哪些東西」）：🔴 硬擋＝burst 超量 deny、Fable 5 開 Workflow deny；🟡 軟延遲＝兩發太近自動 sleep；🔵 只提醒＝寬 fan-out 建議 pin sonnet、bucket 近期撞過牆的 heat nudge。全部 fail-open、可 env / 檔案旗標調整或關閉。
+
+> plugin 的完整行為表 + 所有參數見 [`plugins/claude-hot-limit/README.md`](./plugins/claude-hot-limit/README.md)。
 
 ## 安裝
 
@@ -34,7 +38,8 @@ claude-hot-limit/                       ← repo root（marketplace）
 └── plugins/
     └── claude-hot-limit/               ← plugin 本體
         ├── .claude-plugin/plugin.json
-        ├── hooks/                       ← pacing-guard PreToolUse hook
+        ├── hooks/                       ← pacing-guard（PreToolUse）+ trip-recorder（StopFailure）
+        ├── proxy/                       ← rate-limit-proxy（選配觀測 daemon）
         ├── skills/pacing-playbook/      ← 設計期反 burst skill
         ├── README.md / CLAUDE.md / CHANGELOG.md
 ```
