@@ -15,6 +15,7 @@ acceleration-limit / short-burst 節流（429 / 529）。
 | trip-recorder hook | `hooks/trip-recorder.py` + `hooks/hooks.json` | StopFailure（matcher `.*`，腳本側過濾）撞牆自動記錄 trip → calibration-log.md + trips-raw.jsonl |
 | rate-limit-proxy | `proxy/rate-limit-proxy.py` | 本地 HTTP reverse proxy（**Phase 1，純觀測**）：經 `ANTHROPIC_BASE_URL` 導流，transparent forwarding（含 streaming）+ 擷取真實 rate-limit header、token usage、請求 body 的 model（#4，供 `rate_state_heat()` 分桶）、與 HTTP response **status**（#13，含 429 撞牆偵測，零 header 依賴）寫入 `rate-state.jsonl` |
 | proxy-launcher | `proxy/proxy-launcher.py` + SessionStart hook | proxy 的 opt-in 冪等啟動器（#8）：導流 env 即 opt-in 訊號，每 session `ensure` daemon 起著（flock 防 race、fail-loud、`stop`/`status` 手動管理）。見「Proxy 部署」段 |
+| session-fable-nudge hook | `hooks/session-fable-nudge.py` + SessionStart hook | best-effort：resume/compact 偵測到 fable session → 提醒 main-loop coordinator burn（#24；PreToolUse 到不了的那半）|
 | pacing-playbook skill | `skills/pacing-playbook/SKILL.md` | 設計期反 burst 引導 |
 
 ## Hook 設計重點

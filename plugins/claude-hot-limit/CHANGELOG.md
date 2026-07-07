@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.13.1
+
+- **feat（Fable session coordinator-burn SessionStart advisory；#24 (b)，best-effort）**：新增 SessionStart hook `hooks/session-fable-nudge.py`——SessionStart 時 tail-read transcript 的 model，若是 fable → 印一句 nudge 進 session context，提醒「pacing-guard 擋得到 Workflow/Agent 啟動，但擋不到 main-loop coordinator 自己每個 turn 燒的 fable quota（讀檔/思考/寫 report 都不是 tool 呼叫、沒有 hook surface），考慮 /model 切 sonnet 做協調」。
+- **誠實覆蓋邊界（不 oversell）**：✅ **resume/compact**（transcript 有 fable turns）抓得到——長 fable session 每次 compact 都提醒，正是 #24 incident 樣貌；❌ **fresh startup**（空 transcript）測不到 model → 靜默 no-op；❌ **mid-session /model 切到 fable** 永遠不 fire（沒有 switch hook）。真正的完整解仍是 rate-limit-proxy（#7，唯一量得到 main-loop spend 的層）；本 hook 只提示、無法強制 main loop 離開 fable。
+- **#24 disposition**：(b) best-effort advisory 已做（本版）；(a) 核心「量 main-loop spend」歸 #7 proxy scope；enforcement 是這條路的結構性硬邊界（hook 永遠辦不到，proxy 也只能觀測/警告）。fail-open、同受 `_WORKFLOW_NUDGE` / `_OFF` 開關。
+- **test（+8，套件 115 綠）**：`SessionFableNudgeTest` 釘住 fable-nudges / uppercase / non-fable-silent / no-model-silent / nudge-off / global-off / missing-transcript / empty-stdin-fail-open。既有 107 無回歸。
+
 ## 1.13.0
 
 - **feat（Fable session 開 `Agent` → advisory；#21 F5 Agent side-door）**：Fable 5 session 直接 spawn `Agent`（非 Workflow）時，若 subagent 沒 pin model（會繼承 fable5）或明確 pin 到 fable → 注入 `systemMessage` 提醒把 Agent 的 `model` 參數 pin 到便宜 model（sonnet/haiku）。**只提醒不 deny**：單一 `Agent` 不是 Workflow-scale fan-out（Workflow≈74 subagent），硬擋會過度（連一個 subagent 都 spawn 不了）；多個並行 Agent 的爆量由既有 burst guard（per-bucket MAX 計數）擋——PreToolUse 每個 Agent 分開 fire、看不到一 turn 的並行度。pin 了非-fable model → 不繼承 → 靜默。同受 `_WORKFLOW_NUDGE` 開關、fail-open。

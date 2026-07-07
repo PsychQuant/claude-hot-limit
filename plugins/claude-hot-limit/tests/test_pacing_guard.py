@@ -1246,5 +1246,61 @@ class WorkflowFanoutAdvisoryTest(unittest.TestCase):
         self.assertIn("5 個 agent", msg, "advisory 應顯示確切 agent 數（F9），stdout=%r" % raw)
 
 
+class SessionFableNudgeTest(unittest.TestCase):
+    """#24 (b) — SessionStart best-effort advisory：fable session → coordinator-burn nudge。
+
+    誠實邊界：resume/compact（transcript 有 fable turns）抓得到；fresh startup（空 transcript）
+    測不到 → 靜默。fail-open + 同受 _WORKFLOW_NUDGE / _OFF 開關。"""
+
+    HOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "hooks", "session-fable-nudge.py")
+    MARK = "這是 Fable 5 session"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, models, env_overrides=None, transcript_path=None):
+        tp = transcript_path if transcript_path is not None else make_transcript(self.tmp.name, models)
+        payload = {"hook_event_name": "SessionStart", "source": "compact", "transcript_path": tp}
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_HOT_LIMIT_")}
+        if env_overrides:
+            env.update(env_overrides)
+        p = subprocess.run([sys.executable, self.HOOK], input=json.dumps(payload),
+                           capture_output=True, text=True, env=env)
+        return p.stdout
+
+    def test_fable_session_nudges(self):
+        self.assertIn(self.MARK, self._run(["claude-fable-5"]))
+
+    def test_uppercase_fable_nudges(self):
+        # is_fable lower-normalize（同 pacing-guard）
+        self.assertIn(self.MARK, self._run(["Claude-Fable-5"]))
+
+    def test_nonfable_session_silent(self):
+        self.assertNotIn(self.MARK, self._run(["claude-opus-4-8"]))
+
+    def test_no_model_silent(self):
+        # 只有 <synthetic> turn（≈ fresh startup）→ 測不到 model → 靜默 no-op
+        self.assertNotIn(self.MARK, self._run([None]))
+
+    def test_nudge_off_suppresses(self):
+        self.assertNotIn(self.MARK, self._run(["claude-fable-5"], {"CLAUDE_HOT_LIMIT_WORKFLOW_NUDGE": "0"}))
+
+    def test_global_off_suppresses(self):
+        self.assertNotIn(self.MARK, self._run(["claude-fable-5"], {"CLAUDE_HOT_LIMIT_OFF": "1"}))
+
+    def test_missing_transcript_silent(self):
+        self.assertNotIn(self.MARK, self._run(None, transcript_path="/nonexistent/t.jsonl"))
+
+    def test_empty_stdin_fail_open(self):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_HOT_LIMIT_")}
+        p = subprocess.run([sys.executable, self.HOOK], input="", capture_output=True, text=True, env=env)
+        self.assertEqual(p.returncode, 0, "空 stdin 應 fail-open exit 0")
+        self.assertNotIn(self.MARK, p.stdout)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

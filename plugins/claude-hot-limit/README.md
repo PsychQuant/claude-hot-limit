@@ -13,6 +13,7 @@ Anthropic 的 **acceleration-limit / short-burst 節流**（429，以及 529
 |------|------|------|
 | **pacing-guard** | PreToolUse hook | 執行期**硬擋 / 延遲 / 提醒**：守住 `Workflow`/`Agent` 啟動節奏（見下方「攔截／提醒總表」）|
 | **trip-recorder** | StopFailure hook | 撞牆**自動記錄**：429/529 turn 結束時記下當下各時間窗 launch 數，供校準上限 |
+| **session-fable-nudge** | SessionStart hook | **best-effort**：resume/compact 時若偵測到 fable session → 提醒 main-loop coordinator 在 fable 上貴且 guard 看不見，考慮 /model 切 sonnet（#24；fresh startup / mid-switch 抓不到，真解是 proxy #7）|
 | **rate-limit-proxy** | 選配 daemon | 本地 reverse proxy，擷取**真實** rate-limit header / usage，讓提醒用真實 budget（見「啟用 proxy」）|
 | **pacing-playbook** | skill | 設計期**引導**：fan-out 前讀的反 burst 規則與決策檢查表 |
 
