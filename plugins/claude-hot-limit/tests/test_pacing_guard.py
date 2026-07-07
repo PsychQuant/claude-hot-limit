@@ -970,6 +970,51 @@ class FableWorkflowGateTest(unittest.TestCase):
         self.assertIn("靜態估寬 fan-out", msg,
                       "fable-pinned + gate off 的寬 fan-out 不該完全靜默（value-aware F4），stdout=%r" % raw)
 
+    # --- #21 F5：Fable session 開 Agent → advisory（不 deny；單一 Agent 非 Workflow-scale fan-out）---
+
+    F5_MARK = "Fable 5 session 開 Agent"
+
+    def _agent_payload(self, agent_model=None):
+        tp = make_transcript(self.tmp.name, ["claude-fable-5"])
+        ti = {}
+        if agent_model is not None:
+            ti["model"] = agent_model
+        return {"tool_name": "Agent", "tool_input": ti, "transcript_path": tp}
+
+    def test_fable_agent_unpinned_advises(self):
+        # F5：fable session + 沒 pin model 的 Agent → subagent 會繼承 fable → advisory（不 deny）
+        _, parsed, raw = run_hook(payload=self._agent_payload(), env_overrides=self.base)
+        self.assertFalse(is_deny(parsed), "F5 是 advisory 不該 deny（單一 Agent 非 fan-out），stdout=%r" % raw)
+        msg = (parsed or {}).get("systemMessage", "") if parsed else ""
+        self.assertIn(self.F5_MARK, msg, "fable + unpinned Agent 應提醒 pin subagent model，stdout=%r" % raw)
+
+    def test_fable_agent_pinned_cheap_silent(self):
+        # F5：pin 到非-fable model → 不繼承 fable → 靜默
+        _, parsed, raw = run_hook(payload=self._agent_payload(agent_model="claude-sonnet-5"), env_overrides=self.base)
+        msg = (parsed or {}).get("systemMessage", "") if parsed else ""
+        self.assertNotIn(self.F5_MARK, msg, "pin 非-fable model 的 Agent 不繼承 fable → 不提醒，stdout=%r" % raw)
+
+    def test_fable_agent_pinned_fable_advises(self):
+        # F5：明確 pin 到 fable → 仍繼承 fable → 提醒
+        _, parsed, raw = run_hook(payload=self._agent_payload(agent_model="claude-fable-5"), env_overrides=self.base)
+        msg = (parsed or {}).get("systemMessage", "") if parsed else ""
+        self.assertIn(self.F5_MARK, msg, "pin 到 fable 的 Agent 仍該提醒，stdout=%r" % raw)
+
+    def test_nonfable_agent_no_f5_advisory(self):
+        # F5 反面：非-fable session 開 Agent 不觸發
+        tp = make_transcript(self.tmp.name, ["claude-opus-4-8"])
+        payload = {"tool_name": "Agent", "tool_input": {}, "transcript_path": tp}
+        _, parsed, raw = run_hook(payload=payload, env_overrides=self.base)
+        msg = (parsed or {}).get("systemMessage", "") if parsed else ""
+        self.assertNotIn(self.F5_MARK, msg, "非-fable session 不該觸發 F5，stdout=%r" % raw)
+
+    def test_fable_agent_nudge_off_suppresses_f5(self):
+        # F5：WORKFLOW_NUDGE=0 一併關掉 F5 advisory
+        env = dict(self.base, CLAUDE_HOT_LIMIT_WORKFLOW_NUDGE="0")
+        _, parsed, raw = run_hook(payload=self._agent_payload(), env_overrides=env)
+        msg = (parsed or {}).get("systemMessage", "") if parsed else ""
+        self.assertNotIn(self.F5_MARK, msg, "NUDGE=0 應關閉 F5 advisory，stdout=%r" % raw)
+
 
 class WorkflowFanoutAdvisoryTest(unittest.TestCase):
     """#19 — 依 Workflow fan-out 寬度給 dispatch-model 建議（顯示，不擋）。

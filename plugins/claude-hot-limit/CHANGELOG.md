@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.13.0
+
+- **feat（Fable session 開 `Agent` → advisory；#21 F5 Agent side-door）**：Fable 5 session 直接 spawn `Agent`（非 Workflow）時，若 subagent 沒 pin model（會繼承 fable5）或明確 pin 到 fable → 注入 `systemMessage` 提醒把 Agent 的 `model` 參數 pin 到便宜 model（sonnet/haiku）。**只提醒不 deny**：單一 `Agent` 不是 Workflow-scale fan-out（Workflow≈74 subagent），硬擋會過度（連一個 subagent 都 spawn 不了）；多個並行 Agent 的爆量由既有 burst guard（per-bucket MAX 計數）擋——PreToolUse 每個 Agent 分開 fire、看不到一 turn 的並行度。pin 了非-fable model → 不繼承 → 靜默。同受 `_WORKFLOW_NUDGE` 開關、fail-open。
+- **#21 F5 定案**：issue 標的「extend gate vs document」→ 選 **fable-aware advisory**（與 #19 Workflow fan-out advisory 同構），非 deny、非純文件。**未做（accepted residue，續留 #21）**：F7（is_fable word-boundary，純理論）、F8（tier gate，純理論）、F10（既有 burst-deny 訊息 path leak）。
+- **相關 #24**：advisory 訊息指出「跑起來的 main-loop 消耗連本 guard 都看不見」——#24（main-loop coordinator burn）是 PreToolUse 結構上到不了的互補另一半，diagnosis 定 disposition 為 #7（proxy）use-case + 可選 SessionStart advisory。
+- **test（+5，套件 107 綠）**：`FableWorkflowGateTest` 補 fable-agent unpinned-advises / pinned-cheap-silent / pinned-fable-advises / nonfable-no-advisory / nudge-off。既有 102 無回歸。
+
 ## 1.12.2
 
 - **feat/fix（#20 — `estimate_workflow_fanout` 估算精度 + 可調門檻；#19 6-AI verify 的 F4-F9 follow-up）**：

@@ -29,6 +29,7 @@ pacing-guard 掛在 `Workflow` 與 `Agent` 兩個 fan-out 入口的 **PreToolUse
 | 🔴 **硬擋（deny）** | **Fable × Workflow gate** | **Fable 5（頂階/貴 model）session 開 `Workflow`** | 預設 `deny`（fan-out 的 unpinned agent 會繼承 fable5 → N 並發幾乎必撞 429/session-limit）| `_FABLE_WORKFLOW`（`deny`/`warn`/`off`）|
 | 🟡 **軟延遲（sleep）** | **Min-gap** | 距上一發 < 最小間隔（預設 20s）| 自動 `sleep` 補足間隔後**放行**（防 short-burst）| `_MIN_GAP` / `_SLEEP_CAP` |
 | 🔵 **只提醒（不擋）** | **Fan-out 寬度建議** | 寬 `Workflow`（`parallel`/`pipeline` 或 ≥ 門檻個 `agent()`，門檻預設 4）且未全 pin 便宜 model | `systemMessage` 建議在 script 裡把 `agent()` pin 到 sonnet/haiku，別繼承 session 貴 model | `_FANOUT_WIDE_MIN` |
+| 🔵 **只提醒（不擋）** | **Fable × Agent advisory** | **Fable 5 session 直接開 `Agent`** 且 subagent 沒 pin model（會繼承 fable5）| `systemMessage` 建議把 Agent 的 `model` 參數 pin 到 sonnet/haiku。單一 `Agent` 非 Workflow-scale fan-out → 不 deny；多個並行 Agent 的爆量由 burst guard 擋 | `_WORKFLOW_NUDGE` |
 | 🔵 **只提醒（不擋）** | **Heat-aware nudge** | bucket 近期**實際撞過牆** + 這發是 `Workflow` | `systemMessage` 提醒先收斂並發／改串行 | `_WORKFLOW_NUDGE` |
 
 **共通紀律**：

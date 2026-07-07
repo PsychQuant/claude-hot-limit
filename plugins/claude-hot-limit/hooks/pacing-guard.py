@@ -796,6 +796,23 @@ def main():
                     "若真的寬，把 agent() pin 到便宜 model（agent(..., {'model':'sonnet'}）避免燒 token/撞牆。"
                 )
 
+    # --- Fable session 開 Agent → advisory（#21 F5，Agent side-door）---
+    # 單一 `Agent` 不是 Workflow-scale fan-out（Workflow≈74 subagent），對每個 fable Agent 硬 deny
+    # 會過度（連一個 subagent 都 spawn 不了）。多個並行 Agent 的爆量由 burst guard（per-bucket MAX）
+    # 擋——PreToolUse 每個 Agent 分開 fire、看不到一 turn 的並行度。這裡只做 fable-aware advisory：
+    # 沒 pin model 的 Agent 會繼承 fable5（貴，且跑起來的 main-loop 消耗連本 guard 都看不見，見 #24）。
+    # pin 了非-fable model → 不繼承 → 靜默。同受 _WORKFLOW_NUDGE 開關、fail-open。
+    if (tool_name == "Agent" and is_fable(model)
+            and os.environ.get("CLAUDE_HOT_LIMIT_WORKFLOW_NUDGE", "1") != "0"):
+        ti = payload.get("tool_input")
+        agent_model = ti.get("model") if isinstance(ti, dict) else None
+        if agent_model is None or is_fable(agent_model):
+            messages.append(
+                "[claude-hot-limit] ℹ️ Fable 5 session 開 Agent。沒 pin model 的 subagent 會繼承 "
+                "fable5（頂階/貴），且跑起來的 main-loop 消耗連本 guard 都看不見（#24）。建議把 Agent "
+                "的 model 參數 pin 到便宜 model（sonnet/haiku）。多個並行 Agent 的爆量由 burst guard 擋。"
+            )
+
     if messages:
         allow_with_message("\n".join(messages))
     allow_silent()
