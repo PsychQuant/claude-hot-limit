@@ -38,7 +38,10 @@ DEFAULT_STATE_FILE = os.path.expanduser("~/.cache/claude-hot-limit/rate-state.js
 DEFAULT_PORT = 8787
 
 # 轉發時不逐字複製的 hop-by-hop / 會被 http.client 自動重算的 header。
-_SKIP_REQUEST_HEADERS = {"host", "content-length", "connection"}
+# accept-encoding（#26 H-GZIP 保險）：剝掉 client 的壓縮宣告 → http.client 自動補 identity →
+# 上游恆回未壓縮 → 側路（SSE data: 掃描 + buffered json.loads）永遠可讀。client 不壞
+#（identity 恆可接受，HTTP 標準）；代價只有頻寬（SSE 本多未壓縮，實際影響小）。
+_SKIP_REQUEST_HEADERS = {"host", "content-length", "connection", "accept-encoding"}
 
 
 def resolve_upstream():
@@ -93,6 +96,42 @@ def maybe_debug_dump_headers(state_file_path, resp_headers):
             os.makedirs(d, exist_ok=True)
         with open(path, "a") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+_SSE_SAMPLE_DUMPED = False  # 每個 daemon process 只 dump 一筆（見 maybe_debug_dump_sse_sample）
+
+
+def maybe_debug_dump_sse_sample(state_file_path, resp_headers, first_bytes):
+    """opt-in（同 `RATE_LIMIT_PROXY_DEBUG_HEADERS`）SSE 樣本 dump（#26 歸因用）。
+
+    把**第一筆** streaming 回應的 content-type / content-encoding 值 + 前 2KB 原始 bytes 的
+    hex 寫進 proxy-headers-debug.jsonl —— 部署後看一眼即可歸因 H-CRLF（邊界是 0d0a0d0a 還是
+    0a0a）vs H-GZIP（content-encoding 有無 + bytes 是否可讀）。每個 daemon process 只 dump
+    一筆（避免灌檔）。⚠️ 前 2KB 可能含回應內容片段（local-only、opt-in 診斷）——查完關掉
+    env 並刪 debug 檔。fail-open：任何異常靜默返回。"""
+    global _SSE_SAMPLE_DUMPED
+    if _SSE_SAMPLE_DUMPED:
+        return
+    if os.environ.get("RATE_LIMIT_PROXY_DEBUG_HEADERS", "") not in ("1", "true", "True"):
+        return
+    try:
+        h = {k.lower(): v for k, v in resp_headers}
+        rec = {
+            "ts": time.time(),
+            "kind": "sse-sample",
+            "content_type": h.get("content-type"),
+            "content_encoding": h.get("content-encoding"),
+            "first_2kb_hex": bytes(first_bytes[:2048]).hex(),
+        }
+        path = os.path.join(os.path.dirname(state_file_path), "proxy-headers-debug.jsonl")
+        d = os.path.dirname(path)
+        if d and not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        _SSE_SAMPLE_DUMPED = True
     except Exception:
         pass
 
@@ -276,28 +315,52 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         usage_acc = {}
         sse_buffer = bytearray()
-        while True:
-            chunk = upstream_resp.read(1)
-            if not chunk:
-                break
-            self.wfile.write(("%x\r\n" % len(chunk)).encode("ascii"))
-            self.wfile.write(chunk)
-            self.wfile.write(b"\r\n")
+        sample_head = bytearray()  # #26 診斷：前 2KB 原始 bytes（opt-in dump 用，歸因 H-CRLF/H-GZIP）
+        completed = False
+        try:
+            while True:
+                chunk = upstream_resp.read(1)
+                if not chunk:
+                    break
+                self.wfile.write(("%x\r\n" % len(chunk)).encode("ascii"))
+                self.wfile.write(chunk)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+
+                if len(sample_head) < 2048:
+                    sample_head += chunk
+                sse_buffer += chunk
+                # event 邊界雙容忍（#26 H-CRLF）：`\r\n\r\n`（0d0a0d0a **不含** 0a0a 子序列）
+                # 與 `\n\n` 都算邊界，取最早出現者切割。production 實測 streaming usage 0% 全漏，
+                # 前導假設即為上游送 CRLF 讓舊的單一 `\n\n` 切割永不 match。只動側路，轉發 bytes 原樣。
+                while True:
+                    i_lf = sse_buffer.find(b"\n\n")
+                    i_crlf = sse_buffer.find(b"\r\n\r\n")
+                    if i_crlf != -1 and (i_lf == -1 or i_crlf < i_lf):
+                        event_bytes = bytes(sse_buffer[:i_crlf])
+                        sse_buffer = bytearray(sse_buffer[i_crlf + 4:])
+                    elif i_lf != -1:
+                        event_bytes = bytes(sse_buffer[:i_lf])
+                        sse_buffer = bytearray(sse_buffer[i_lf + 2:])
+                    else:
+                        break
+                    accumulate_usage_from_sse_event(event_bytes, usage_acc)
+            completed = True  # 上游 EOF＝usage 累積完整（terminator 寫失敗不影響完整性判定）
+            self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
-
-            sse_buffer += chunk
-            while b"\n\n" in sse_buffer:
-                event_bytes, _, rest = sse_buffer.partition(b"\n\n")
-                sse_buffer = bytearray(rest)
-                accumulate_usage_from_sse_event(event_bytes, usage_acc)
-        self.wfile.write(b"0\r\n\r\n")
-        self.wfile.flush()
-
-        maybe_debug_dump_headers(self._state_file(), resp_headers)  # #12 opt-in 診斷（streaming 路徑）
-        record = {"ts": time.time(), "model": req_model, "status": status}  # status（#13）：同 _record_state
-        record.update(extract_rate_limit_fields(resp_headers))
-        record["usage"] = usage_acc or None
-        write_state_record(self._state_file(), record)
+        finally:
+            # record 保寫（#26 第二缺口）：client mid-stream 斷線（wfile 寫入 raise）時，舊版
+            # 直接跳出、record 從未寫入——整筆蒸發（production proxy.log 大量 ConnectionResetError）。
+            # 現在無論如何都寫入已累積的 partial usage + status；未完成者標 truncated 供消費端
+            #（#25 burn-rate）辨識。寫入自身 fail-open（write_state_record 已吞例外），絕不遮蔽原始例外。
+            maybe_debug_dump_headers(self._state_file(), resp_headers)  # #12 opt-in 診斷（streaming 路徑）
+            maybe_debug_dump_sse_sample(self._state_file(), resp_headers, sample_head)  # #26 歸因
+            record = {"ts": time.time(), "model": req_model, "status": status}  # status（#13）：同 _record_state
+            record.update(extract_rate_limit_fields(resp_headers))
+            record["usage"] = usage_acc or None
+            if not completed:
+                record["truncated"] = True
+            write_state_record(self._state_file(), record)
 
     do_GET = _handle
     do_POST = _handle

@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.14.0
+
+- **fix（proxy streaming usage 擷取全漏，#26；#25 burn-rate 的資料前置）**：production 實測 `rate-state.jsonl` 的 usage 覆蓋率僅 **2.1%**（2026-07-10：103/4863；有 usage 的全是固定形狀的非 streaming 背景呼叫、output_tokens 恰好全=30）→ **streaming 側路 0% 全漏**。三處修復 + 一個診斷（全在側路，轉發 byte 流不動）：
+  - **SSE event 邊界雙容忍（H-CRLF 修復）**：舊切割只認 `\n\n`，對 `\r\n\r\n`（`0d0a0d0a` **不含** `0a0a` 子序列）永不 match → `usage_acc` 恆空。改為 `\n\n` 與 `\r\n\r\n` 取最早出現者切割。測試 harness 直接複現了此機制（CRLF chunks → usage=None）。
+  - **剝 forwarded request 的 `Accept-Encoding`（H-GZIP 保險）**：`_SKIP_REQUEST_HEADERS` 加 `accept-encoding` → http.client 自動補 identity → 上游恆回未壓縮 → 側路（SSE 掃描 + buffered `json.loads`）永遠可讀。client 不壞（identity 恆可接受）；順帶修「大型 buffered JSON 被壓縮 → usage parse 靜默失敗」的隱藏面。
+  - **record 保寫（第二缺口）**：streaming record 原在 EOF 後才寫，client mid-stream 斷線（production proxy.log 大量 `ConnectionResetError`）→ **整筆 record 蒸發**。改 try/finally：斷線也寫入 partial usage + status，加 `"truncated": true` 標記供消費端（#25）辨識。
+  - **診斷 dump（#26 歸因）**：`RATE_LIMIT_PROXY_DEBUG_HEADERS=1` 時額外 dump 第一筆 streaming 回應的 content-type/content-encoding 值 + 前 2KB hex（每 daemon process 一筆）→ 部署後歸因 H-CRLF vs H-GZIP 何者為 production 真因。⚠️ 含回應內容片段（local-only、opt-in），查完關 env 刪檔。
+- **部署後驗證契約**：發版 + daemon 重啟後跑正常 session，usage 覆蓋率應從 2.1% → 接近 status=200 佔比（~97%）；歸因結果記回 #26。
+- **test（+3，proxy 27 綠、全套件 180 綠）**：`StreamingCaptureGapTest` 釘住 CRLF 邊界累積 / mid-stream 斷線 partial record + truncated 標記 / forwarded request 不宣告壓縮支援。既有 LF / 非 streaming 路徑無回歸。
+
 ## 1.13.1
 
 - **feat（Fable session coordinator-burn SessionStart advisory；#24 (b)，best-effort）**：新增 SessionStart hook `hooks/session-fable-nudge.py`——SessionStart 時 tail-read transcript 的 model，若是 fable → 印一句 nudge 進 session context，提醒「pacing-guard 擋得到 Workflow/Agent 啟動，但擋不到 main-loop coordinator 自己每個 turn 燒的 fable quota（讀檔/思考/寫 report 都不是 tool 呼叫、沒有 hook surface），考慮 /model 切 sonnet 做協調」。

@@ -811,5 +811,106 @@ class StatusCodeCaptureTest(unittest.TestCase):
             proxy_server.shutdown()
 
 
+class StreamingCaptureGapTest(unittest.TestCase):
+    """#26 — streaming 側路 0% 全漏的三個修復：CRLF 邊界 / 斷線保寫 / Accept-Encoding 剝除。
+
+    Production 實測（2026-07-10）：usage 覆蓋率 2.1%，有 usage 的全是固定形狀的非 streaming
+    背景呼叫 → streaming 側路一筆都沒抓過。候選機制 H-CRLF（event 切割 `\\n\\n` 對
+    `\\r\\n\\r\\n` 永不 match）與 H-GZIP（壓縮 bytes 掃不到 data:）——兩個都防禦性修。
+    第二缺口：record 在 EOF 後才寫，client 斷線 → 整筆蒸發 → try/finally 保寫。"""
+
+    def setUp(self):
+        self.mock, self.mock_url = start_mock_upstream()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state_file = os.path.join(self.tmp.name, "rate-state.jsonl")
+
+    def tearDown(self):
+        MockUpstreamHandler.sse_chunks = None
+        MockUpstreamHandler.chunk_delay = 0
+        self.mock.shutdown()
+        self.tmp.cleanup()
+
+    def test_streaming_usage_with_crlf_event_boundaries(self):
+        # H-CRLF：event 以 \r\n\r\n 分隔（0d0a0d0a 不含 0a0a 子序列）→ 現行切割永不 match
+        MockUpstreamHandler.response_status = 200
+        MockUpstreamHandler.response_headers = {}
+        MockUpstreamHandler.sse_chunks = [
+            b'data: {"type": "message_start", "usage": {"input_tokens": 200, "output_tokens": 0}}\r\n\r\n',
+            b'data: {"type": "content_block_delta"}\r\n\r\n',
+            b'data: {"type": "message_delta", "usage": {"output_tokens": 77}}\r\n\r\n',
+        ]
+
+        proxy_server, proxy_url, _ = start_proxy(self.mock_url, self.state_file)
+        try:
+            req = urllib.request.Request(proxy_url + "/v1/messages",
+                                          data=b'{"model":"x","stream":true}', method="POST")
+            full_body = urllib.request.urlopen(req).read()
+            self.assertEqual(full_body, b"".join(MockUpstreamHandler.sse_chunks),
+                              "CRLF 內容仍應原樣轉發（normalize 只在側路，不動轉發 bytes）")
+            time.sleep(0.1)
+            rows = read_jsonl(self.state_file)
+            self.assertEqual(len(rows), 1)
+            usage = rows[0]["usage"]
+            self.assertIsNotNone(usage, "CRLF 邊界的 SSE 也應抓到 usage（#26 H-CRLF）")
+            self.assertEqual(usage["input_tokens"], 200)
+            self.assertEqual(usage["output_tokens"], 77)
+            self.assertFalse(rows[0].get("truncated"), "正常 EOF 不該標 truncated")
+        finally:
+            proxy_server.shutdown()
+
+    def test_midstream_disconnect_still_writes_record(self):
+        # 第二缺口：client 中途斷線（production proxy.log 大量 ConnectionResetError）
+        # → record 寫入在 EOF 後 → 整筆蒸發。修後：try/finally 保寫 + truncated 標記。
+        MockUpstreamHandler.response_status = 200
+        MockUpstreamHandler.response_headers = {}
+        MockUpstreamHandler.sse_chunks = [
+            b'data: {"type": "message_start", "usage": {"input_tokens": 10, "output_tokens": 0}}\n\n',
+            b'data: {"type": "content_block_delta"}\n\n',
+            b'data: {"type": "message_delta", "usage": {"output_tokens": 5}}\n\n',
+        ]
+        MockUpstreamHandler.chunk_delay = 0.3  # 拉長串流，讓 client 有空檔中途斷線
+
+        proxy_server, proxy_url, _ = start_proxy(self.mock_url, self.state_file)
+        try:
+            req = urllib.request.Request(proxy_url + "/v1/messages",
+                                          data=b'{"model":"x","stream":true}', method="POST")
+            resp = urllib.request.urlopen(req)
+            resp.read(1)   # 收到第一個 byte 後
+            resp.close()   # 直接斷線（模擬 client abort）
+            time.sleep(1.5)  # 等 proxy 撞上 write error + finally 寫入
+            rows = read_jsonl(self.state_file)
+            self.assertEqual(len(rows), 1,
+                             "mid-stream 斷線也應寫入 record（#26 第二缺口），不該整筆蒸發")
+            self.assertTrue(rows[0].get("truncated"),
+                            "斷線寫入的 record 應標 truncated=true 供消費端辨識")
+            self.assertEqual(rows[0]["status"], 200)
+        finally:
+            proxy_server.shutdown()
+
+    def test_accept_encoding_stripped_from_forwarded_request(self):
+        # H-GZIP 保險：剝掉 Accept-Encoding → 上游恆回 identity → 側路永遠可讀
+        MockUpstreamHandler.response_status = 200
+        MockUpstreamHandler.response_headers = {"Content-Type": "application/json"}
+        MockUpstreamHandler.response_body = b'{"ok": true}'
+        MockUpstreamHandler.sse_chunks = None
+        MockUpstreamHandler.received = []
+
+        proxy_server, proxy_url, _ = start_proxy(self.mock_url, self.state_file)
+        try:
+            req = urllib.request.Request(proxy_url + "/v1/messages", data=b'{"model":"x"}',
+                                          method="POST",
+                                          headers={"Accept-Encoding": "gzip, deflate, br"})
+            urllib.request.urlopen(req).read()
+            time.sleep(0.1)
+            self.assertEqual(len(MockUpstreamHandler.received), 1)
+            fwd = {k.lower(): v for k, v in MockUpstreamHandler.received[0]["headers"].items()}
+            # http.client 沒給 Accept-Encoding 時會自動補 identity——契約是「不得宣告壓縮支援」
+            ae = fwd.get("accept-encoding", "identity").lower()
+            self.assertEqual(ae, "identity",
+                             "forwarded request 不得宣告壓縮支援（#26 H-GZIP 保險），got %r" % ae)
+        finally:
+            proxy_server.shutdown()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
