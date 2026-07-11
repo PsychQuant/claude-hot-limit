@@ -1368,5 +1368,100 @@ class GracefulDrainTest(unittest.TestCase):
         t.join(timeout=10)
 
 
+class StateFileRotationTest(unittest.TestCase):
+    """#17 — rate-state.jsonl size-based rotation（archive、不刪語料）。
+
+    write_state_record 在 flock 臨界區內做 size 檢查：> RATE_LIMIT_PROXY_ROTATE_MB
+    （float MB，預設 64；≤0 停用）→ rename 成 rate-state-<ts>.jsonl 後開新檔續寫。
+    archive 全保留（校準語料）；rotation 失敗 fail-open（照常寫入，絕不丟 record）。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = os.path.join(self.tmp.name, "rate-state.jsonl")
+        self._old_env = os.environ.get("RATE_LIMIT_PROXY_ROTATE_MB")
+
+    def tearDown(self):
+        if self._old_env is None:
+            os.environ.pop("RATE_LIMIT_PROXY_ROTATE_MB", None)
+        else:
+            os.environ["RATE_LIMIT_PROXY_ROTATE_MB"] = self._old_env
+        self.tmp.cleanup()
+
+    def _archives(self):
+        return sorted(f for f in os.listdir(self.tmp.name)
+                      if f.startswith("rate-state-") and f.endswith(".jsonl"))
+
+    def _record(self, i):
+        return {"ts": 1700000000 + i, "model": "claude-opus-4-8", "pad": "x" * 80}
+
+    def test_rotation_triggers_and_conserves_records(self):
+        os.environ["RATE_LIMIT_PROXY_ROTATE_MB"] = "0.0002"  # ~210 bytes
+        rlp = _load_proxy_module()
+        n = 10
+        for i in range(n):
+            rlp.write_state_record(self.state, self._record(i))
+        archives = self._archives()
+        self.assertTrue(archives, "超過 cap 應產生至少一個 archive 檔")
+        total = len(read_jsonl(self.state))
+        for a in archives:
+            total += len(read_jsonl(os.path.join(self.tmp.name, a)))
+        self.assertEqual(total, n, "rotation 不得遺失任何 record（live+archive 守恆）")
+        self.assertLess(os.path.getsize(self.state), 400,
+                        "live 檔剛 rotate 過應遠小於累積總量")
+
+    def test_no_rotation_below_default_cap(self):
+        os.environ.pop("RATE_LIMIT_PROXY_ROTATE_MB", None)  # 預設 64MB
+        rlp = _load_proxy_module()
+        for i in range(5):
+            rlp.write_state_record(self.state, self._record(i))
+        self.assertEqual(self._archives(), [], "遠低於預設 cap 不該 rotate")
+        self.assertEqual(len(read_jsonl(self.state)), 5)
+
+    def test_bad_cap_values_fall_back_to_default(self):
+        for bad in ("abc", "nan", "inf", ""):
+            os.environ["RATE_LIMIT_PROXY_ROTATE_MB"] = bad
+            rlp = _load_proxy_module()
+            rlp.write_state_record(self.state, self._record(0))
+            self.assertEqual(self._archives(), [],
+                             "壞 cap 值 %r 應回預設 64MB（小檔不觸發），不 crash 不誤觸發" % bad)
+
+    def test_zero_or_negative_cap_disables_rotation(self):
+        with open(self.state, "w") as f:
+            f.write('{"pad": "%s"}\n' % ("y" * 4096))  # 一定超過任何微 cap
+        for off in ("0", "-5"):
+            os.environ["RATE_LIMIT_PROXY_ROTATE_MB"] = off
+            rlp = _load_proxy_module()
+            rlp.write_state_record(self.state, self._record(0))
+            self.assertEqual(self._archives(), [],
+                             "cap=%r 應停用 rotation（escape hatch），大檔也不動" % off)
+
+    def test_rotation_failure_fails_open_and_still_writes(self):
+        os.environ["RATE_LIMIT_PROXY_ROTATE_MB"] = "0.0001"  # ~105 bytes，必觸發
+        with open(self.state, "w") as f:
+            f.write('{"pad": "%s"}\n' % ("z" * 512))
+        rlp = _load_proxy_module()
+        real_replace = rlp.os.replace  # rlp.os 即全域 os module——patch 後必還原
+
+        def boom(*a, **k):
+            raise OSError("simulated rename failure")
+
+        import io
+        captured = io.StringIO()
+        old_stderr = sys.stderr
+        rlp.os.replace = boom
+        sys.stderr = captured
+        try:
+            rlp.write_state_record(self.state, self._record(0))
+        finally:
+            rlp.os.replace = real_replace
+            sys.stderr = old_stderr
+        lines = read_jsonl(self.state)
+        self.assertEqual(lines[-1].get("model"), "claude-opus-4-8",
+                         "rotation 失敗仍必須把 record 寫進 live 檔（fail-open）")
+        self.assertIn("WARNING", captured.getvalue(),
+                      "rotation 失敗應印警告，stderr=%r" % captured.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

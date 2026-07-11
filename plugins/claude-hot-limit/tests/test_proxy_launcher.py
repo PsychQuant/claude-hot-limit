@@ -320,5 +320,60 @@ class GracefulStopTest(unittest.TestCase):
             pass
 
 
+class LogRotationTest(unittest.TestCase):
+    """#17 — proxy.log spawn-time rotation（只留一代 .1；log 無語料價值）。
+
+    ensure() 在開 proxy.log append 之前（daemon 未跑、flock 內——無人持 fd 的安全點）
+    size 檢查：> RATE_LIMIT_PROXY_LOG_ROTATE_MB（float MB，預設 32）→ os.replace 成 .1。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.data = self.tmp.name
+        self.port = free_port()
+        self.env = {
+            "CLAUDE_HOT_LIMIT_DATA": self.data,
+            "RATE_LIMIT_PROXY_PORT": str(self.port),
+            "RATE_LIMIT_PROXY_DRAIN_CAP": "2",
+            "CLAUDE_HOT_LIMIT_PROXY": "1",
+        }
+        self.log = os.path.join(self.data, "proxy.log")
+
+    def tearDown(self):
+        run_launcher("stop", self.env)
+        self.tmp.cleanup()
+
+    def test_oversized_log_rotated_to_dot1_on_spawn(self):
+        with open(self.log, "w") as f:
+            f.write("OLD-DAEMON-LOG " * 20)  # ~300 bytes
+        env = dict(self.env, RATE_LIMIT_PROXY_LOG_ROTATE_MB="0.0001")  # cap ~105B
+        code, out, err = run_launcher("ensure", env)
+        self.assertEqual(code, 0, "ensure 應成功，stderr=%r" % err)
+        self.assertTrue(os.path.exists(self.log + ".1"),
+                        "超 cap 的 proxy.log 應在 spawn 前輪替成 .1")
+        with open(self.log + ".1") as f:
+            self.assertIn("OLD-DAEMON-LOG", f.read())
+
+    def test_existing_dot1_is_replaced_single_generation(self):
+        with open(self.log + ".1", "w") as f:
+            f.write("GEN-MINUS-2")
+        with open(self.log, "w") as f:
+            f.write("GEN-MINUS-1 " * 30)
+        env = dict(self.env, RATE_LIMIT_PROXY_LOG_ROTATE_MB="0.0001")
+        code, out, err = run_launcher("ensure", env)
+        self.assertEqual(code, 0)
+        with open(self.log + ".1") as f:
+            content = f.read()
+        self.assertIn("GEN-MINUS-1", content, ".1 應被最新一代覆蓋")
+        self.assertNotIn("GEN-MINUS-2", content, "只留一代——更舊的內容應被丟棄")
+
+    def test_below_cap_not_rotated(self):
+        with open(self.log, "w") as f:
+            f.write("small log\n")
+        code, out, err = run_launcher("ensure", self.env)  # 預設 cap 32MB
+        self.assertEqual(code, 0)
+        self.assertFalse(os.path.exists(self.log + ".1"), "未達 cap 不該輪替")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

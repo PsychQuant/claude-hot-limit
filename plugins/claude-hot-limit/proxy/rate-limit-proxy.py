@@ -18,6 +18,9 @@ HTTP response header，也管不到主迴圈自己的一般對話輪。要拿到
   - fail-open：狀態檔寫入失敗、upstream 錯誤，都不影響轉發給 client 的真實回應。
   - 真實上游位址由本檔自己的環境變數讀取（RATE_LIMIT_PROXY_UPSTREAM），不能沿用
     Claude Code 的 ANTHROPIC_BASE_URL——那個值屆時會指向這個 proxy 自己。
+  - 狀態檔 size-based rotation（#17）：live 檔 > RATE_LIMIT_PROXY_ROTATE_MB（float MB，
+    預設 64；≤0 停用）→ flock 臨界區內 rename 成 rate-state-<ts>.jsonl archive。
+    archive 全保留（校準語料，手動清理）；rotation 失敗 fail-open 照常寫入。
 """
 import http.server
 import json
@@ -236,6 +239,58 @@ def accumulate_usage_from_sse_event(event_bytes, usage_acc):
             usage_acc.update(usage)
 
 
+def resolve_rotate_cap_bytes():
+    """rate-state.jsonl 的 rotation 門檻（bytes）；None = 停用（#17）。
+
+    `RATE_LIMIT_PROXY_ROTATE_MB` 收 float MB（測試可設 0.0001 級微 cap），預設 64
+    （現行 ~15MB/day 約 4 天一轉）。壞值紀律比照 resolve_drain_cap：非有限 / parse
+    失敗 → 預設；≤0 → 停用（「就是要無限累積」的 escape hatch）。
+    """
+    default_mb = 64.0
+    try:
+        v = float(os.environ.get("RATE_LIMIT_PROXY_ROTATE_MB", default_mb))
+    except (ValueError, TypeError):
+        v = default_mb
+    if v != v or v in (float("inf"), float("-inf")):
+        v = default_mb
+    if v <= 0:
+        return None
+    return int(v * 1024 * 1024)
+
+
+def _rotate_state_file(state_file_path):
+    """flock 臨界區內呼叫：live 檔超過 cap → rename 成帶時戳的 archive（#17）。
+
+    archive 全保留——歷史 record 是校準語料（#23/#25 的分析資料集），rotation 的
+    目的只是讓 live 檔有界，不是刪資料；prune 留給使用者手動。臨界區內 rename +
+    每次寫入都重新開檔（無持久 fd）→ 零 record 遺失。失敗 fail-open：只警告、
+    照常 append（寧可檔案續長，不可丟 record）。
+    """
+    cap = resolve_rotate_cap_bytes()
+    if cap is None:
+        return
+    try:
+        size = os.path.getsize(state_file_path)
+    except OSError:
+        return  # live 檔還不存在 → 無事可轉
+    if size <= cap:
+        return
+    try:
+        base = state_file_path
+        if base.endswith(".jsonl"):
+            base = base[: -len(".jsonl")]
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        target = "%s-%s.jsonl" % (base, stamp)
+        n = 0
+        while os.path.exists(target):  # 同秒多次 rotation（微 cap）→ 序號後綴
+            n += 1
+            target = "%s-%s-%d.jsonl" % (base, stamp, n)
+        os.replace(state_file_path, target)
+    except Exception as e:
+        print("[rate-limit-proxy] WARNING: state file rotation failed: %s" % e,
+              file=sys.stderr)
+
+
 def write_state_record(state_file_path, record):
     """Append 一行 JSON 進帳號級共用狀態檔（flock 序列化，比照既有 hook 帳本慣例）。
 
@@ -250,6 +305,7 @@ def write_state_record(state_file_path, record):
             lockf = open(state_file_path + ".lock", "a")
             fcntl.flock(lockf, fcntl.LOCK_EX)
         try:
+            _rotate_state_file(state_file_path)
             with open(state_file_path, "a") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
         finally:

@@ -22,6 +22,10 @@ Opt-in gate（ensure 的動作條件，缺一即靜默退出 exit 0）：
 fail-loud：opt-in 成立但 daemon 起不來（bind 失敗等）→ stdout 印警告（SessionStart
 hook 的 stdout 會進 session context，使用者一定看得到）+ 退回指引，exit 0 絕不擋 session。
 
+proxy.log 輪替（#17）：ensure 在 spawn 前若 proxy.log > RATE_LIMIT_PROXY_LOG_ROTATE_MB
+（float MB，預設 32；≤0 停用）→ os.replace 成 proxy.log.1（只留一代——log 無語料價值）。
+mid-run 成長無界至下次重啟（stderr fd 固定，daemon 端 reopen 屬過度工程）。
+
 為什麼是 Python 不是 bash：macOS 沒有 flock(1)，並發 session 的 ensure 序列化只能用
 fcntl.flock——與本 repo 既有 hook 同款；且 daemon 本身就是 Python，零新增依賴。
 Windows 無 fcntl → 跳過鎖（fail-open，沿用 rate-limit-proxy.py 同款 fallback）。
@@ -170,6 +174,15 @@ def ensure():
             return 0  # 鎖內二次探測：並發 session 在我們等鎖時已把 daemon 起好
 
         proxy_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rate-limit-proxy.py")
+        # #17：spawn 前輪替 proxy.log——此刻 daemon 未跑（port 檢查後、flock 內），
+        # 無人持這個 fd，是唯一安全輪替點（mid-run stderr fd 跟著舊檔、動不得）。
+        # log 無語料價值 → 只留一代 .1；輪替失敗 fail-open 照常 append。
+        cap = _log_rotate_cap_bytes()
+        try:
+            if cap is not None and os.path.getsize(log_path) > cap:
+                os.replace(log_path, log_path + ".1")
+        except OSError:
+            pass
         try:
             logf = open(log_path, "a")
         except Exception:
@@ -246,6 +259,24 @@ def _still_ours(pid):
     誤殺無辜 process）。查不到 command（degraded 平台）→ 沿用「照殺」的既有取捨。"""
     cmd = _pid_command(pid)
     return cmd is None or "rate-limit-proxy" in cmd
+
+
+def _log_rotate_cap_bytes():
+    """proxy.log 的 spawn 前輪替門檻（bytes）；None = 停用（#17）。
+
+    `RATE_LIMIT_PROXY_LOG_ROTATE_MB` 收 float MB，預設 32。壞值紀律同 daemon 的
+    ROTATE_MB：非有限 / parse 失敗 → 預設；≤0 → 停用。
+    """
+    default_mb = 32.0
+    try:
+        v = float(os.environ.get("RATE_LIMIT_PROXY_LOG_ROTATE_MB", default_mb))
+    except (ValueError, TypeError):
+        v = default_mb
+    if v != v or v in (float("inf"), float("-inf")):
+        v = default_mb
+    if v <= 0:
+        return None
+    return int(v * 1024 * 1024)
 
 
 def _drain_cap():
