@@ -22,3 +22,11 @@
 - IDD config 加 `pr_policy: never`（`1dfa0b1`）；filed #28（gitignore `.claude/.idd/`）；#17 帶 production 成長數據重評（46.5MB/9 天）。
 - 全套件 **195/195 綠**（proxy 38 / launcher 15 / pacing 115 / model_bucket 7 / trip 20）。
 - 待辦（batch 末端）：graceful `restart` 部署 1.16.0 daemon + #12 三類欄 production 驗證；#27 verify 進行中。
+
+## #25 — 官方 utilization leading indicator（v1.17.0，同日第二批）
+
+- **重框**：立案前提被 #12/#26 翻新——兩種牆兩種訊號（quota 牆→官方水位主力；burst 牆→velocity **經負面校準砍除**：撞牆前速率 14/155 遠低於忙碌期 p95 677/640，quota 級 429 由水位直接回答）。
+- **實作**：`rate_state_heat()` 雙層訊號——官方 unified 5h（**帳號級、任意桶最新**、非 `allowed` 直判熱、utilization ≥ `UTIL_WARN` 0.8）+ legacy per-bucket remaining；**null-blindness 修正**（Max 環境 heat-nudge 一直被「全 null=確認冷」壓制——429 fallback 復活）；rate-state 讀取全面 **1MB bounded tail-read**（#17 hook-cost 面順帶解）。
+- **驗證**：R1 6-AI FAIL（HIGH 三方收斂：tail 涵蓋 ~606s 貼死 WINDOW + 帳號級訊號被桶過濾）→ 全修 → R2 聚焦 DA PASS（1MB sizing 真實資料雙驗 57.8/27.3 min；4 新測試 revert-check）。DA refute 兩攻擊留檔（0.80 門檻實給 ~19-20 min lead time）。
+- 全套件 **211/211**；production live smoke（真資料水位 45% 讀取）通過。
+- Commits: `600b8b0`/`0860519`/`8890056`/`4c54c37`/`f34d62b`。待 `/idd-close #25`。
