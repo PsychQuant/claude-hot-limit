@@ -912,5 +912,155 @@ class StreamingCaptureGapTest(unittest.TestCase):
             proxy_server.shutdown()
 
 
+_UNIFIED_HEADERS_FULL = {
+    "anthropic-ratelimit-unified-5h-utilization": "0.2",
+    "anthropic-ratelimit-unified-5h-status": "allowed",
+    "anthropic-ratelimit-unified-5h-reset": "1752192000",
+    "anthropic-ratelimit-unified-7d-utilization": "0.21",
+    "anthropic-ratelimit-unified-7d-status": "allowed",
+    "anthropic-ratelimit-unified-7d-reset": "1752600000",
+    "anthropic-ratelimit-unified-7d_oi-utilization": "0.29",
+    "anthropic-ratelimit-unified-7d_oi-status": "allowed",
+    "anthropic-ratelimit-unified-7d_oi-reset": "1752600000",
+    "anthropic-ratelimit-unified-representative-claim": "five_hour",
+    "anthropic-ratelimit-unified-status": "allowed",
+    "anthropic-ratelimit-unified-reset": "1752192000",
+    "anthropic-ratelimit-unified-overage-status": "rejected",
+    "anthropic-ratelimit-unified-overage-disabled-reason": "org_level_disabled",
+    "anthropic-ratelimit-unified-overage-fallback-percentage": "0.5",
+}
+
+_UNIFIED_FIELDS = [
+    "rl_unified_5h_utilization", "rl_unified_5h_status", "rl_unified_5h_reset",
+    "rl_unified_7d_utilization", "rl_unified_7d_status", "rl_unified_7d_reset",
+    "rl_unified_7d_oi_utilization", "rl_unified_7d_oi_status", "rl_unified_7d_oi_reset",
+    "rl_unified_representative_claim", "rl_unified_status", "rl_unified_reset",
+    "rl_unified_overage_status", "rl_unified_overage_disabled_reason",
+    "rl_unified_overage_fallback_percentage",
+]
+
+
+class UnifiedHeaderFamilyTest(unittest.TestCase):
+    """#12 — Max/OAuth 訂閱回應用 `anthropic-ratelimit-unified-*` 家族，
+    proxy 必須擷取（先前 map 只認 API-platform 家族 → production 0/1134）。"""
+
+    def setUp(self):
+        self.mock, self.mock_url = start_mock_upstream()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state_file = os.path.join(self.tmp.name, "rate-state.jsonl")
+
+    def tearDown(self):
+        self.mock.shutdown()
+        self.tmp.cleanup()
+
+    def _post(self, proxy_url, body=b'{"model": "claude-sonnet-5"}'):
+        req = urllib.request.Request(proxy_url + "/v1/messages", data=body, method="POST")
+        urllib.request.urlopen(req).read()
+        time.sleep(0.1)
+
+    def test_unified_family_captured(self):
+        MockUpstreamHandler.response_status = 200
+        MockUpstreamHandler.response_headers = dict(
+            {"Content-Type": "application/json"}, **_UNIFIED_HEADERS_FULL)
+        MockUpstreamHandler.response_body = b'{"ok": true}'
+        MockUpstreamHandler.sse_chunks = None
+
+        proxy_server, proxy_url, _ = start_proxy(self.mock_url, self.state_file)
+        try:
+            self._post(proxy_url)
+            rows = read_jsonl(self.state_file)
+            self.assertEqual(len(rows), 1)
+            row = rows[0]
+            self.assertEqual(row["rl_unified_5h_utilization"], 0.2)
+            self.assertEqual(row["rl_unified_5h_status"], "allowed")
+            self.assertEqual(row["rl_unified_5h_reset"], 1752192000)
+            self.assertEqual(row["rl_unified_7d_utilization"], 0.21)
+            self.assertEqual(row["rl_unified_7d_oi_utilization"], 0.29)
+            self.assertEqual(row["rl_unified_7d_oi_reset"], 1752600000)
+            self.assertEqual(row["rl_unified_representative_claim"], "five_hour")
+            self.assertEqual(row["rl_unified_status"], "allowed")
+            self.assertEqual(row["rl_unified_reset"], 1752192000)
+            self.assertEqual(row["rl_unified_overage_status"], "rejected")
+            self.assertEqual(row["rl_unified_overage_disabled_reason"], "org_level_disabled")
+            self.assertEqual(row["rl_unified_overage_fallback_percentage"], 0.5)
+        finally:
+            proxy_server.shutdown()
+
+    def test_unified_missing_recorded_as_null(self):
+        MockUpstreamHandler.response_status = 200
+        MockUpstreamHandler.response_headers = {"Content-Type": "application/json"}
+        MockUpstreamHandler.response_body = b'{"ok": true}'
+        MockUpstreamHandler.sse_chunks = None
+
+        proxy_server, proxy_url, _ = start_proxy(self.mock_url, self.state_file)
+        try:
+            self._post(proxy_url)
+            row = read_jsonl(self.state_file)[0]
+            for field in _UNIFIED_FIELDS:
+                self.assertIn(field, row, "缺 header 也要記欄位（寧記勿漏）: %s" % field)
+                self.assertIsNone(row[field])
+        finally:
+            proxy_server.shutdown()
+
+    def test_unified_bad_values_recorded_as_null(self):
+        headers = dict(_UNIFIED_HEADERS_FULL)
+        headers["anthropic-ratelimit-unified-5h-utilization"] = "garbage"
+        headers["anthropic-ratelimit-unified-reset"] = "not-an-epoch"
+        MockUpstreamHandler.response_status = 200
+        MockUpstreamHandler.response_headers = dict(
+            {"Content-Type": "application/json"}, **headers)
+        MockUpstreamHandler.response_body = b'{"ok": true}'
+        MockUpstreamHandler.sse_chunks = None
+
+        proxy_server, proxy_url, _ = start_proxy(self.mock_url, self.state_file)
+        try:
+            self._post(proxy_url)
+            row = read_jsonl(self.state_file)[0]
+            self.assertIsNone(row["rl_unified_5h_utilization"], "壞值 → null，不炸")
+            self.assertIsNone(row["rl_unified_reset"])
+            self.assertEqual(row["rl_unified_7d_utilization"], 0.21, "他欄不受壞值影響")
+            self.assertEqual(row["rl_unified_5h_status"], "allowed")
+        finally:
+            proxy_server.shutdown()
+
+    def test_both_families_coexist(self):
+        MockUpstreamHandler.response_status = 200
+        MockUpstreamHandler.response_headers = dict(
+            {"Content-Type": "application/json",
+             "anthropic-ratelimit-requests-remaining": "42",
+             "anthropic-ratelimit-requests-reset": "2026-07-01T05:00:00Z"},
+            **_UNIFIED_HEADERS_FULL)
+        MockUpstreamHandler.response_body = b'{"ok": true}'
+        MockUpstreamHandler.sse_chunks = None
+
+        proxy_server, proxy_url, _ = start_proxy(self.mock_url, self.state_file)
+        try:
+            self._post(proxy_url)
+            row = read_jsonl(self.state_file)[0]
+            self.assertEqual(row["rl_requests_remaining"], 42, "API-platform 家族回歸")
+            self.assertEqual(row["rl_requests_reset"], "2026-07-01T05:00:00Z")
+            self.assertEqual(row["rl_unified_5h_utilization"], 0.2, "unified 家族並存")
+        finally:
+            proxy_server.shutdown()
+
+    def test_unified_captured_on_streaming_path(self):
+        MockUpstreamHandler.response_status = 200
+        MockUpstreamHandler.response_headers = dict(_UNIFIED_HEADERS_FULL)
+        MockUpstreamHandler.sse_chunks = [
+            b'event: message_start\ndata: {"type":"message_start"}\n\n',
+            b'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":7}}\n\n',
+        ]
+
+        proxy_server, proxy_url, _ = start_proxy(self.mock_url, self.state_file)
+        try:
+            self._post(proxy_url)
+            row = read_jsonl(self.state_file)[0]
+            self.assertEqual(row["rl_unified_5h_utilization"], 0.2,
+                             "streaming 主路徑（_forward_streaming）也要擷取 unified 家族")
+            self.assertEqual(row["rl_unified_representative_claim"], "five_hour")
+        finally:
+            proxy_server.shutdown()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

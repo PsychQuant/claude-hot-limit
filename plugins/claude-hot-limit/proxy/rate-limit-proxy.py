@@ -63,8 +63,10 @@ def resolve_state_file():
     return os.path.join(data_dir, "rate-state.jsonl")
 
 
-# 官方 rate-limit response header → 狀態檔欄位名。三組（requests/input-tokens/
-# output-tokens）都各自獨立擷取 remaining 與 reset，缺欄位一律記 null（寧記勿漏）。
+# 官方 rate-limit response header → 狀態檔欄位名。缺欄位一律記 null（寧記勿漏）。
+# 兩個家族並存（#12）：API-platform 家族（API-key 認證回傳）與 unified-* 訂閱配額家族
+# （Max/OAuth 回傳；5h/7d/7d_oi 三窗 utilization 0.0-1.0 + status + reset epoch）。
+# Max 訂閱下 API-platform 六欄恆 null 是預期行為，非缺陷。
 _RATE_LIMIT_HEADER_MAP = {
     "anthropic-ratelimit-requests-remaining": ("rl_requests_remaining", int),
     "anthropic-ratelimit-requests-reset": ("rl_requests_reset", str),
@@ -72,6 +74,21 @@ _RATE_LIMIT_HEADER_MAP = {
     "anthropic-ratelimit-input-tokens-reset": ("rl_input_tokens_reset", str),
     "anthropic-ratelimit-output-tokens-remaining": ("rl_output_tokens_remaining", int),
     "anthropic-ratelimit-output-tokens-reset": ("rl_output_tokens_reset", str),
+    "anthropic-ratelimit-unified-5h-utilization": ("rl_unified_5h_utilization", float),
+    "anthropic-ratelimit-unified-5h-status": ("rl_unified_5h_status", str),
+    "anthropic-ratelimit-unified-5h-reset": ("rl_unified_5h_reset", int),
+    "anthropic-ratelimit-unified-7d-utilization": ("rl_unified_7d_utilization", float),
+    "anthropic-ratelimit-unified-7d-status": ("rl_unified_7d_status", str),
+    "anthropic-ratelimit-unified-7d-reset": ("rl_unified_7d_reset", int),
+    "anthropic-ratelimit-unified-7d_oi-utilization": ("rl_unified_7d_oi_utilization", float),
+    "anthropic-ratelimit-unified-7d_oi-status": ("rl_unified_7d_oi_status", str),
+    "anthropic-ratelimit-unified-7d_oi-reset": ("rl_unified_7d_oi_reset", int),
+    "anthropic-ratelimit-unified-representative-claim": ("rl_unified_representative_claim", str),
+    "anthropic-ratelimit-unified-status": ("rl_unified_status", str),
+    "anthropic-ratelimit-unified-reset": ("rl_unified_reset", int),
+    "anthropic-ratelimit-unified-overage-status": ("rl_unified_overage_status", str),
+    "anthropic-ratelimit-unified-overage-disabled-reason": ("rl_unified_overage_disabled_reason", str),
+    "anthropic-ratelimit-unified-overage-fallback-percentage": ("rl_unified_overage_fallback_percentage", float),
 }
 
 
