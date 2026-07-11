@@ -1302,5 +1302,131 @@ class SessionFableNudgeTest(unittest.TestCase):
         self.assertNotIn(self.MARK, p.stdout)
 
 
+class UnifiedUtilizationHeatTest(unittest.TestCase):
+    """#25 — 官方 utilization leading indicator + null-blindness 修正。
+
+    #12（v1.15.0）後每筆 Max/OAuth record 帶 rl_unified_5h_utilization（帳號級 0-1）
+    + status + reset epoch。rate_state_heat 應優先消費官方水位；且全 null record
+    （Max 的 API-platform 六欄恆 null 的 pre-1.15 形狀）不得誤判「確認冷」壓制
+    429 fallback（既有 null-blindness bug）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.data = os.path.join(self.tmp.name, "ledger")
+        os.makedirs(self.data, exist_ok=True)
+        self.env = {
+            "CLAUDE_HOT_LIMIT_DATA": self.data,
+            "CLAUDE_HOT_LIMIT_MAX": "999",
+            "CLAUDE_HOT_LIMIT_MIN_GAP": "0",
+            "CLAUDE_HOT_LIMIT_WINDOW": "600",
+        }
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def fire(self, tool="Workflow", extra=None):
+        return run_hook(tool=tool, env_overrides=dict(self.env, **(extra or {})))
+
+    def seed_rate_state(self, age=5, **fields):
+        row = {
+            "ts": time.time() - age,
+            "rl_requests_remaining": None, "rl_requests_reset": None,
+            "rl_input_tokens_remaining": None, "rl_input_tokens_reset": None,
+            "rl_output_tokens_remaining": None, "rl_output_tokens_reset": None,
+            "usage": None,
+        }
+        row.update(fields)
+        with open(os.path.join(self.data, "rate-state.jsonl"), "a") as f:
+            f.write(json.dumps(row) + "\n")
+
+    def seed_hot_trip(self, age=5):
+        with open(os.path.join(self.data, "trips-raw.jsonl"), "a") as f:
+            f.write(json.dumps({"recorded_at": time.time() - age,
+                                "payload": {"error": "rate_limit"}}) + "\n")
+
+    def test_all_null_record_falls_back_to_trips_raw(self):
+        # null-blindness 修正鑑別：全 null record（pre-1.15 Max 形狀）+ 近期真撞牆
+        # → 必須出聲（現行 bug：全 null 誤回「確認冷」→ 429 fallback 被壓制 → 靜默）。
+        self.seed_rate_state(age=5)  # 全預設 null
+        self.seed_hot_trip(age=5)
+        _, parsed, raw = self.fire()
+        self.assertIsNotNone(parsed,
+                             "全 null 快照不是「確認冷」——應 fallback 到 trips-raw 出聲，stdout=%r" % raw)
+        self.assertIn("撞牆", parsed.get("systemMessage", ""),
+                      "fallback 訊息應是 429 啟發式那條，msg=%r" % parsed.get("systemMessage"))
+
+    def test_nudges_on_official_utilization_above_threshold(self):
+        self.seed_rate_state(age=5, rl_unified_5h_utilization=0.85,
+                             rl_unified_5h_status="allowed")
+        _, parsed, raw = self.fire()
+        self.assertIsNotNone(parsed, "水位 0.85 ≥ 預設門檻 0.80 應出聲，stdout=%r" % raw)
+        msg = parsed.get("systemMessage", "")
+        self.assertIn("5h 配額水位", msg, "應點名官方 5h 水位，msg=%r" % msg)
+        self.assertIn("85", msg, "應帶實際水位數字，msg=%r" % msg)
+
+    def test_allowed_warning_status_triggers_directly(self):
+        # server 直判優先於本地門檻：水位 0.5（< 0.8）但 status=allowed_warning → 熱
+        self.seed_rate_state(age=5, rl_unified_5h_utilization=0.5,
+                             rl_unified_5h_status="allowed_warning")
+        _, parsed, raw = self.fire()
+        self.assertIsNotNone(parsed, "allowed_warning 應直判熱（官方已標警告），stdout=%r" % raw)
+        self.assertIn("allowed_warning", parsed.get("systemMessage", ""),
+                      "應點名官方 warning 狀態，msg=%r" % parsed.get("systemMessage"))
+
+    def test_utilization_below_threshold_confirms_cold(self):
+        # 官方水位低 + status allowed → 真冷，取代 429 啟發式（沿既有「取代不疊加」語意）
+        self.seed_rate_state(age=5, rl_unified_5h_utilization=0.25,
+                             rl_unified_5h_status="allowed")
+        self.seed_hot_trip(age=5)
+        _, parsed, raw = self.fire()
+        self.assertEqual(raw, "", "官方水位 0.25 確認冷應安靜（即使 trips 有舊撞牆），stdout=%r" % raw)
+
+    def test_util_warn_file_flag_beats_env(self):
+        self.seed_rate_state(age=5, rl_unified_5h_utilization=0.5,
+                             rl_unified_5h_status="allowed")
+        # env 說 0.3（會觸發）、檔案說 0.9（不觸發）→ 檔案優先 → 靜默
+        with open(os.path.join(self.data, "util-warn"), "w") as f:
+            f.write("0.9")
+        _, parsed, raw = self.fire(extra={"CLAUDE_HOT_LIMIT_UTIL_WARN": "0.3"})
+        self.assertEqual(raw, "", "util-warn 檔案旗標應優先於 env，stdout=%r" % raw)
+        os.remove(os.path.join(self.data, "util-warn"))
+        _, parsed, raw = self.fire(extra={"CLAUDE_HOT_LIMIT_UTIL_WARN": "0.3"})
+        self.assertIsNotNone(parsed, "移除檔案後 env 0.3 生效（0.5 ≥ 0.3）應出聲，stdout=%r" % raw)
+
+    def test_replay_production_high_watermark_record(self):
+        # 2026-07-11 13:57 真實 production record 形狀原樣 replay（0.99 + allowed_warning）
+        self.seed_rate_state(
+            age=5, model="claude-opus-4-8", status=200,
+            rl_unified_5h_utilization=0.99, rl_unified_5h_status="allowed_warning",
+            rl_unified_5h_reset=int(time.time()) + 7980,
+            rl_unified_7d_utilization=0.19, rl_unified_7d_status="allowed",
+            rl_unified_7d_reset=int(time.time()) + 500000,
+            rl_unified_representative_claim="five_hour",
+            rl_unified_status="allowed_warning", rl_unified_reset=int(time.time()) + 7980,
+            rl_unified_overage_status="rejected",
+            rl_unified_overage_disabled_reason="org_level_disabled",
+            rl_unified_overage_fallback_percentage=0.5,
+            usage={"input_tokens": 4, "output_tokens": 128})
+        _, parsed, raw = self.fire()
+        self.assertIsNotNone(parsed, "production 0.99 record 應出聲，stdout=%r" % raw)
+        self.assertIn("99", parsed.get("systemMessage", ""),
+                      "應帶 99%% 水位，msg=%r" % parsed.get("systemMessage"))
+
+    def test_tail_read_reaches_last_record_in_large_file(self):
+        # 檔案 > tail 上限（256KB）：新讀取只掃檔尾——最後一筆熱 record 必須被讀到。
+        filler = {"ts": time.time() - 30, "model": "claude-opus-4-8",
+                  "rl_unified_5h_utilization": 0.1, "rl_unified_5h_status": "allowed"}
+        line = json.dumps(filler) + "\n"
+        n = (300 * 1024 // len(line)) + 1  # ~300KB
+        with open(os.path.join(self.data, "rate-state.jsonl"), "w") as f:
+            for _ in range(n):
+                f.write(line)
+        self.seed_rate_state(age=2, rl_unified_5h_utilization=0.95,
+                             rl_unified_5h_status="allowed")
+        _, parsed, raw = self.fire()
+        self.assertIsNotNone(parsed, "大檔下最後一筆 0.95 應被 tail-read 讀到並出聲，stdout=%r" % raw)
+        self.assertIn("95", parsed.get("systemMessage", ""))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

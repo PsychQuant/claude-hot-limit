@@ -418,43 +418,81 @@ def recent_heat(data_dir, window, now, model=None):
 _RATE_STATE_UNAVAILABLE = object()
 
 
-def _read_last_rate_state_record(data_dir, model=None):
-    """讀 rate-limit-proxy 落地的 rate-state.jsonl，回傳最後一筆「同桶」且能成功解析的 record（dict）。
+_RATE_STATE_TAIL_BYTES = 262_144  # #25/#17：rate-state.jsonl production 已 46.5MB+，hook 熱路徑只掃檔尾
 
-    找不到檔案 / 整份解析不出任何一行（壞掉的 JSON、檔案被刪一半等）→ None，呼叫端視為
-    「無可用真實資料」fail-open fallback 回既有 trips-raw.jsonl 啟發式。個別壞行（例如並發
-    寫入切到一半的最後一行）安靜跳過，不影響前面已解析成功的行。
+
+def _read_rate_state_tail(data_dir):
+    """bounded tail-read rate-state.jsonl → list[dict]（時間序，個別壞行安靜跳過）。
+
+    比照 `_TRANSCRIPT_TAIL_BYTES` 的 bounded-read 紀律：只讀檔尾 `_RATE_STATE_TAIL_BYTES`，
+    seek 落點切到的不完整首行直接丟棄（#25；順帶消掉 #17 的 hook-cost 面——先前
+    `_read_last_rate_state_record` 每次 Workflow launch 全檔掃描；rotation 本體仍歸 #17）。
+    檔案不存在 / 讀取異常 → 空 list（呼叫端 fail-open）。"""
+    path = os.path.join(data_dir, "rate-state.jsonl")
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            truncated = size > _RATE_STATE_TAIL_BYTES
+            if truncated:
+                f.seek(size - _RATE_STATE_TAIL_BYTES)
+            else:
+                f.seek(0)
+            data = f.read()
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return []
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    if truncated and lines:
+        lines = lines[1:]  # seek 落點幾乎必切在行中，首行不完整 → 丟棄
+    records = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            records.append(obj)
+    return records
+
+
+def _read_last_rate_state_record(data_dir, model=None):
+    """回傳檔尾窗內最後一筆「同桶」record（dict）；無 → None（呼叫端 fail-open fallback）。
 
     bucket 過濾（#4/D4）：只採「同一個家族桶」的記錄。無 model 欄 / null model 的記錄（proxy
     加 model 擷取前寫的舊列）視為 unscoped → 計入任何桶；當前 model 未知（None/"unknown"）→
-    不過濾（unscoped-unknown 語意同 recent_heat，nudge 寧可多提醒不漏）。
-    """
-    path = os.path.join(data_dir, "rate-state.jsonl")
+    不過濾（unscoped-unknown 語意同 recent_heat，nudge 寧可多提醒不漏）。"""
     cur_bucket = model_bucket(model)
     last = None
-    try:
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    continue
-                if not isinstance(obj, dict):
-                    continue
-                rec_bucket = model_bucket(obj.get("model"))
-                if (cur_bucket not in (None, "unknown")
-                        and rec_bucket not in (None, "unknown")
-                        and rec_bucket != cur_bucket):
-                    continue  # 跨桶記錄不採（例：opus 的快照不代表 sonnet-5 桶的熱度）
-                last = obj
-    except FileNotFoundError:
-        return None
-    except Exception:
-        return None
+    for obj in _read_rate_state_tail(data_dir):
+        rec_bucket = model_bucket(obj.get("model"))
+        if (cur_bucket not in (None, "unknown")
+                and rec_bucket not in (None, "unknown")
+                and rec_bucket != cur_bucket):
+            continue  # 跨桶記錄不採（例：opus 的快照不代表 sonnet-5 桶的熱度）
+        last = obj
     return last
+
+
+def _util_warn_threshold(data_dir):
+    """官方 5h utilization 警示門檻（0-1，預設 0.80；#25）。
+
+    帳號級單一值（unified 是 subscription 級非 model 桶級——與 per-bucket-settings.md
+    不衝突，那條 rule 管 per-model 設定）。解析鏈同 file_override 慣例：
+    <data_dir>/util-warn 檔 → env CLAUDE_HOT_LIMIT_UTIL_WARN → 0.80。
+    壞值（非數值 / 非有限 / 不在 (0, 1]）fail-open 回預設。"""
+    raw = file_override_str(data_dir, "util-warn", "CLAUDE_HOT_LIMIT_UTIL_WARN", "0.8")
+    try:
+        v = float(raw)
+        if 0 < v <= 1:
+            return v
+    except (TypeError, ValueError):
+        pass
+    return 0.8
 
 
 def rate_state_heat(data_dir, window, now, model=None):
@@ -484,6 +522,40 @@ def rate_state_heat(data_dir, window, now, model=None):
     if now - ts > window:
         return _RATE_STATE_UNAVAILABLE
 
+    informative = False  # 是否至少讀到一個非 null 的判斷欄位（#25 null-blindness 修正）
+
+    # --- 官方 unified 配額訊號優先（#25；#12 v1.15.0 起 Max/OAuth 每筆都帶）---
+    # utilization 是帳號級（subscription 整體，非 per-model 桶）→ 門檻單一值。
+    uni_status = record.get("rl_unified_5h_status")
+    uni_util = record.get("rl_unified_5h_utilization")
+    uni_reset = record.get("rl_unified_5h_reset")
+    reset_str = ""
+    try:
+        if uni_reset is not None:
+            reset_str = "，reset {t}".format(
+                t=time.strftime("%H:%M", time.localtime(float(uni_reset))))
+    except (TypeError, ValueError, OverflowError, OSError):
+        reset_str = ""
+    util_pct = None
+    if uni_util is not None:
+        try:
+            util_pct = float(uni_util) * 100.0
+        except (TypeError, ValueError):
+            util_pct = None
+    if uni_status is not None or util_pct is not None:
+        informative = True
+    if uni_status == "allowed_warning":
+        # server 直判優先於本地門檻——官方已標警告
+        return "官方 5h 配額狀態 allowed_warning{pct}{reset}".format(
+            pct="（水位 {p:g}%）".format(p=util_pct) if util_pct is not None else "",
+            reset=reset_str)
+    if util_pct is not None:
+        thr = _util_warn_threshold(data_dir) * 100.0
+        if util_pct >= thr:
+            return "官方 5h 配額水位 {p:g}%（門檻 {t:g}%{reset}）".format(
+                p=util_pct, t=thr, reset=reset_str)
+
+    # --- API-platform 家族（API-key 認證才有值；Max 下恆 null 屬預期）---
     min_requests = env_int("CLAUDE_HOT_LIMIT_RATE_STATE_MIN_REQUESTS", 10)
     min_tokens = env_int("CLAUDE_HOT_LIMIT_RATE_STATE_MIN_TOKENS", 2000)
     checks = (
@@ -499,9 +571,15 @@ def rate_state_heat(data_dir, window, now, model=None):
             val = float(val)
         except (TypeError, ValueError):
             continue
+        informative = True
         if val < threshold:
             return "{label}={val:g}（門檻 {threshold:g}）".format(
                 label=label, val=val, threshold=threshold)
+
+    if not informative:
+        # null-blindness 修正（#25）：全部判斷欄位皆 null（如 pre-1.15 的 Max record 形狀）
+        # ≠「確認冷」——回 UNAVAILABLE 讓呼叫端 fallback 回 429 啟發式，不得靜默壓制。
+        return _RATE_STATE_UNAVAILABLE
 
     return None
 
