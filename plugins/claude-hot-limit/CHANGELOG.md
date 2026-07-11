@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.17.0
+
+- **feat（官方 utilization leading indicator，#25）**：heat-nudge 新主力訊號——`rate_state_heat()` 優先消費 `rl_unified_5h_status`（`allowed_warning` **直判熱**，server 判斷優先於本地門檻）與 `rl_unified_5h_utilization`（≥ `UTIL_WARN` 預設 **0.80** → 熱；帳號級單一門檻——unified 是 subscription 級非 model 桶級，與 per-bucket-settings.md 不衝突）。訊息帶水位 % + reset 時刻。門檻可調：env `CLAUDE_HOT_LIMIT_UTIL_WARN` + 檔 `<data_dir>/util-warn`（每次 hook 重讀、即時生效；壞值 fail-open 回 0.8）。
+- **fix（null-blindness——Max 環境 heat-nudge 一直被靜默壓制）**：`rate_state_heat()` 在全部判斷欄位 null 時（Max 的 API-platform 六欄恆 null，pre-1.15 record 形狀）誤回「確認冷」→ caller 跳過 429 fallback。修正：無任何 informative 欄位 → `_RATE_STATE_UNAVAILABLE`（429 啟發式復活）。
+- **perf（rate-state tail-read；Refs #17 hook-cost 面）**：`_read_last_rate_state_record` 原每次 Workflow launch **全檔掃描**（production 已 46.5MB+）→ 新 `_read_rate_state_tail()` 只讀檔尾 256KB（丟不完整首行），比照 `_TRANSCRIPT_TAIL_BYTES` bounded-read 紀律。rotation 本體仍歸 #17。
+- **誠實負面校準結果（velocity 訊號降 residue）**：原計畫的 request-velocity burst 訊號被 production 資料推翻——07-10 兩次真實首 429 的前 300s 同桶請求數僅 **14**（fable）/ **155**（opus），遠低於平常忙碌期 p95（677/640）：當晚 429 是 quota 級（官方水位直接量測的東西）而非速率效應。門檻設高漏報、設低誤報 → 不實作；等未來出現「utilization 低但仍 429」的真 burst-only 樣本再議（user 核定砍除）。
+- **test（+7，pacing 122 綠、全套件 206 綠）**：`UnifiedUtilizationHeatTest` 釘住 null-blindness 修正鑑別（全 null + 熱 trip → 出聲）/ `allowed_warning` 直判 / 0.85 門檻觸發 / 0.25 確認冷（取代啟發式）/ util-warn 檔勝 env / production 0.99 record 原樣 replay / 大檔 tail-read 讀到最後一筆。
+
 ## 1.16.0
 
 - **fix（共用 daemon 重啟殺死並發 in-flight streams，#27）**：2026-07-10 三次硬重啟（v1.14.0 部署）瞬殺 daemon，切斷所有並發 session 的 streaming 回應（`Connection closed mid-response`）且該時段 record 全蒸發。機制：`ThreadingMixIn` + `daemon_threads=True`——main thread 退出瞬間 handler threads 全死、finally 不跑（SIGTERM 預設 handler 直接終止 process）。
