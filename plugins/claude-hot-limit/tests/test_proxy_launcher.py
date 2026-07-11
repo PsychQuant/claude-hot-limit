@@ -60,6 +60,10 @@ class ProxyLauncherTest(unittest.TestCase):
         self.env = {
             "CLAUDE_HOT_LIMIT_DATA": self.data,
             "RATE_LIMIT_PROXY_PORT": str(self.port),
+            # #27 verify F8：pin 低 DRAIN_CAP，避免 stop 內部窗（預設 125s）>
+            # run_launcher 的 subprocess timeout（20s）——回歸時的失敗模式才會是
+            # launcher 自己的有界 escalation，而非 TimeoutExpired + 孤兒 daemon。
+            "RATE_LIMIT_PROXY_DRAIN_CAP": "2",
         }
 
     def tearDown(self):
@@ -218,6 +222,10 @@ class GracefulStopTest(unittest.TestCase):
         self.env = {
             "CLAUDE_HOT_LIMIT_DATA": self.data,
             "RATE_LIMIT_PROXY_PORT": str(self.port),
+            # #27 verify F8：pin 低 DRAIN_CAP，避免 stop 內部窗（預設 125s）>
+            # run_launcher 的 subprocess timeout（20s）——回歸時的失敗模式才會是
+            # launcher 自己的有界 escalation，而非 TimeoutExpired + 孤兒 daemon。
+            "RATE_LIMIT_PROXY_DRAIN_CAP": "2",
         }
         self.fake = None
 
@@ -245,11 +253,20 @@ class GracefulStopTest(unittest.TestCase):
 
     def test_stop_waits_until_daemon_actually_dead(self):
         fake = self._spawn_fake(FAKE_SLOW_EXIT)  # SIGTERM 後 ~2s 才退（模擬 drain 中）
+        t0 = time.time()
         code, out, err = run_launcher("stop", dict(self.env, RATE_LIMIT_PROXY_DRAIN_CAP="4"))
+        elapsed = time.time() - t0
         self.assertEqual(code, 0)
         self.assertIsNotNone(fake.poll(),
                              "stop 返回時 daemon 必須已死（現行 2s port-only 等待會提早返回）")
         self.assertIsNone(self.read_pid(), "pidfile 應在確認死亡後清除")
+        # #27 verify F3：fake 是本測試 process 的 child，退出後成 zombie——
+        # 壞掉的 _pid_alive（kill(pid,0) 對 zombie 成功）會等滿 4+5s 窗 + 假 SIGKILL。
+        # 及時偵測死亡 = elapsed 貼近 fake 的 ~2s 實際退出時間。
+        self.assertLess(elapsed, 6,
+                        "死亡偵測應及時（殭屍盲點會等滿 9s 窗），實測 %.1fs" % elapsed)
+        self.assertNotIn("SIGKILL", out + err,
+                         "乾淨退出不該觸發 SIGKILL fallback（假警告 = 殭屍誤判）")
 
     def test_stop_escalates_sigkill_on_stuck_daemon(self):
         fake = self._spawn_fake(FAKE_IGNORE_SIGTERM)  # SIGTERM 無效 → 必須 SIGKILL fallback

@@ -397,24 +397,25 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 record["truncated"] = True
             write_state_record(self._state_file(), record)
 
-    # --- in-flight 計數（#27 graceful drain 用）---
-    # BaseRequestHandler 保證 finish() 走 finally → 計數必配對遞減。
-    # in-process 測試用的 plain HTTPServer 沒有這兩個屬性 → getattr 容忍（零行為差）。
-    def setup(self):
-        super().setup()
-        lock = getattr(self.server, "inflight_lock", None)
-        if lock is not None:
-            with lock:
-                self.server.inflight += 1
+    # --- in-flight 計數（#27 graceful drain 用；verify F1 修正版）---
+    # 計數必須是「per-request」（包住 _handle_inner）而非連線級（setup→finish）：
+    # HTTP/1.1 keep-alive 下 finish() 要等 client 關連線才跑，idle persistent 連線
+    # 會被誤計為 in-flight → 每次 drain 都燒滿 cap。per-request 計數讓 idle 連線
+    # 不擋 drain；process 退出時 idle 連線收到 RST，標準 HTTP client 會自動重連重試。
+    # in-process 測試用的 plain HTTPServer 沒有 inflight 屬性 → getattr 容忍（零行為差）。
+    _handle_inner = _handle
 
-    def finish(self):
+    def _handle(self):
+        lock = getattr(self.server, "inflight_lock", None)
+        if lock is None:
+            return self._handle_inner()
+        with lock:
+            self.server.inflight += 1
         try:
-            super().finish()
+            return self._handle_inner()
         finally:
-            lock = getattr(self.server, "inflight_lock", None)
-            if lock is not None:
-                with lock:
-                    self.server.inflight -= 1
+            with lock:
+                self.server.inflight -= 1
 
     do_GET = _handle
     do_POST = _handle
@@ -430,10 +431,11 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def resolve_drain_cap():
-    """graceful drain 等待上限（秒）。壞值 fail-open 回預設 120。"""
+    """graceful drain 等待上限（秒）。壞值（含 inf/nan/負值，#27 verify F7）fail-open 回預設 120。"""
     try:
         v = float(os.environ.get("RATE_LIMIT_PROXY_DRAIN_CAP", "120"))
-        return v if v >= 0 else 120.0
+        # nan 的比較恆 False、inf 不滿足上界 → 兩者都落回預設（「有界」是硬承諾）
+        return v if (0 <= v < float("inf")) else 120.0
     except (ValueError, TypeError):
         return 120.0
 
@@ -443,11 +445,20 @@ def main():
     server = ThreadingHTTPServer(("127.0.0.1", port), ProxyHandler)
     server.inflight = 0
     server.inflight_lock = threading.Lock()
+    drain_started = threading.Event()
 
     def _request_drain(signum, frame):
         # shutdown() 會等 serve_forever 迴圈退出——在 signal handler（main thread）
         # 直呼必死鎖（serve_forever 被 handler 暫停、無法前進）→ 丟到別的 thread。
-        threading.Thread(target=server.shutdown, daemon=True).start()
+        # once-guard（#27 verify F10）：signal 連發不重複 spawn thread；
+        # try/except：Thread.start 的 RuntimeError 不得炸穿 serve_forever（會跳過 drain）。
+        if drain_started.is_set():
+            return
+        drain_started.set()
+        try:
+            threading.Thread(target=server.shutdown, daemon=True).start()
+        except Exception:
+            drain_started.clear()  # 極端失敗（thread 資源耗盡）：允許下一發 signal 重試
 
     signal.signal(signal.SIGTERM, _request_drain)
     signal.signal(signal.SIGINT, _request_drain)
@@ -461,20 +472,25 @@ def main():
 
     # --- graceful drain（#27）---
     # 順序：先關 listening socket（新連線立即 refused，消除「backlog 掛住」），
-    # 再有界等待 in-flight handler threads 走完（records 經既有 per-request finally
-    # 自然落地）。超時 → 直接返回（exit 0），殘留 daemon threads 隨 process 終結。
+    # 短暫 grace（verify F2：已 accept、handler thread 尚未執行到計數的 scheduling
+    # latency 窗——grace 讓它們先完成 +1），再有界等待 in-flight 請求走完（records
+    # 經既有 per-request finally 自然落地）。超時 → 直接返回（exit 0），殘留 daemon
+    # threads 隨 process 終結。deadline 用 monotonic（verify F11：牆鐘跳動免疫）。
     try:
         server.server_close()
     except Exception:
         pass
-    deadline = time.time() + resolve_drain_cap()
-    while time.time() < deadline:
+    time.sleep(0.5)
+    deadline = time.monotonic() + resolve_drain_cap()
+    while time.monotonic() < deadline:
         with server.inflight_lock:
             remaining = server.inflight
         if remaining <= 0:
             break
         time.sleep(0.2)
-    print("[rate-limit-proxy] drained (inflight=%d), exiting" % server.inflight, file=sys.stderr)
+    with server.inflight_lock:
+        remaining = server.inflight
+    print("[rate-limit-proxy] drained (inflight=%d), exiting" % remaining, file=sys.stderr)
 
 
 if __name__ == "__main__":

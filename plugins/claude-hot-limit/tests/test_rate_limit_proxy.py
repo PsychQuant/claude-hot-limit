@@ -1235,7 +1235,7 @@ class GracefulDrainTest(unittest.TestCase):
         t.start()
         time.sleep(1.0)
         self.proc.send_signal(signal.SIGTERM)
-        time.sleep(0.7)  # 給 listening socket 關閉時間
+        time.sleep(1.0)  # 給 listening socket 關閉時間（CI 負載邊際，#27 verify F13）
         with self.assertRaises((urllib.error.URLError, OSError),
                                msg="drain 期間新連線應被拒"):
             req = urllib.request.Request("http://127.0.0.1:%d/v1/messages" % port,
@@ -1244,6 +1244,60 @@ class GracefulDrainTest(unittest.TestCase):
         t.join(timeout=15)
         self.assertTrue(out.get("ok"), "既有 in-flight 仍應完整走完，got %r" % out.get("err"))
         self.assertEqual(self.proc.wait(timeout=15), 0)
+
+    def test_idle_keepalive_connection_does_not_block_drain(self):
+        # #27 verify F1（HIGH）：計數若蓋整條 keep-alive 連線（setup→finish），
+        # idle persistent 連線會讓每次 restart 燒滿 DRAIN_CAP。
+        # 契約：只有「活躍請求」擋 drain；idle keep-alive 不擋。
+        MockUpstreamHandler.response_status = 200
+        MockUpstreamHandler.response_headers = {"Content-Type": "application/json"}
+        MockUpstreamHandler.response_body = b'{"ok": true}'
+        MockUpstreamHandler.sse_chunks = None
+
+        port = self._spawn_proxy(drain_cap="10")
+        body = b'{"model": "claude-sonnet-5"}'
+        s = socket.create_connection(("127.0.0.1", port), timeout=10)
+        try:
+            s.sendall(b"POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                      b"Content-Type: application/json\r\n"
+                      b"Content-Length: %d\r\n\r\n%s" % (len(body), body))
+            # 讀完整回應（headers + body），連線保持開啟（idle keep-alive）
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                buf += s.recv(4096)
+            head, rest = buf.split(b"\r\n\r\n", 1)
+            clen = int([l for l in head.split(b"\r\n")
+                        if l.lower().startswith(b"content-length:")][0].split(b":")[1])
+            while len(rest) < clen:
+                rest += s.recv(4096)
+            self.assertIn(b"ok", rest)
+
+            time.sleep(0.3)  # 請求已完成、連線 idle
+            t0 = time.time()
+            self.proc.send_signal(signal.SIGTERM)
+            rc = self.proc.wait(timeout=6)
+            elapsed = time.time() - t0
+            self.assertEqual(rc, 0)
+            self.assertLess(elapsed, 4,
+                            "idle keep-alive 不得擋 drain（cap=10 全燒 = F1 未修），實測 %.1fs" % elapsed)
+        finally:
+            s.close()
+
+    def test_drain_cap_rejects_non_finite(self):
+        # #27 verify F7：DRAIN_CAP=inf 讓「有界」變無界。unit 級直測 resolve_drain_cap。
+        rlp = _load_proxy_module()
+        for bad in ("inf", "Infinity", "-1", "nan", "garbage", ""):
+            os.environ["RATE_LIMIT_PROXY_DRAIN_CAP"] = bad
+            try:
+                self.assertEqual(rlp.resolve_drain_cap(), 120.0,
+                                 "壞值 %r 應回預設 120" % bad)
+            finally:
+                del os.environ["RATE_LIMIT_PROXY_DRAIN_CAP"]
+        os.environ["RATE_LIMIT_PROXY_DRAIN_CAP"] = "7.5"
+        try:
+            self.assertEqual(rlp.resolve_drain_cap(), 7.5)
+        finally:
+            del os.environ["RATE_LIMIT_PROXY_DRAIN_CAP"]
 
     def test_drain_cap_bounds_shutdown(self):
         MockUpstreamHandler.response_status = 200

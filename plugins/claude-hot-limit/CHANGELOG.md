@@ -7,7 +7,17 @@
 - **launcher stop/restart 語意**：`stop` 預設轉 graceful（SIGTERM → 等 pid 真死 + port 釋放，窗 = DRAIN_CAP+5s、每 2s 印進度 → 超時 SIGKILL fallback + 警告）；pidfile 改**確認死亡後**才清（先刪會讓中途失敗留無主 daemon）；`stop --force` 立即 SIGKILL 逃生；新增 `restart`（graceful stop → ensure，最小化 dead-port 窗口）。
 - **重啟紀律（docs）**：CLAUDE.md 新增 CRITICAL 段——部署一律 `restart`；重啟前查 rate-state.jsonl 近期活動；`--force` 接受切斷並發的代價。
 - **誠實邊界**：graceful drain 只消除「重啟殺 streams」（L1）與「SIGTERM record 蒸發」（L3）；**upstream 中途斷流（L2）不在本修範圍**——實測 daemon 穩定期間仍有 status=200-usage-null streaming records（與桶熱相關），證據已記 #14。
-- **test（+7，proxy 38 綠、launcher 15 綠、全套件 195 綠）**：`GracefulDrainTest`（subprocess 級：SIGTERM 中 in-flight stream 完整走完 + record 落地 + exit 0 / drain 期間拒新連線 / cap 超時有界退出）+ `GracefulStopTest`（stop 等到真死 / SIGKILL fallback / `--force` / `restart` 換新 pid）。RED 階段精準複現事故形狀（`IncompleteRead` + exit -15）。
+- **verify 輪硬化（6-AI：5×sonnet + Codex xhigh，aggregate FAIL → 全修 findings）**：
+  - **F1 HIGH（keep-alive 計數，DA 評整輪最重要）**：計數從連線級（`setup()`→`finish()`）改 **per-request**（包住 `_handle`）——HTTP/1.1 idle persistent 連線不再被誤計為 in-flight，restart 不再於一般流量下燒滿 cap；process 退出時 idle 連線收 RST、標準 client 自動重連。
+  - **F2 HIGH（accept→thread-start 競態）**：`server_close()` 後加 0.5s grace 再首查計數，覆蓋剛 accept 請求的 scheduling latency 窗（殘餘窗誠實記錄於註解）。
+  - **F3 HIGH（殭屍盲點，實測 12.1s→~2s）**：`_pid_alive` 加 ps stat Z 偵測——`os.kill(pid,0)` 對 zombie 成功導致等滿窗 + 假 SIGKILL；測試補 elapsed + no-false-SIGKILL 斷言（原測試「通過的理由是錯的」）。
+  - **F4/F5（kill 紀律，四 reviewer 收斂）**：SIGKILL 前重查 process 身分（`_still_ours`，防長窗 PID reuse 誤殺）；pidfile **確認死亡才刪**、否則保留 + exit 1（`restart` 的 rc gate 因此從死碼變活）。
+  - **F6（兩階段 restart）**：port 一釋放（daemon `server_close` 幾乎立即）就 spawn 新 daemon，舊 process 於背景等 drain——dead-port 窗從「整段 drain」縮到 <1s。
+  - **F7（`DRAIN_CAP=inf`）**：兩端 cap 解析改 `0 <= v < inf`——「有界」是硬承諾。
+  - **F9/F10/F11**：pid 死但 port 被外部佔用 → 警告；signal 連發 once-guard（DA 實測 2 萬發 SIGTERM 無害後降級，仍補）；deadline 全面改 `time.monotonic()`。
+  - **F8/F13（測試韌性）**：launcher 測試 env pin `DRAIN_CAP=2`（避免內部窗 125s > subprocess timeout 20s 的邊際反轉）；refuse 測試邊際 0.7→1.0s。
+  - **SIGINT 前景 UX 變更（明示）**：Ctrl-C 現在走 graceful drain——前景 debug 且有 in-flight 時最多等 cap 才退（背景 daemon 模式不受影響；`stop --force` 為逃生）。
+- **test（+9，proxy 40 綠、launcher 15 綠、全套件 197 綠）**：`GracefulDrainTest`（SIGTERM 中 in-flight 完整走完 + record 落地 + exit 0 / 拒新連線 / cap 有界 / **idle keep-alive 不擋 drain** / **cap 拒 inf**）+ `GracefulStopTest`（等到真死**且及時** / SIGKILL fallback / `--force` / `restart` 換新 pid）。RED 階段精準複現事故形狀（`IncompleteRead` + exit -15；殭屍 12.1s）。
 
 ## 1.15.0
 
