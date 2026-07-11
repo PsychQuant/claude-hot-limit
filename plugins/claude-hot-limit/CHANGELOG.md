@@ -5,8 +5,9 @@
 - **fix（rate-limit header 擷取家族錯誤，#12；0/1134 → 可修 capture bug 定案）**：Max/OAuth 訂閱回應**一直都有** rate-limit header——是 `anthropic-ratelimit-unified-*` 訂閱配額家族（2026-07-10 `RATE_LIMIT_PROXY_DEBUG_HEADERS` dump 15/15 實證），而 `_RATE_LIMIT_HEADER_MAP` 只認 API-platform 家族 6 個名字（`-requests-remaining` / `-input-tokens-*` / `-output-tokens-*`）→ production 0/1134 全 null。**排除舊假設**：`extract_rate_limit_fields` 兩個呼叫點（streaming 主路徑 + HTTPError 路徑）都有接線，缺口在名單不在路徑。
 - **修復**：`_RATE_LIMIT_HEADER_MAP` 增補 unified-* 家族 **15 entries** → 平面 `rl_unified_*` 欄位（3 窗 `5h`/`7d`/`7d_oi` × utilization(float)/status(str)/reset(int epoch)，+ `representative_claim`、頂層 `status`/`reset`、`overage_status`/`overage_disabled_reason`/`overage_fallback_percentage`）。零新函式（`extract_rate_limit_fields` 純資料驅動）；既有 6 欄保留（API-key 使用者仍命中舊家族；Max 下舊 6 欄恆 null 是預期非缺陷）。
 - **連鎖解鎖**：#7 predictive 排程復活（utilization + reset = 真實 budget 訊號）；#25 burn-rate 可疊官方 utilization 斜率。
-- **部署後驗證契約**：daemon 重啟（延後與 #27 修復合併一次）後，新 production records 的 `rl_unified_5h_utilization` 應非 null（同 #26 覆蓋率驗證法）。
-- **test（+5，proxy 32 綠、全套件 147 綠）**：`UnifiedHeaderFamilyTest` 釘住全家族擷取 / 缺 header→15 欄全 null（寧記勿漏）/ 壞值→該欄 null 他欄不擾 / 兩家族並存 / streaming 主路徑接線。
+- **部署後驗證契約（verify 輪加寬，F1/F4）**：daemon 重啟（延後與 #27 修復合併一次）後，新 production records 須**三類欄各查一**皆非 null——`rl_unified_5h_utilization`（float 類）、`rl_unified_5h_reset`（epoch 類，**格式假設的裁決點**：dump 表格該欄是佔位詞「epoch」非實測值，若實為 RFC3339 此欄會 null）、`rl_unified_representative_claim`（str 類）。只查 1/15 欄會讓 14 欄的名稱/格式轉錄錯誤永久靜默（6-AI verify DA finding）。
+- **verify 輪硬化（6-AI：5×sonnet + Codex xhigh，aggregate PASS 後修 findings）**：`_finite_float`（nan/inf → null，防 json.dumps 寫出非標準 NaN/Infinity token 毒害 strict 消費端；Codex+logic F6）+ `_epoch_int`（容忍小數/科學記號 epoch；真正非數值如 RFC3339 仍誠實 null；DA F4）；429/HTTPError 分支補回歸 pin（撞牆場景正是 unified 家族的存在理由；logic F3）。CHANGELOG 初版「全套件 147 綠」為漏算勘誤（真實全套件 5 檔 185）。rate-state.jsonl 成長實測（46.5MB/166k 行/9 天）已帶回 #17 重評。
+- **test（+8，proxy 35 綠、全套件 188 綠）**：`UnifiedHeaderFamilyTest` 釘住全家族擷取（15 欄全斷言）/ 缺 header→15 欄全 null（寧記勿漏）/ 壞值→該欄 null 他欄不擾 / 兩家族並存 / streaming 主路徑接線 / 429 HTTPError 分支 / nan+inf→null / 小數 epoch 容忍+RFC3339→null。
 
 ## 1.14.0
 

@@ -975,7 +975,10 @@ class UnifiedHeaderFamilyTest(unittest.TestCase):
             self.assertEqual(row["rl_unified_5h_status"], "allowed")
             self.assertEqual(row["rl_unified_5h_reset"], 1752192000)
             self.assertEqual(row["rl_unified_7d_utilization"], 0.21)
+            self.assertEqual(row["rl_unified_7d_status"], "allowed")
+            self.assertEqual(row["rl_unified_7d_reset"], 1752600000)
             self.assertEqual(row["rl_unified_7d_oi_utilization"], 0.29)
+            self.assertEqual(row["rl_unified_7d_oi_status"], "allowed")
             self.assertEqual(row["rl_unified_7d_oi_reset"], 1752600000)
             self.assertEqual(row["rl_unified_representative_claim"], "five_hour")
             self.assertEqual(row["rl_unified_status"], "allowed")
@@ -1040,6 +1043,77 @@ class UnifiedHeaderFamilyTest(unittest.TestCase):
             self.assertEqual(row["rl_requests_remaining"], 42, "API-platform 家族回歸")
             self.assertEqual(row["rl_requests_reset"], "2026-07-01T05:00:00Z")
             self.assertEqual(row["rl_unified_5h_utilization"], 0.2, "unified 家族並存")
+        finally:
+            proxy_server.shutdown()
+
+    def test_unified_captured_on_429_httperror_branch(self):
+        # #12 verify F3：撞牆（429，HTTPError 分支）正是 unified 家族最要緊的場景——
+        # 回歸 pin：該分支的 record 必須帶 unified 欄位（今日靠 code-sharing 正確，
+        # 未來 special-case 該分支時此測試防靜默回歸）。
+        MockUpstreamHandler.response_status = 429
+        MockUpstreamHandler.response_headers = dict(
+            {"Content-Type": "application/json"}, **_UNIFIED_HEADERS_FULL)
+        MockUpstreamHandler.response_body = b'{"error": {"type": "rate_limit_error"}}'
+        MockUpstreamHandler.sse_chunks = None
+
+        proxy_server, proxy_url, _ = start_proxy(self.mock_url, self.state_file)
+        try:
+            req = urllib.request.Request(proxy_url + "/v1/messages",
+                                         data=b'{"model":"x"}', method="POST")
+            try:
+                urllib.request.urlopen(req)
+                self.fail("預期 429 會 raise HTTPError")
+            except urllib.error.HTTPError as e:
+                self.assertEqual(e.code, 429)
+            time.sleep(0.1)
+            row = read_jsonl(self.state_file)[0]
+            self.assertEqual(row.get("status"), 429)
+            self.assertEqual(row["rl_unified_5h_utilization"], 0.2,
+                             "429 分支也要擷取 unified 家族")
+            self.assertEqual(row["rl_unified_5h_reset"], 1752192000)
+        finally:
+            proxy_server.shutdown()
+
+    def test_unified_nonfinite_float_recorded_as_null(self):
+        # #12 verify F6（Codex+logic）：float() 接受 nan/inf → JSONL 出現非標準 token。
+        # 契約：非有限值視為壞值 → null；他欄不受影響。
+        headers = dict(_UNIFIED_HEADERS_FULL)
+        headers["anthropic-ratelimit-unified-5h-utilization"] = "nan"
+        headers["anthropic-ratelimit-unified-overage-fallback-percentage"] = "inf"
+        MockUpstreamHandler.response_status = 200
+        MockUpstreamHandler.response_headers = dict(
+            {"Content-Type": "application/json"}, **headers)
+        MockUpstreamHandler.response_body = b'{"ok": true}'
+        MockUpstreamHandler.sse_chunks = None
+
+        proxy_server, proxy_url, _ = start_proxy(self.mock_url, self.state_file)
+        try:
+            self._post(proxy_url)
+            row = read_jsonl(self.state_file)[0]
+            self.assertIsNone(row["rl_unified_5h_utilization"], "nan → null")
+            self.assertIsNone(row["rl_unified_overage_fallback_percentage"], "inf → null")
+            self.assertEqual(row["rl_unified_7d_utilization"], 0.21)
+        finally:
+            proxy_server.shutdown()
+
+    def test_unified_decimal_epoch_tolerated(self):
+        # #12 verify F4（DA）：reset 的 epoch 格式是未驗證假設——容忍小數/科學記號
+        # （int(float(x))），RFC3339 等真正非數值仍 → null（由加寬的部署驗證契約偵測）。
+        headers = dict(_UNIFIED_HEADERS_FULL)
+        headers["anthropic-ratelimit-unified-5h-reset"] = "1752192000.5"
+        headers["anthropic-ratelimit-unified-reset"] = "2026-07-01T05:00:00Z"
+        MockUpstreamHandler.response_status = 200
+        MockUpstreamHandler.response_headers = dict(
+            {"Content-Type": "application/json"}, **headers)
+        MockUpstreamHandler.response_body = b'{"ok": true}'
+        MockUpstreamHandler.sse_chunks = None
+
+        proxy_server, proxy_url, _ = start_proxy(self.mock_url, self.state_file)
+        try:
+            self._post(proxy_url)
+            row = read_jsonl(self.state_file)[0]
+            self.assertEqual(row["rl_unified_5h_reset"], 1752192000, "小數 epoch → 截斷成 int")
+            self.assertIsNone(row["rl_unified_reset"], "RFC3339 非數值 → null（誠實缺值）")
         finally:
             proxy_server.shutdown()
 
