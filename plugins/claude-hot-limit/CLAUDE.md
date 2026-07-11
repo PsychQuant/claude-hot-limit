@@ -104,7 +104,7 @@ proxy 是**選配、opt-in**：部署拆成兩個時序不同的關注點——
    port 已 UP 就 no-op；`fcntl.flock` + 鎖內二次探測防並發 session race；**多 session 共用單一
    daemon**（帳號級，port 8787 一個實例）。daemon detached（session 結束續活）、log 在
    `<data>/proxy.log`、pidfile `<data>/proxy.pid`；手動管理：`proxy-launcher.py stop [--force]|restart|status`（#27：`stop` 預設 graceful——SIGTERM 後等 daemon drain in-flight streams（`RATE_LIMIT_PROXY_DRAIN_CAP` 預設 120s）+ 超時 SIGKILL fallback；`--force` 立即 kill；`restart` = graceful stop → ensure）。
-   **檔案 rotation（#17）**：`rate-state.jsonl` > `RATE_LIMIT_PROXY_ROTATE_MB`（float MB，預設 64；≤0 停用）→ daemon 在 flock 臨界區內 rename 成 `rate-state-<ts>.jsonl` **archive 全保留**（校準語料——#23/#25 分析資料集；prune 手動）；`proxy.log` > `RATE_LIMIT_PROXY_LOG_ROTATE_MB`（預設 32）→ ensure 於 spawn 前輪替成 `proxy.log.1`（只留一代）。消費端天然容忍：rotation 後 live 檔短暫資料稀薄 → `rate_state_heat()` 最壞回 UNAVAILABLE → 429 fallback（既有 fail-open 語意）。
+   **檔案 rotation（#17）**：`rate-state.jsonl` > `RATE_LIMIT_PROXY_ROTATE_MB`（float MiB，預設 64；≤0 停用）→ daemon 在 flock 臨界區內 rename 成 `rate-state-<ts>.jsonl` **archive 全保留**（校準語料——#23/#25 分析資料集；prune 手動）；`proxy.log` > `RATE_LIMIT_PROXY_LOG_ROTATE_MB`（float MiB，預設 32）→ ensure 於 spawn 前輪替成 `proxy.log.1`（只留一代）。消費端天然容忍：rotation 後 live 檔短暫資料稀薄 → `rate_state_heat()` 最壞回 UNAVAILABLE → 429 fallback（既有 fail-open 語意）。
 
 **⚠️ dead-port 風險（部署層頭號風險）**：`ANTHROPIC_BASE_URL` 指向沒起來的 proxy = **所有
 API 流量無法送出**。proxy 內部的 fail-open 救不了「proxy 根本沒在跑」。緩解：**fail-loud 覆蓋

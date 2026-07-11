@@ -18,7 +18,7 @@ HTTP response header，也管不到主迴圈自己的一般對話輪。要拿到
   - fail-open：狀態檔寫入失敗、upstream 錯誤，都不影響轉發給 client 的真實回應。
   - 真實上游位址由本檔自己的環境變數讀取（RATE_LIMIT_PROXY_UPSTREAM），不能沿用
     Claude Code 的 ANTHROPIC_BASE_URL——那個值屆時會指向這個 proxy 自己。
-  - 狀態檔 size-based rotation（#17）：live 檔 > RATE_LIMIT_PROXY_ROTATE_MB（float MB，
+  - 狀態檔 size-based rotation（#17）：live 檔 > RATE_LIMIT_PROXY_ROTATE_MB（float MiB=1024²，
     預設 64；≤0 停用）→ flock 臨界區內 rename 成 rate-state-<ts>.jsonl archive。
     archive 全保留（校準語料，手動清理）；rotation 失敗 fail-open 照常寫入。
 """
@@ -242,7 +242,7 @@ def accumulate_usage_from_sse_event(event_bytes, usage_acc):
 def resolve_rotate_cap_bytes():
     """rate-state.jsonl 的 rotation 門檻（bytes）；None = 停用（#17）。
 
-    `RATE_LIMIT_PROXY_ROTATE_MB` 收 float MB（測試可設 0.0001 級微 cap），預設 64
+    `RATE_LIMIT_PROXY_ROTATE_MB` 收 float MiB（1024² bytes；測試可設 0.0001 級微 cap），預設 64
     （現行 ~15MB/day 約 4 天一轉）。壞值紀律比照 resolve_drain_cap：非有限 / parse
     失敗 → 預設；≤0 → 停用（「就是要無限累積」的 escape hatch）。
     """
