@@ -8,5 +8,7 @@ __pycache__/
 .spectra/
 openspec/.vector-search.db*
 
-# IDD tree-lock (idd-tree-lock.sh #183) — per-machine session state, not tracked
-.claude/.idd/tree-lock
+# IDD per-machine working state (#28; supersedes narrower tree-lock entry from #183)
+.claude/.idd/
+# wiki-sync marker (session-local, #28)
+.wiki-last-sync
