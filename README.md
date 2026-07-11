@@ -11,7 +11,7 @@ Anthropic 的 **acceleration-limit / short-burst 節流**（429，以及 529
 |------|------|------|
 | **pacing-guard** | PreToolUse hook | 執行期守住 `Workflow`/`Agent` 啟動節奏：**硬擋**（burst 超量、Fable 5 開 Workflow）、**軟延遲**（間隔太近自動 sleep）、**只提醒**（寬 fan-out 建議 pin 便宜 model、bucket 燙時提醒收斂）|
 | **trip-recorder** | StopFailure hook | 撞牆（429/529）自動記錄，供校準上限 |
-| **rate-limit-proxy** | 選配 daemon | 本地 reverse proxy，擷取真實 rate-limit header（API-platform + Max/OAuth `unified-*` 兩家族）/ usage；SIGTERM graceful drain，部署重啟用 `proxy-launcher.py restart` |
+| **rate-limit-proxy** | 選配 daemon | 本地 reverse proxy，擷取真實 rate-limit header（API-platform + Max/OAuth `unified-*` 兩家族）/ usage；SIGTERM graceful drain，部署重啟用 `proxy-launcher.py restart`；檔案 rotation（rate-state 歸檔全保留 / proxy.log 一代，#17） |
 | **pacing-playbook** | skill | 設計期反 burst 引導與決策檢查表 |
 
 **會攔截／提醒什麼**（＝「會檔到你哪些東西」）：🔴 硬擋＝burst 超量 deny、Fable 5 開 Workflow deny；🟡 軟延遲＝兩發太近自動 sleep；🔵 只提醒＝寬 fan-out 建議 pin sonnet、bucket 近期撞過牆的 heat nudge。全部 fail-open、可 env / 檔案旗標調整或關閉。
