@@ -115,7 +115,9 @@ kill-switch（`CLAUDE_HOT_LIMIT_OFF=1` / `<data>/disabled`）優先於 opt-in。
 graceful drain（拒新連線 → 等 in-flight 走完 → record 落地 → 退出），但紀律仍然必要：
 ① 部署新版一律用 `proxy-launcher.py restart`（graceful），不要 `stop --force` + `ensure`；
 ② 重啟前可看 `rate-state.jsonl` 最近 60s 有無其他 session 活動；③ `--force` 只在 daemon
-卡死時用，並接受切斷並發 streams 的代價。2026-07-10 的三連硬重啟事故（並發 session 反覆
+卡死時用，並接受切斷並發 streams 的代價；④ **bootstrap 缺口**：從 ≤1.15.0 舊 daemon
+升級的那一次 restart 無 graceful 效果（舊 code 無 SIGTERM handler、即刻死）——graceful
+從新 daemon 起才生效。2026-07-10 的三連硬重啟事故（並發 session 反覆
 `Connection closed mid-response` + 該時段 record 全蒸發）是本紀律的直接動機。
 
 **觀測期**：opt-in 後正常使用一段時間，`rate-state.jsonl` 會累積真實 header/usage/model

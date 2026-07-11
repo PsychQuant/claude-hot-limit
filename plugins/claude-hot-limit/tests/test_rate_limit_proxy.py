@@ -1283,6 +1283,55 @@ class GracefulDrainTest(unittest.TestCase):
         finally:
             s.close()
 
+    def test_drain_closes_idle_connections_while_active_stream_continues(self):
+        # #27 re-verify (a)（DA 實測重現）：idle keep-alive 連線若只是「不擋 drain」
+        # 但保持開啟，drain 首見零即 break → 之後才到的請求被 process 退出拋棄。
+        # 契約：drain 進行中（active stream 還在跑時）idle 連線就要被**主動 shutdown**
+        # ——沒有 idle 連線 + listener 已關 = 新請求無處遞送，競態被結構性關閉。
+        MockUpstreamHandler.response_status = 200
+        MockUpstreamHandler.response_headers = {"Content-Type": "application/json"}
+        MockUpstreamHandler.response_body = b'{"ok": true}'
+        MockUpstreamHandler.sse_chunks = None
+
+        port = self._spawn_proxy(drain_cap="15")
+
+        # conn B：完成一個請求後保持 idle keep-alive
+        body = b'{"model": "claude-sonnet-5"}'
+        sock_b = socket.create_connection(("127.0.0.1", port), timeout=10)
+        sock_b.sendall(b"POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                       b"Content-Type: application/json\r\n"
+                       b"Content-Length: %d\r\n\r\n%s" % (len(body), body))
+        buf = b""
+        while b'{"ok": true}' not in buf:
+            buf += sock_b.recv(4096)
+
+        # conn A：慢 SSE stream（~4s），SIGTERM 時仍在進行中
+        MockUpstreamHandler.sse_chunks = [b'data: {"type":"content_block_delta"}\n\n'] * 8
+        MockUpstreamHandler.chunk_delay = 0.5
+        out = {}
+        t = threading.Thread(target=self._reader, args=("http://127.0.0.1:%d" % port, out))
+        t.start()
+        try:
+            time.sleep(1.0)  # A 進行中、B idle
+            self.proc.send_signal(signal.SIGTERM)
+
+            # 鑑別斷言：B 必須在 drain 進行中（A 還有 ~3s stream）就收到 EOF——
+            # 而非等到 process 死亡才斷（舊行為：EOF 與退出同時、>4s 後）。
+            sock_b.settimeout(2.5)
+            try:
+                leftover = sock_b.recv(4096)
+            except socket.timeout:
+                self.fail("idle 連線未在 drain 期間被關閉（2.5s 內無 EOF）——"
+                          "首見零即 break 的競態未修")
+            self.assertEqual(leftover, b"", "idle 連線應收 EOF（server 主動 shutdown）")
+
+            t.join(timeout=15)
+            self.assertTrue(out.get("ok"), "active stream 仍應完整走完，got %r" % out.get("err"))
+            self.assertEqual(self.proc.wait(timeout=15), 0)
+        finally:
+            sock_b.close()
+            t.join(timeout=5)
+
     def test_drain_cap_rejects_non_finite(self):
         # #27 verify F7：DRAIN_CAP=inf 讓「有界」變無界。unit 級直測 resolve_drain_cap。
         rlp = _load_proxy_module()

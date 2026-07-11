@@ -23,6 +23,7 @@ import http.server
 import json
 import os
 import signal
+import socket
 import socketserver
 import sys
 import threading
@@ -397,13 +398,33 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 record["truncated"] = True
             write_state_record(self._state_file(), record)
 
-    # --- in-flight 計數（#27 graceful drain 用；verify F1 修正版）---
-    # 計數必須是「per-request」（包住 _handle_inner）而非連線級（setup→finish）：
-    # HTTP/1.1 keep-alive 下 finish() 要等 client 關連線才跑，idle persistent 連線
-    # 會被誤計為 in-flight → 每次 drain 都燒滿 cap。per-request 計數讓 idle 連線
-    # 不擋 drain；process 退出時 idle 連線收到 RST，標準 HTTP client 會自動重連重試。
-    # in-process 測試用的 plain HTTPServer 沒有 inflight 屬性 → getattr 容忍（零行為差）。
+    # --- in-flight 追蹤（#27 graceful drain；verify F1 + re-verify (a) 修正版）---
+    # 兩層追蹤，各司其職：
+    #   * per-request 計數（`_handle` 包住 `_handle_inner`）：只有活躍請求擋 drain——
+    #     連線級計數（setup→finish）在 HTTP/1.1 keep-alive 下會把 idle persistent
+    #     連線誤計為 in-flight，讓每次 drain 燒滿 cap（verify F1）。
+    #   * 連線 registry（setup/finish 記 `open_socks`、`_handle` 記 `active_socks`）：
+    #     drain 用它「主動 shutdown idle 連線」——只讓 idle 不計數還不夠，idle 連線
+    #     在 drain loop 首見零之後仍可能遞來新請求、被 process 退出拋棄（re-verify (a)，
+    #     DA 實測重現）。關掉 idle + listener 已關 = 新請求無處遞送，競態結構性關閉。
+    # in-process 測試用的 plain HTTPServer 沒有這些屬性 → getattr 容忍（零行為差）。
     _handle_inner = _handle
+
+    def setup(self):
+        super().setup()
+        lock = getattr(self.server, "inflight_lock", None)
+        if lock is not None:
+            with lock:
+                self.server.open_socks.add(self.connection)
+
+    def finish(self):
+        try:
+            super().finish()
+        finally:
+            lock = getattr(self.server, "inflight_lock", None)
+            if lock is not None:
+                with lock:
+                    self.server.open_socks.discard(self.connection)
 
     def _handle(self):
         lock = getattr(self.server, "inflight_lock", None)
@@ -411,11 +432,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return self._handle_inner()
         with lock:
             self.server.inflight += 1
+            self.server.active_socks.add(self.connection)
         try:
             return self._handle_inner()
         finally:
             with lock:
                 self.server.inflight -= 1
+                self.server.active_socks.discard(self.connection)
 
     do_GET = _handle
     do_POST = _handle
@@ -445,6 +468,8 @@ def main():
     server = ThreadingHTTPServer(("127.0.0.1", port), ProxyHandler)
     server.inflight = 0
     server.inflight_lock = threading.Lock()
+    server.open_socks = set()
+    server.active_socks = set()
     drain_started = threading.Event()
 
     def _request_drain(signum, frame):
@@ -470,12 +495,18 @@ def main():
     except KeyboardInterrupt:
         pass
 
-    # --- graceful drain（#27）---
-    # 順序：先關 listening socket（新連線立即 refused，消除「backlog 掛住」），
-    # 短暫 grace（verify F2：已 accept、handler thread 尚未執行到計數的 scheduling
-    # latency 窗——grace 讓它們先完成 +1），再有界等待 in-flight 請求走完（records
-    # 經既有 per-request finally 自然落地）。超時 → 直接返回（exit 0），殘留 daemon
-    # threads 隨 process 終結。deadline 用 monotonic（verify F11：牆鐘跳動免疫）。
+    # --- graceful drain（#27；re-verify (a) 修正版）---
+    # 順序：① 關 listening socket（新連線立即 refused）② 0.5s grace（verify F2：已
+    # accept、handler thread 尚未執行到計數的 scheduling latency 窗）③ 有界迴圈：
+    # 活躍請求歸零時**主動 shutdown 所有 idle keep-alive 連線**（re-verify (a)：光是
+    # 「idle 不計數」不夠——首見零即 break 會拋棄之後才從 idle 連線遞來的請求；關掉
+    # idle 後新請求無處遞送，競態結構性關閉），收斂條件 = 零活躍 **且** 零開啟連線。
+    # 超時 → 直接返回（exit 0），殘留 daemon threads 隨 process 終結。
+    # deadline 用 monotonic（verify F11）。
+    #
+    # 殘餘窗（誠實記錄）：idle socket 在「快照為 idle」與「shutdown 生效」的微秒級
+    # 間隙收到新請求時，該請求會被 pre-response 切斷——client 端是 connection-reset
+    # （重試級錯誤），不是 mid-response 拋棄；與本 issue 要消滅的「回應斷頭」不同類。
     try:
         server.server_close()
     except Exception:
@@ -483,10 +514,20 @@ def main():
     time.sleep(0.5)
     deadline = time.monotonic() + resolve_drain_cap()
     while time.monotonic() < deadline:
+        # 每輪都先關當下 idle 的連線（active 的不動）——idle 必須在 drain「一開始」
+        # 就關，不能等活躍歸零：active stream 可能還要跑很久，期間 idle 連線隨時
+        # 可能遞來新請求。active 連線完成請求、回到 idle 後，下一輪自然被關
+        #（= drain 期間禁止 keep-alive 重用）。
         with server.inflight_lock:
-            remaining = server.inflight
-        if remaining <= 0:
-            break
+            idle = [s for s in server.open_socks if s not in server.active_socks]
+        for s in idle:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+        with server.inflight_lock:
+            if server.inflight <= 0 and not server.open_socks:
+                break
         time.sleep(0.2)
     with server.inflight_lock:
         remaining = server.inflight

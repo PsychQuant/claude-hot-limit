@@ -360,16 +360,31 @@ def restart():
                 os.kill(pid, signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
                 pass
-    # Phase 1：等 port 釋放（正常 < 1s；超時 → 退回完整 graceful stop 再 ensure）
+    # Phase 1：等 port 釋放（正常 < 1s：daemon 收 SIGTERM 後 server_close 幾乎立即）
     deadline = time.monotonic() + 15.0
     while time.monotonic() < deadline and port_up(port):
         time.sleep(0.1)
     if port_up(port):
-        print("[claude-hot-limit] ⚠️ port {pt} 未在 15s 內釋放——退回完整 stop → ensure。".format(pt=port))
-        rc = stop()
-        if rc != 0:
-            return rc
-        return ensure()
+        # re-verify (c)：Phase 1 已送過 SIGTERM 且等了 15s——再跑完整 stop() 會重複
+        # SIGTERM + 再等一輪 ~125s（最壞 140s dead port）。卡死 daemon 直接升級 SIGKILL
+        #（身分重查防 PID reuse）；SIGKILL 後 port 仍被佔 = 外部 process 佔 port，
+        # 誠實 fail（exit 1）而非靜默 no-op。
+        print("[claude-hot-limit] ⚠️ port {pt} 未在 15s 內釋放 → 直接升級 SIGKILL。".format(pt=port))
+        if pid is not None and _pid_alive(pid):
+            if _still_ours(pid):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline and _pid_alive(pid):
+                    time.sleep(0.05)
+            else:
+                print("[claude-hot-limit] ⚠️ pid {p} 已換人（PID reuse）——不 SIGKILL。".format(p=pid))
+        if port_up(port):
+            print("[claude-hot-limit] ⚠️ SIGKILL 後 port {pt} 仍被佔用——外部 process 佔 port？"
+                  "無法 restart，exit 1。".format(pt=port))
+            return 1
     # 舊 pidfile 先清（ensure spawn 會寫新 daemon 的 pidfile）
     try:
         os.remove(_pid_path(d))
