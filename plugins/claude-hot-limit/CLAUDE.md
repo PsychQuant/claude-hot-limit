@@ -98,7 +98,7 @@ proxy 是**選配、opt-in**：部署拆成兩個時序不同的關注點——
    （沒用 proxy 的使用者零打擾）。`CLAUDE_HOT_LIMIT_PROXY=1` 可強制（測試/預熱）。冪等：
    port 已 UP 就 no-op；`fcntl.flock` + 鎖內二次探測防並發 session race；**多 session 共用單一
    daemon**（帳號級，port 8787 一個實例）。daemon detached（session 結束續活）、log 在
-   `<data>/proxy.log`、pidfile `<data>/proxy.pid`；手動管理：`proxy-launcher.py stop|status`。
+   `<data>/proxy.log`、pidfile `<data>/proxy.pid`；手動管理：`proxy-launcher.py stop [--force]|restart|status`（#27：`stop` 預設 graceful——SIGTERM 後等 daemon drain in-flight streams（`RATE_LIMIT_PROXY_DRAIN_CAP` 預設 120s）+ 超時 SIGKILL fallback；`--force` 立即 kill；`restart` = graceful stop → ensure）。
 
 **⚠️ dead-port 風險（部署層頭號風險）**：`ANTHROPIC_BASE_URL` 指向沒起來的 proxy = **所有
 API 流量無法送出**。proxy 內部的 fail-open 救不了「proxy 根本沒在跑」。緩解：**fail-loud 覆蓋
@@ -109,6 +109,14 @@ API 流量無法送出**。proxy 內部的 fail-open 救不了「proxy 根本沒
 （proxy 打的上游）與 `ANTHROPIC_BASE_URL`（Claude Code 打的入口）刻意分離，不會自我迴圈。mid-session daemon 死掉 → 流量斷到下次
 session start 自動 re-ensure（v1 接受；要 mid-session auto-restart 可自行掛 launchd `KeepAlive`）。
 kill-switch（`CLAUDE_HOT_LIMIT_OFF=1` / `<data>/disabled`）優先於 opt-in。
+
+**⚠️ 重啟紀律（#27，CRITICAL）**：daemon 是**多 session 共用**（帳號級單一實例）——重啟它 =
+**所有並發 session** 的 in-flight streaming 回應同時面臨中斷風險。v1.16.0 起 daemon 有 SIGTERM
+graceful drain（拒新連線 → 等 in-flight 走完 → record 落地 → 退出），但紀律仍然必要：
+① 部署新版一律用 `proxy-launcher.py restart`（graceful），不要 `stop --force` + `ensure`；
+② 重啟前可看 `rate-state.jsonl` 最近 60s 有無其他 session 活動；③ `--force` 只在 daemon
+卡死時用，並接受切斷並發 streams 的代價。2026-07-10 的三連硬重啟事故（並發 session 反覆
+`Connection closed mid-response` + 該時段 record 全蒸發）是本紀律的直接動機。
 
 **觀測期**：opt-in 後正常使用一段時間，`rate-state.jsonl` 會累積真實 header/usage/model
 快照——這是 #7（Phase 2 主動排程）gating precondition 的驗證資料。

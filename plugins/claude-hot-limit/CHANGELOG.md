@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.16.0
+
+- **fix（共用 daemon 重啟殺死並發 in-flight streams，#27）**：2026-07-10 三次硬重啟（v1.14.0 部署）瞬殺 daemon，切斷所有並發 session 的 streaming 回應（`Connection closed mid-response`）且該時段 record 全蒸發。機制：`ThreadingMixIn` + `daemon_threads=True`——main thread 退出瞬間 handler threads 全死、finally 不跑（SIGTERM 預設 handler 直接終止 process）。
+- **graceful drain（proxy）**：SIGTERM/SIGINT handler（`server.shutdown()` 必經另一 thread——同 thread 直呼與 `serve_forever` 死鎖）→ 先 `server_close()`（新連線立即 refused，消除 backlog 掛住）→ 有界等待 in-flight（handler `setup()`/`finish()` 計數，`RATE_LIMIT_PROXY_DRAIN_CAP` 預設 120s）→ clean exit(0)。records 經既有 per-request finally 自然落地（SIGTERM record 蒸發缺口順帶解，與 #26 的 client-disconnect 缺口互補成對）。`daemon_threads=True` 刻意保留：drain 超時後卡死 stream 不得綁架退出。
+- **launcher stop/restart 語意**：`stop` 預設轉 graceful（SIGTERM → 等 pid 真死 + port 釋放，窗 = DRAIN_CAP+5s、每 2s 印進度 → 超時 SIGKILL fallback + 警告）；pidfile 改**確認死亡後**才清（先刪會讓中途失敗留無主 daemon）；`stop --force` 立即 SIGKILL 逃生；新增 `restart`（graceful stop → ensure，最小化 dead-port 窗口）。
+- **重啟紀律（docs）**：CLAUDE.md 新增 CRITICAL 段——部署一律 `restart`；重啟前查 rate-state.jsonl 近期活動；`--force` 接受切斷並發的代價。
+- **誠實邊界**：graceful drain 只消除「重啟殺 streams」（L1）與「SIGTERM record 蒸發」（L3）；**upstream 中途斷流（L2）不在本修範圍**——實測 daemon 穩定期間仍有 status=200-usage-null streaming records（與桶熱相關），證據已記 #14。
+- **test（+7，proxy 38 綠、launcher 15 綠、全套件 195 綠）**：`GracefulDrainTest`（subprocess 級：SIGTERM 中 in-flight stream 完整走完 + record 落地 + exit 0 / drain 期間拒新連線 / cap 超時有界退出）+ `GracefulStopTest`（stop 等到真死 / SIGKILL fallback / `--force` / `restart` 換新 pid）。RED 階段精準複現事故形狀（`IncompleteRead` + exit -15）。
+
 ## 1.15.0
 
 - **fix（rate-limit header 擷取家族錯誤，#12；0/1134 → 可修 capture bug 定案）**：Max/OAuth 訂閱回應**一直都有** rate-limit header——是 `anthropic-ratelimit-unified-*` 訂閱配額家族（2026-07-10 `RATE_LIMIT_PROXY_DEBUG_HEADERS` dump 15/15 實證），而 `_RATE_LIMIT_HEADER_MAP` 只認 API-platform 家族 6 個名字（`-requests-remaining` / `-input-tokens-*` / `-output-tokens-*`）→ production 0/1134 全 null。**排除舊假設**：`extract_rate_limit_fields` 兩個呼叫點（streaming 主路徑 + HTTPError 路徑）都有接線，缺口在名單不在路徑。
