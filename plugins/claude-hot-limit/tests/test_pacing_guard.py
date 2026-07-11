@@ -1373,6 +1373,14 @@ class UnifiedUtilizationHeatTest(unittest.TestCase):
         self.assertIn("allowed_warning", parsed.get("systemMessage", ""),
                       "應點名官方 warning 狀態，msg=%r" % parsed.get("systemMessage"))
 
+    def test_rejected_status_triggers_directly(self):
+        # 5h_status=rejected（撞牆中）——任何非 allowed 狀態都直判熱，不限 allowed_warning
+        self.seed_rate_state(age=5, rl_unified_5h_utilization=1.0,
+                             rl_unified_5h_status="rejected")
+        _, parsed, raw = self.fire()
+        self.assertIsNotNone(parsed, "rejected 應直判熱，stdout=%r" % raw)
+        self.assertIn("rejected", parsed.get("systemMessage", ""))
+
     def test_utilization_below_threshold_confirms_cold(self):
         # 官方水位低 + status allowed → 真冷，取代 429 啟發式（沿既有「取代不疊加」語意）
         self.seed_rate_state(age=5, rl_unified_5h_utilization=0.25,

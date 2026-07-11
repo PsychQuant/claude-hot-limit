@@ -544,9 +544,11 @@ def rate_state_heat(data_dir, window, now, model=None):
             util_pct = None
     if uni_status is not None or util_pct is not None:
         informative = True
-    if uni_status == "allowed_warning":
-        # server 直判優先於本地門檻——官方已標警告
-        return "官方 5h 配額狀態 allowed_warning{pct}{reset}".format(
+    if uni_status is not None and uni_status != "allowed":
+        # server 直判優先於本地門檻——任何非 allowed 狀態（allowed_warning / rejected /
+        # 未來新值）都視為熱：官方已標非正常，寧可提醒不漏。
+        return "官方 5h 配額狀態 {st}{pct}{reset}".format(
+            st=uni_status,
             pct="（水位 {p:g}%）".format(p=util_pct) if util_pct is not None else "",
             reset=reset_str)
     if util_pct is not None:
