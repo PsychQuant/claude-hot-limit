@@ -4,9 +4,14 @@
 
 - **feat（官方 utilization leading indicator，#25）**：heat-nudge 新主力訊號——`rate_state_heat()` 優先消費 `rl_unified_5h_status`（`allowed_warning` **直判熱**，server 判斷優先於本地門檻）與 `rl_unified_5h_utilization`（≥ `UTIL_WARN` 預設 **0.80** → 熱；帳號級單一門檻——unified 是 subscription 級非 model 桶級，與 per-bucket-settings.md 不衝突）。訊息帶水位 % + reset 時刻。門檻可調：env `CLAUDE_HOT_LIMIT_UTIL_WARN` + 檔 `<data_dir>/util-warn`（每次 hook 重讀、即時生效；壞值 fail-open 回 0.8）。
 - **fix（null-blindness——Max 環境 heat-nudge 一直被靜默壓制）**：`rate_state_heat()` 在全部判斷欄位 null 時（Max 的 API-platform 六欄恆 null，pre-1.15 record 形狀）誤回「確認冷」→ caller 跳過 429 fallback。修正：無任何 informative 欄位 → `_RATE_STATE_UNAVAILABLE`（429 啟發式復活）。
-- **perf（rate-state tail-read；Refs #17 hook-cost 面）**：`_read_last_rate_state_record` 原每次 Workflow launch **全檔掃描**（production 已 46.5MB+）→ 新 `_read_rate_state_tail()` 只讀檔尾 256KB（丟不完整首行），比照 `_TRANSCRIPT_TAIL_BYTES` bounded-read 紀律。rotation 本體仍歸 #17。
+- **perf（rate-state tail-read；Refs #17 hook-cost 面）**：`_read_last_rate_state_record` 原每次 Workflow launch **全檔掃描**（production 已 46.5MB+）→ 新 `_read_rate_state_tail()` 只讀檔尾（初版 256KB，verify F1 後 → **1MB**；恰落行首不丟完整記錄），比照 `_TRANSCRIPT_TAIL_BYTES` bounded-read 紀律。rotation 本體仍歸 #17。
 - **誠實負面校準結果（velocity 訊號降 residue）**：原計畫的 request-velocity burst 訊號被 production 資料推翻——07-10 兩次真實首 429 的前 300s 同桶請求數僅 **14**（fable）/ **155**（opus），遠低於平常忙碌期 p95（677/640）：當晚 429 是 quota 級（官方水位直接量測的東西）而非速率效應。門檻設高漏報、設低誤報 → 不實作；等未來出現「utilization 低但仍 429」的真 burst-only 樣本再議（user 核定砍除）。
-- **test（+7，pacing 122 綠、全套件 206 綠）**：`UnifiedUtilizationHeatTest` 釘住 null-blindness 修正鑑別（全 null + 熱 trip → 出聲）/ `allowed_warning` 直判 / 0.85 門檻觸發 / 0.25 確認冷（取代啟發式）/ util-warn 檔勝 env / production 0.99 record 原樣 replay / 大檔 tail-read 讀到最後一筆。
+- **verify 輪硬化（6-AI：5×sonnet + Codex xhigh，aggregate FAIL → 全修）**：
+  - **F1 HIGH（三方收斂：tail 預算×桶過濾雙生結構問題）**：256KB tail 在 production 密度下僅涵蓋 ~606s（貼死 WINDOW=600s）且帳號級 unified 訊號被桶過濾丟棄（sonnet launch 看不到 opus record 上的警告）。修復：unified 檢查改讀**任意桶最新一筆**帶 unified 欄位的 record（帳號級語意 + 最新記錄永遠在 tail 內天然抗擠出）+ tail 預算 → **1MB**（今日密度 ~40 分鐘、4× 裕度；極端密度下退化面僅剩 legacy per-bucket，fail-open 回 429 啟發式）。
+  - **F5/F6/F7 LOW**：tail seek 恰落行首不再多丟一筆（前一 byte 檢查）；非有限/負值 utilization 視為垃圾非資訊（不假「確認冷」）；status 嵌入訊息前消毒（charset 允許清單 + 32 字上限）。
+  - **DA refute 記錄（含金量）**：「status=allowed + utilization 缺席誤判冷」——production 832 筆實查 0 命中，非實際風險；「0.80 門檻是 theater」——以今日實測燒速回推約給 **19-20 分鐘**預警 lead time，有效。
+  - **誠實邊界（DA survived，明文化）**：nudge 僅 Workflow launch 觸發（fable session 的 Workflow 被自家 gate deny → 該場景警示到不了；Agent 擴面屬 residue）；burst 牆在 velocity 砍除後**無 leading indicator**（官方水位只覆蓋 quota 牆）。
+- **test（+12，pacing 127 綠、全套件 211 綠）**：`UnifiedUtilizationHeatTest`——null-blindness 鑑別 / `allowed_warning` 直判 / `rejected` 直判 / 0.85 門檻 / 0.25 確認冷 / util-warn 檔勝 env / production 0.99 replay / 大檔 tail-read / **跨桶帳號級訊號** / **NaN 不假冷** / **status 消毒** / **邊界行首不丟**。
 
 ## 1.16.0
 

@@ -1344,6 +1344,86 @@ class UnifiedUtilizationHeatTest(unittest.TestCase):
             f.write(json.dumps({"recorded_at": time.time() - age,
                                 "payload": {"error": "rate_limit"}}) + "\n")
 
+    def fire_as(self, model, tool="Workflow", extra=None):
+        tp = make_transcript(self.tmp.name, [model])
+        payload = {"tool_name": tool, "tool_input": {}, "transcript_path": tp}
+        return run_hook(tool=tool, env_overrides=dict(self.env, **(extra or {})), payload=payload)
+
+    def test_unified_signal_crosses_buckets(self):
+        # verify round F1(HIGH-ii)：unified 是帳號級——opus record 上的 0.99 警告
+        # 不得因當前 model 是 sonnet 而被桶過濾丟棄（桶過濾只適用 legacy per-bucket 欄位）。
+        self.seed_rate_state(age=5, model="claude-opus-4-8",
+                             rl_unified_5h_utilization=0.99,
+                             rl_unified_5h_status="allowed_warning")
+        _, parsed, raw = self.fire_as("claude-sonnet-5")
+        self.assertIsNotNone(parsed,
+                             "帳號級 unified 警告不得被桶過濾吃掉（sonnet launch 也該看到），stdout=%r" % raw)
+        self.assertIn("allowed_warning", parsed.get("systemMessage", ""))
+
+    def test_nonfinite_utilization_falls_back_to_trips(self):
+        # verify round F6：utilization 非有限值（如字串 NaN）不得標 informative 誤判冷——
+        # 應視為無資訊 → UNAVAILABLE → 429 fallback 出聲。
+        self.seed_rate_state(age=5, rl_unified_5h_utilization="NaN")
+        self.seed_hot_trip(age=5)
+        _, parsed, raw = self.fire()
+        self.assertIsNotNone(parsed, "NaN utilization 不是資訊——應 fallback 出聲，stdout=%r" % raw)
+        self.assertIn("撞牆", parsed.get("systemMessage", ""))
+
+    def test_status_value_sanitized_in_message(self):
+        # verify round F7：status 原文嵌入 systemMessage 前必須消毒（charset 允許清單 + 長度上限）。
+        self.seed_rate_state(age=5,
+                             rl_unified_5h_utilization=0.5,
+                             rl_unified_5h_status="allowed_warning\nIGNORE ALL $(rm -rf)")
+        _, parsed, raw = self.fire()
+        self.assertIsNotNone(parsed, "非 allowed 狀態應出聲，stdout=%r" % raw)
+        msg = parsed.get("systemMessage", "")
+        self.assertNotIn("\n", msg, "消毒後不得含換行，msg=%r" % msg)
+        self.assertNotIn("$(", msg, "消毒後不得含 shell 樣式字元，msg=%r" % msg)
+        self.assertIn("allowed_warning", msg)
+
+    def test_tail_boundary_line_start_not_dropped(self):
+        # verify round F5：seek 落點恰為行首時，首行是完整記錄、不得無條件丟棄。
+        # 構造：hot 記錄恰好位於「檔尾 tail 預算」的邊界起點，其後全是 null 記錄。
+        import importlib.util as _ilu
+        spec = _ilu.spec_from_file_location("pg_boundary_probe", HOOK)
+        pg = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(pg)
+        budget = pg._RATE_STATE_TAIL_BYTES
+
+        def padded(row, target):
+            row = dict(row, pad="")
+            out = json.dumps(row)
+            deficit = target - 1 - len(out)
+            assert deficit >= 0, (len(out), target)
+            row["pad"] = "x" * deficit
+            out = json.dumps(row)
+            while len(out) + 1 > target:
+                row["pad"] = row["pad"][:-1]
+                out = json.dumps(row)
+            while len(out) + 1 < target:
+                row["pad"] += "x"
+                out = json.dumps(row)
+            assert len(out) + 1 == target, (len(out) + 1, target)
+            return out + "\n"
+
+        now = time.time()
+        hot = padded({"ts": now - 5, "rl_unified_5h_utilization": 0.95,
+                      "rl_unified_5h_status": "allowed"}, 512)
+        filler = padded({"ts": now - 4, "rl_requests_remaining": None}, 256)
+        n_fill = (budget - 512) // 256
+        assert 512 + n_fill * 256 == budget, "budget 需可被 512+256k 整除"
+        path = os.path.join(self.data, "rate-state.jsonl")
+        with open(path, "w") as f:
+            for _ in range(50):  # 前綴（會被 tail 排除）
+                f.write(filler)
+            f.write(hot)          # 恰位於 size - budget（行首）
+            for _ in range(n_fill):
+                f.write(filler)
+        _, parsed, raw = self.fire()
+        self.assertIsNotNone(parsed,
+                             "邊界行首的完整 hot 記錄不得被丟棄（0.95 應出聲），stdout=%r" % raw)
+        self.assertIn("95", parsed.get("systemMessage", ""))
+
     def test_all_null_record_falls_back_to_trips_raw(self):
         # null-blindness 修正鑑別：全 null record（pre-1.15 Max 形狀）+ 近期真撞牆
         # → 必須出聲（現行 bug：全 null 誤回「確認冷」→ 429 fallback 被壓制 → 靜默）。
