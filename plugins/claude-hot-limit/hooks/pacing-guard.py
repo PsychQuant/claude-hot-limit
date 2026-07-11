@@ -552,7 +552,9 @@ def rate_state_heat(data_dir, window, now, model=None):
                     informative = True
             if uni_status is not None:
                 informative = True
-                if uni_status != "allowed":
+                # 比對前 strip（DA round-2 LOW：`"allowed "` 尾空白會誤直判熱、
+                # 顯示端又消毒成 "allowed" 造成訊息自相矛盾）
+                if str(uni_status).strip() != "allowed":
                     # server 直判優先於本地門檻——任何非 allowed 狀態（allowed_warning /
                     # rejected / 未來新值）都視為熱。比對用原值；嵌入訊息前消毒
                     #（verify F7：charset 允許清單 + 32 字上限，防 state 檔字串挾帶
