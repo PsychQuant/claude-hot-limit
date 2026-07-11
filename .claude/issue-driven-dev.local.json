@@ -1,4 +1,5 @@
 {
   "github_repo": "PsychQuant/claude-hot-limit",
-  "github_owner": "PsychQuant"
+  "github_owner": "PsychQuant",
+  "pr_policy": "never"
 }
