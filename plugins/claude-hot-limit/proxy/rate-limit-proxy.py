@@ -255,7 +255,13 @@ def resolve_rotate_cap_bytes():
         v = default_mb
     if v <= 0:
         return None
-    return int(v * 1024 * 1024)
+    b = v * 1024 * 1024
+    # verify F1/F7（R2+Codex 收斂）：檢查【乘積】而非只檢查 v——「1e308」有限但乘完
+    # 溢位成 inf（int(inf) 拋 OverflowError 丟 record）；「1e-10」截成 0-byte cap
+    # （每筆一檔 archive storm）。兩者都是壞值 → 回預設。
+    if not (1 <= b < float("inf")):
+        b = default_mb * 1024 * 1024
+    return int(b)
 
 
 def _rotate_state_file(state_file_path):
@@ -271,8 +277,10 @@ def _rotate_state_file(state_file_path):
         return
     try:
         size = os.path.getsize(state_file_path)
-    except OSError:
-        return  # live 檔還不存在 → 無事可轉
+    except Exception:
+        # verify F3：不只檔案不存在——任何 stat 失敗（含 PermissionError 等）都跳過
+        # rotation 讓後續 append 自己面對；例外若逃出去會讓整筆 record 被外層吃掉
+        return
     if size <= cap:
         return
     try:
@@ -291,8 +299,17 @@ def _rotate_state_file(state_file_path):
               file=sys.stderr)
 
 
+# verify F2（R1+Codex 收斂）：in-process baseline mutex。fcntl=None（Windows）時
+# flock 整段跳過，rotation 的 check-then-replace（exists 迴圈 → os.replace）在多
+# request thread 間裸奔——兩 thread 算出同一 archive target，後者用 stale target
+# 覆蓋前者剛歸檔的整包歷史（永久遺失）。threading.Lock 序列化同 process 內全部
+# thread（daemon 是 port-singleton，同機同檔的寫入者就是這一個 process 的 threads）；
+# POSIX 上 flock 照樣疊加提供跨 process 互斥。
+_STATE_WRITE_MUTEX = threading.Lock()
+
+
 def write_state_record(state_file_path, record):
-    """Append 一行 JSON 進帳號級共用狀態檔（flock 序列化，比照既有 hook 帳本慣例）。
+    """Append 一行 JSON 進帳號級共用狀態檔（in-process mutex + flock 雙層序列化）。
 
     fail-open：寫入失敗（磁碟滿/權限錯誤等）只印警告到 stderr，不影響呼叫端。
     """
@@ -300,18 +317,19 @@ def write_state_record(state_file_path, record):
         d = os.path.dirname(state_file_path)
         if d:
             os.makedirs(d, exist_ok=True)
-        lockf = None
-        if fcntl is not None:
-            lockf = open(state_file_path + ".lock", "a")
-            fcntl.flock(lockf, fcntl.LOCK_EX)
-        try:
-            _rotate_state_file(state_file_path)
-            with open(state_file_path, "a") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        finally:
-            if lockf is not None:
-                fcntl.flock(lockf, fcntl.LOCK_UN)
-                lockf.close()
+        with _STATE_WRITE_MUTEX:
+            lockf = None
+            if fcntl is not None:
+                lockf = open(state_file_path + ".lock", "a")
+                fcntl.flock(lockf, fcntl.LOCK_EX)
+            try:
+                _rotate_state_file(state_file_path)
+                with open(state_file_path, "a") as f:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            finally:
+                if lockf is not None:
+                    fcntl.flock(lockf, fcntl.LOCK_UN)
+                    lockf.close()
     except Exception as e:
         print("[rate-limit-proxy] WARNING: failed to write state file: %s" % e, file=sys.stderr)
 

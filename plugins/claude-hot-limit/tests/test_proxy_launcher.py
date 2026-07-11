@@ -323,8 +323,9 @@ class GracefulStopTest(unittest.TestCase):
 class LogRotationTest(unittest.TestCase):
     """#17 — proxy.log spawn-time rotation（只留一代 .1；log 無語料價值）。
 
-    ensure() 在開 proxy.log append 之前（daemon 未跑、flock 內——無人持 fd 的安全點）
-    size 檢查：> RATE_LIMIT_PROXY_LOG_ROTATE_MB（float MB，預設 32）→ os.replace 成 .1。
+    ensure() 在開 proxy.log append 之前（daemon 未跑；two-phase restart 下舊 daemon
+    drain 期間仍可能持 fd——其輸出跟去 .1，已披露）size 檢查：
+    > RATE_LIMIT_PROXY_LOG_ROTATE_MB（float MiB=1024²，預設 32）→ os.replace 成 .1。
     """
 
     def setUp(self):
@@ -370,9 +371,23 @@ class LogRotationTest(unittest.TestCase):
     def test_below_cap_not_rotated(self):
         with open(self.log, "w") as f:
             f.write("small log\n")
-        code, out, err = run_launcher("ensure", self.env)  # 預設 cap 32MB
+        code, out, err = run_launcher("ensure", self.env)  # 預設 cap 32MiB
         self.assertEqual(code, 0)
         self.assertFalse(os.path.exists(self.log + ".1"), "未達 cap 不該輪替")
+
+    def test_bad_log_cap_values_do_not_break_ensure(self):
+        # verify F1（R2+Codex，launcher 側）：「1e308」有限巨值 ×1024² 溢位 →
+        # 未捕捉 OverflowError 會讓 ensure 整個崩、daemon 不 spawn（dead-port 級）。
+        # 壞值只能退回預設，絕不能擋 spawn。verify F4（R3）：launcher 原本零壞值測試。
+        for bad in ("1e308", "abc", "nan", "0"):
+            with self.subTest(cap=bad):
+                run_launcher("stop", self.env)  # 每輪乾淨起點
+                env = dict(self.env, RATE_LIMIT_PROXY_LOG_ROTATE_MB=bad)
+                code, out, err = run_launcher("ensure", env)
+                self.assertEqual(code, 0,
+                                 "cap=%r 不得讓 ensure 失敗，stderr=%r" % (bad, err))
+                self.assertTrue(port_up(self.port),
+                                "cap=%r 不得擋 daemon spawn（dead-port 級後果）" % bad)
 
 
 if __name__ == "__main__":

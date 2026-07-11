@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.18.1
+
+- **verify 輪硬化（#17，6-AI：5×sonnet + Codex xhigh，aggregate FAIL → 全修）**：
+  - **F1 HIGH（cap parser 乘法後溢位；R2+Codex 各自實測重現）**：兩側 resolver 的 `int(v*1024*1024)` 只檢查 `v` 自身有限性——`ROTATE_MB=1e303+` 有限巨值乘完溢位成 `inf` → 未捕捉 `OverflowError`。daemon 端：例外在 `f.write` 前炸出，**該 daemon 生涯每筆 record 靜默丟失**；launcher 端：`ensure` 整個崩、daemon 不 spawn（dead-port 級）。修復：檢查**乘積**的有限性（`1 <= b < inf` 否則回預設）。
+  - **F2 HIGH（fcntl=None rotation TOCTOU；R1+Codex 獨立推導同一交錯）**：Windows fallback 無鎖時，兩 thread 算出同一 archive target、後者用 stale target `os.replace` **覆蓋前者剛歸檔的整包歷史**（RED 實測 8 threads×25 writes 丟 29 筆）。修復：module-level `threading.Lock` in-process baseline（POSIX 上 flock 照樣疊加）；「零遺失」宣稱範圍限定明文化（POSIX 全保證；Windows 由 mutex 涵蓋 port-singleton 單 daemon 情境）。
+  - **F3 MEDIUM**：`_rotate_state_file` 的 `except OSError` 過窄（吞 PermissionError 但註解不準；非 OSError 逃出會讓整筆 record 被外層吃掉）→ 改 `except Exception` + 註解準確化。
+  - **F7 LOW**：`1e-10` 正微值截成 0-byte cap（每筆一檔 archive storm）→ 乘積 <1 byte 視為壞值回預設。
+  - **F5/F6/F8 docs**：`proxy-headers-debug.jsonl`「查完刪」是操作紀律非機械保證（無 flock 無 rotation，flag 開著無限長）；校準分析全歷史 = live + archives concat（別只掃 live）；launcher「無人持 fd」註解誠實化（two-phase restart drain 窗內舊 daemon 仍持 fd、輸出跟去 `.1`，實測觀察到）。F9：測試 docstring 的 MiB 殘漏補掃。
+  - **DA survived（如實記錄）**：POSIX flock 主路徑零遺失（lock 檔不被 rename、per-inode 語意）、double-checked locking 擋雙 spawn、兩項誠實更正準確、四處文檔互相一致、部署完整（安裝版與 repo 行為 byte-identical）。
+- **test（+3 改 2，全套件 222 綠）**：壞值輪每輪**斷言 record 有寫入**（只斷言「沒 archive」抓不到丟 record 的 mutation——R3）+ `1e308` 入列 / 正微值回預設 / **無 fcntl 8-thread 守恆（per-id 驗證，非只數總量）** / launcher 壞值×4 不崩 ensure 不擋 spawn / 守恆測試鎖 `len(archives)>=2`（序號後綴路徑成為契約覆蓋而非偶然）。
+
 ## 1.18.0
 
 - **feat（rate-state.jsonl size-based rotation，#17）**：production 實測推翻原「量不大→won't-fix」（48MB/9 天、#12 後 ~15MB/day）。`write_state_record` 在既有 flock 臨界區內做 size 檢查：live 檔 > `RATE_LIMIT_PROXY_ROTATE_MB`（**float MiB**=1024² bytes，預設 **64** ≈ 4 天；測試可設微 cap）→ rename 成 `rate-state-<YYYYmmdd-HHMMSS>.jsonl`（同秒碰撞加序號後綴）後開新檔續寫。**archive 全保留**——歷史 record 是校準語料（#23/#25 分析資料集），rotation 只讓 live 檔有界、不刪資料，prune 手動。臨界區內 rename + 每次寫入重新開檔（無持久 fd）= **零 record 遺失**。壞值紀律比照 DRAIN_CAP：非有限/parse 失敗 → 預設；**≤0 → 停用**（escape hatch）；rotation 失敗 fail-open（警告 + 照常寫入——寧可檔案續長，不可丟 record）。

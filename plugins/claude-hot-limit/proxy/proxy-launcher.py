@@ -174,8 +174,10 @@ def ensure():
             return 0  # 鎖內二次探測：並發 session 在我們等鎖時已把 daemon 起好
 
         proxy_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rate-limit-proxy.py")
-        # #17：spawn 前輪替 proxy.log——此刻 daemon 未跑（port 檢查後、flock 內），
-        # 無人持這個 fd，是唯一安全輪替點（mid-run stderr fd 跟著舊檔、動不得）。
+        # #17：spawn 前輪替 proxy.log。port down ≠ 舊 process 已死（verify F8）：
+        # two-phase restart 下舊 daemon drain 期間（≤DRAIN_CAP）仍持 stderr fd——
+        # rename 後其輸出跟去 .1（live 部署實際觀察到 .1 續長），寫入不丟、只是落
+        # 在舊代；連續兩次 restart 會覆蓋前一代 drain 尾巴（「只留一代」設計內）。
         # log 無語料價值 → 只留一代 .1；輪替失敗 fail-open 照常 append。
         cap = _log_rotate_cap_bytes()
         try:
@@ -276,7 +278,12 @@ def _log_rotate_cap_bytes():
         v = default_mb
     if v <= 0:
         return None
-    return int(v * 1024 * 1024)
+    b = v * 1024 * 1024
+    # verify F1（R2+Codex）：檢查【乘積】——「1e308」有限但乘完溢位，int(inf) 的
+    # OverflowError 會讓整個 ensure 崩、daemon 不 spawn（dead-port 級）。壞值回預設。
+    if not (1 <= b < float("inf")):
+        b = default_mb * 1024 * 1024
+    return int(b)
 
 
 def _drain_cap():

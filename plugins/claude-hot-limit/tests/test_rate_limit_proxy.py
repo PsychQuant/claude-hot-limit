@@ -1372,7 +1372,7 @@ class StateFileRotationTest(unittest.TestCase):
     """#17 — rate-state.jsonl size-based rotation（archive、不刪語料）。
 
     write_state_record 在 flock 臨界區內做 size 檢查：> RATE_LIMIT_PROXY_ROTATE_MB
-    （float MB，預設 64；≤0 停用）→ rename 成 rate-state-<ts>.jsonl 後開新檔續寫。
+    （float MiB=1024²，預設 64；≤0 停用）→ rename 成 rate-state-<ts>.jsonl 後開新檔續寫。
     archive 全保留（校準語料）；rotation 失敗 fail-open（照常寫入，絕不丟 record）。
     """
 
@@ -1395,6 +1395,12 @@ class StateFileRotationTest(unittest.TestCase):
     def _record(self, i):
         return {"ts": 1700000000 + i, "model": "claude-opus-4-8", "pad": "x" * 80}
 
+    def _total_records(self):
+        total = len(read_jsonl(self.state))
+        for a in self._archives():
+            total += len(read_jsonl(os.path.join(self.tmp.name, a)))
+        return total
+
     def test_rotation_triggers_and_conserves_records(self):
         os.environ["RATE_LIMIT_PROXY_ROTATE_MB"] = "0.0002"  # ~210 bytes
         rlp = _load_proxy_module()
@@ -1403,10 +1409,12 @@ class StateFileRotationTest(unittest.TestCase):
             rlp.write_state_record(self.state, self._record(i))
         archives = self._archives()
         self.assertTrue(archives, "超過 cap 應產生至少一個 archive 檔")
-        total = len(read_jsonl(self.state))
-        for a in archives:
-            total += len(read_jsonl(os.path.join(self.tmp.name, a)))
-        self.assertEqual(total, n, "rotation 不得遺失任何 record（live+archive 守恆）")
+        # verify F4（R3）：微 cap 下 10 筆必轉多次——同秒序號後綴路徑是本測試的
+        # 契約覆蓋而非偶然，鎖死 >=2 防後綴迴圈被拿掉仍全綠
+        self.assertGreaterEqual(len(archives), 2,
+                                "微 cap 下應多次 rotation（覆蓋同秒序號後綴路徑）")
+        self.assertEqual(self._total_records(), n,
+                         "rotation 不得遺失任何 record（live+archive 守恆）")
         self.assertLess(os.path.getsize(self.state), 400,
                         "live 檔剛 rotate 過應遠小於累積總量")
 
@@ -1419,12 +1427,64 @@ class StateFileRotationTest(unittest.TestCase):
         self.assertEqual(len(read_jsonl(self.state)), 5)
 
     def test_bad_cap_values_fall_back_to_default(self):
-        for bad in ("abc", "nan", "inf", ""):
+        # verify F1（R2+Codex）：「1e308」是有限值但 ×1024² 後溢位成 inf——必須回預設，
+        # 不得讓 OverflowError 逃出去丟 record。verify F4（R3）：每輪都要斷言 record
+        # 真的寫進去了——只斷言「沒 archive」抓不到「連寫入都沒發生」的失敗模式。
+        bads = ("abc", "nan", "inf", "", "1e308")
+        for k, bad in enumerate(bads):
             os.environ["RATE_LIMIT_PROXY_ROTATE_MB"] = bad
             rlp = _load_proxy_module()
-            rlp.write_state_record(self.state, self._record(0))
+            rlp.write_state_record(self.state, self._record(k))
             self.assertEqual(self._archives(), [],
-                             "壞 cap 值 %r 應回預設 64MB（小檔不觸發），不 crash 不誤觸發" % bad)
+                             "壞 cap 值 %r 應回預設 64MiB（小檔不觸發），不 crash 不誤觸發" % bad)
+            self.assertEqual(len(read_jsonl(self.state)), k + 1,
+                             "壞 cap 值 %r 下 record 必須照常寫入（fail-open 鐵律）" % bad)
+
+    def test_tiny_positive_cap_treated_as_bad_value(self):
+        # verify F7（R2+Codex）：1e-10 MiB 截成 0-byte cap → 每筆一檔 archive storm。
+        # 乘積 <1 byte 視為壞值回預設（不是停用——停用是 ≤0 的明確語意）。
+        with open(self.state, "w") as f:
+            f.write('{"pad": "%s"}\n' % ("y" * 2048))
+        os.environ["RATE_LIMIT_PROXY_ROTATE_MB"] = "1e-10"
+        rlp = _load_proxy_module()
+        rlp.write_state_record(self.state, self._record(0))
+        self.assertEqual(self._archives(), [],
+                         "正微值 cap 應回預設 64MiB，不得變成 0-byte cap 的 archive storm")
+        self.assertEqual(len(read_jsonl(self.state)), 2, "record 照常寫入")
+
+    def test_threaded_writes_conserve_without_fcntl(self):
+        # verify F2（R1+Codex）：fcntl=None（Windows fallback）時 rotation 的
+        # check-then-replace 無鎖 → 兩 thread 同 target 互相覆蓋 archive、歷史永久遺失。
+        # 修法 = module-level threading.Lock 作 in-process baseline。此測試在無鎖版
+        # 屬機率性失敗（排程時序），修復後必須決定性守恆。
+        os.environ["RATE_LIMIT_PROXY_ROTATE_MB"] = "0.0002"  # ~210 bytes 微 cap
+        rlp = _load_proxy_module()
+        real_fcntl = rlp.fcntl
+        rlp.fcntl = None  # 模擬 Windows：flock 路徑整段跳過
+        n_threads, per_thread = 8, 25
+        try:
+            def worker(tid):
+                for j in range(per_thread):
+                    rlp.write_state_record(
+                        self.state,
+                        {"ts": 1700000000, "id": "t%d-%d" % (tid, j), "pad": "x" * 80})
+            threads = [threading.Thread(target=worker, args=(t,)) for t in range(n_threads)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            rlp.fcntl = real_fcntl
+        # 不只數總量（數量剛好但內容被覆蓋會漏抓）——驗證每個 id 都存在
+        seen = set()
+        for path in [self.state] + [os.path.join(self.tmp.name, a) for a in self._archives()]:
+            for r in read_jsonl(path):
+                seen.add(r.get("id"))
+        expected = {"t%d-%d" % (t, j) for t in range(n_threads) for j in range(per_thread)}
+        missing = expected - seen
+        self.assertEqual(missing, set(),
+                         "無 fcntl 時 in-process mutex 必須守恆——遺失 %d 筆：%s"
+                         % (len(missing), sorted(missing)[:5]))
 
     def test_zero_or_negative_cap_disables_rotation(self):
         with open(self.state, "w") as f:
