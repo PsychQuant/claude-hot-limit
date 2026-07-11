@@ -290,6 +290,16 @@ class GracefulStopTest(unittest.TestCase):
         self.assertIsNotNone(fake.poll(), "--force 應立即收掉 daemon")
         self.assertLess(elapsed, 5, "--force 不等 drain")
 
+    def test_restart_exits_nonzero_when_new_daemon_fails_to_start(self):
+        # #27 re-verify round-3（DA Attack 5，HIGH）：ensure() 的「永遠 exit 0」契約
+        # （SessionStart 不擋 session，正確）不可洩漏進 restart——restart 的契約是
+        # 「結束時有 daemon 在 port 上」，新 daemon 起不來（此處用 privileged port 1
+        # 模擬 bind 失敗）就必須非零 exit，否則部署腳本看 exit code 會被騙。
+        env = self.opted(RATE_LIMIT_PROXY_PORT="1")
+        code, out, err = run_launcher("restart", env, timeout=30)
+        self.assertNotEqual(code, 0,
+                            "新 daemon 啟動失敗時 restart 不得回 0（silent dead port）")
+
     def test_restart_replaces_daemon(self):
         code, out, err = run_launcher("ensure", self.opted())
         self.assertEqual(code, 0)

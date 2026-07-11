@@ -8,16 +8,16 @@
 - **重啟紀律（docs）**：CLAUDE.md 新增 CRITICAL 段——部署一律 `restart`；重啟前查 rate-state.jsonl 近期活動；`--force` 接受切斷並發的代價。
 - **誠實邊界**：graceful drain 只消除「重啟殺 streams」（L1）與「SIGTERM record 蒸發」（L3）；**upstream 中途斷流（L2）不在本修範圍**——實測 daemon 穩定期間仍有 status=200-usage-null streaming records（與桶熱相關），證據已記 #14。
 - **verify 輪硬化（6-AI：5×sonnet + Codex xhigh，aggregate FAIL → 全修 findings）**：
-  - **F1 HIGH（keep-alive 計數，DA 評整輪最重要；含 re-verify round 2 深化）**：計數改 **per-request**（包住 `_handle`）——idle persistent 連線不再誤計為 in-flight、restart 不再燒滿 cap。**Round 2（DA 實測重現「首見零即 break 拋棄後到請求」後補）**：drain 迴圈每輪**主動 shutdown 當下 idle 的連線**（active 不動；連線 registry `open_socks`/`active_socks`），收斂條件 = 零活躍**且**零開啟連線——idle 連線無法在 drain 中途遞新請求，競態結構性關閉。殘餘窗（微秒級快照-shutdown 間隙、pre-response、client 重試級）已誠實記錄於 drain 迴圈註解。
+  - **F1 HIGH（keep-alive 計數，DA 評整輪最重要；含 re-verify round 2 深化）**：計數改 **per-request**（包住 `_handle`）——idle persistent 連線不再誤計為 in-flight、restart 不再燒滿 cap。**Round 2（DA 實測重現「首見零即 break 拋棄後到請求」後補）**：drain 迴圈每輪**主動 shutdown 當下 idle 的連線**（active 不動；連線 registry `open_socks`/`active_socks`），收斂條件 = 零活躍**且**零開啟連線——idle 連線無法在 drain 中途遞新請求，競態結構性關閉。殘餘窗（round-3 措辭校正）：client 端安全（sendall 原子性失敗、0 byte 送出、乾淨 reset 重試級——DA 實測），但 server 端該請求可能已完成 upstream 往返才被切 → **浪費一次 upstream 呼叫**是真實預算成本；間隙寬度隨 idle 連線數放大，均已如實記錄於 drain 迴圈註解。
   - **F2 HIGH（accept→thread-start 競態）**：`server_close()` 後 0.5s grace 再進 drain 迴圈，覆蓋剛 accept 請求的 scheduling latency 窗。
   - **F3 HIGH（殭屍盲點，實測 12.1s→~2s）**：`_pid_alive` 加 ps stat Z 偵測——`os.kill(pid,0)` 對 zombie 成功導致等滿窗 + 假 SIGKILL；測試補 elapsed + no-false-SIGKILL 斷言（原測試「通過的理由是錯的」）。
   - **F4/F5（kill 紀律，四 reviewer 收斂）**：SIGKILL 前重查 process 身分（`_still_ours`，防長窗 PID reuse 誤殺）；pidfile **確認死亡才刪**、否則保留 + exit 1（`restart` 的 rc gate 因此從死碼變活）。
-  - **F6（兩階段 restart；含 round 2 卡死升級）**：port 一釋放（daemon `server_close` 幾乎立即）就 spawn 新 daemon，舊 process 於背景等 drain——正常路徑 dead-port 窗 <1s。**Round 2**：port 15s 內未釋放（卡死 daemon）→ **直接升級 SIGKILL**（身分重查防 PID reuse；不再退回完整 stop() 重跑 ~125s 窗，舊 fallback 最壞 140s dead port）；SIGKILL 後 port 仍被佔（外部 process）→ 誠實 exit 1。**Bootstrap 缺口（明示）**：從 ≤1.15.0 舊 daemon 升級的**那一次** restart 無 graceful 效果——舊 code 無 SIGTERM handler、即刻死（等同修復前行為），graceful 從新 daemon 起才生效。
+  - **F6（兩階段 restart；含 round 2 卡死升級）**：port 一釋放（daemon `server_close` 幾乎立即）就 spawn 新 daemon，舊 process 於背景等 drain——正常路徑 dead-port 窗 <1s。**Round 2**：port 15s 內未釋放（卡死 daemon）→ **直接升級 SIGKILL**（身分重查防 PID reuse；不再退回完整 stop() 重跑 ~125s 窗，舊 fallback 最壞 140s dead port）；SIGKILL 後 port 仍被佔（外部 process）→ 誠實 exit 1。**Round 3（DA Attack 5 HIGH）**：restart 結束前自驗 port 上線——新 daemon 啟動失敗（或未 opt-in）不再繼承 ensure 的恆-0 契約，exit 1（部署腳本看 exit code 不再被 silent dead port 騙）。**Bootstrap 缺口（明示）**：從 ≤1.15.0 舊 daemon 升級的**那一次** restart 無 graceful 效果——舊 code 無 SIGTERM handler、即刻死（等同修復前行為），graceful 從新 daemon 起才生效。
   - **F7（`DRAIN_CAP=inf`）**：兩端 cap 解析改 `0 <= v < inf`——「有界」是硬承諾。
   - **F9/F10/F11**：pid 死但 port 被外部佔用 → 警告；signal 連發 once-guard（DA 實測 2 萬發 SIGTERM 無害後降級，仍補）；deadline 全面改 `time.monotonic()`。
   - **F8/F13（測試韌性）**：launcher 測試 env pin `DRAIN_CAP=2`（避免內部窗 125s > subprocess timeout 20s 的邊際反轉）；refuse 測試邊際 0.7→1.0s。
   - **SIGINT 前景 UX 變更（明示）**：Ctrl-C 現在走 graceful drain——前景 debug 且有 in-flight 時最多等 cap 才退（背景 daemon 模式不受影響；`stop --force` 為逃生）。
-- **test（+10，proxy 41 綠、launcher 15 綠、全套件 198 綠）**：`GracefulDrainTest`（SIGTERM 中 in-flight 完整走完 + record 落地 + exit 0 / 拒新連線 / cap 有界 / **idle keep-alive 不擋 drain** / **drain 中 idle 連線被主動關閉而 active stream 不受擾（round 2 鑑別測試）** / **cap 拒 inf**）+ `GracefulStopTest`（等到真死**且及時** / SIGKILL fallback / `--force` / `restart` 換新 pid）。RED 階段精準複現事故形狀（`IncompleteRead` + exit -15；殭屍 12.1s）。
+- **test（+11，proxy 41 綠、launcher 16 綠、全套件 199 綠）**：`GracefulDrainTest`（SIGTERM 中 in-flight 完整走完 + record 落地 + exit 0 / 拒新連線 / cap 有界 / **idle keep-alive 不擋 drain** / **drain 中 idle 連線被主動關閉而 active stream 不受擾（round 2 鑑別測試）** / **cap 拒 inf**）+ `GracefulStopTest`（等到真死**且及時** / SIGKILL fallback / `--force` / `restart` 換新 pid）。RED 階段精準複現事故形狀（`IncompleteRead` + exit -15；殭屍 12.1s）。
 
 ## 1.15.0
 

@@ -343,7 +343,8 @@ def restart():
     （drain 只擋 process 退出、不擋 port）——所以 **port 一釋放就 spawn 新 daemon**
     （Phase 1），舊 process 的 drain 在新 daemon 已上線後於背景等完（Phase 2）。
     等舊 process「全死」才 ensure 的舊寫法，在有真流量時 dead-port 窗 ≈ 整段 drain。
-    ensure 的 opt-in gate 照舊——未 opt-in 時 ensure 靜默 no-op。"""
+    Exit 契約（round-3）：結束時 port 上必須有 daemon，否則 exit 1——含新 daemon
+    啟動失敗與未 opt-in（ensure 靜默 no-op）兩種情形；「沒 restart 出東西」不得宣稱成功。"""
     d = data_dir()
     port = proxy_port()
     pid = _read_pid(d)
@@ -391,6 +392,18 @@ def restart():
     except Exception:
         pass
     rc = ensure()
+    # re-verify round-3（DA Attack 5，HIGH）：ensure() 對自身 spawn 失敗刻意恆回 0
+    #（SessionStart 不擋 session——對「hook caller」正確），但 restart 的契約是
+    # 「結束時有 daemon 在 port 上」——新 daemon 沒上線就回 0 = silent dead port，
+    # 部署腳本看 exit code 會被騙。restart 自己驗 port；未 opt-in（ensure 靜默
+    # no-op）同樣回 1——restart 沒 restart 出東西就不該宣稱成功。
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and not port_up(port):
+        time.sleep(0.1)
+    if not port_up(port):
+        print("[claude-hot-limit] ⚠️ restart 後 port {pt} 未上線——未設定導流 env（opt-in gate）"
+              "屬預期；否則為新 daemon 啟動失敗（見上方 ensure 警告）。exit 1。".format(pt=port))
+        return 1
     # Phase 2：新 daemon 已上線；背景等舊 process drain 完（不動新 pidfile），
     # 超時且身分重查仍是我們的 → SIGKILL。
     if old_ours and pid is not None:

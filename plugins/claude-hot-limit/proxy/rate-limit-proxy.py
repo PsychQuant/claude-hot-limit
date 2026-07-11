@@ -504,9 +504,14 @@ def main():
     # 超時 → 直接返回（exit 0），殘留 daemon threads 隨 process 終結。
     # deadline 用 monotonic（verify F11）。
     #
-    # 殘餘窗（誠實記錄）：idle socket 在「快照為 idle」與「shutdown 生效」的微秒級
-    # 間隙收到新請求時，該請求會被 pre-response 切斷——client 端是 connection-reset
-    # （重試級錯誤），不是 mid-response 拋棄；與本 issue 要消滅的「回應斷頭」不同類。
+    # 殘餘窗（誠實記錄；round-3 措辭校正，DA 實測）：idle socket 在「快照為 idle」與
+    # 「shutdown 生效」的間隙收到新請求時，該請求會被切斷。client 端觀測安全：sendall
+    # 對已 shutdown 的 socket **原子性失敗**（0 byte 送出，DA 實測 217-byte header 全數
+    # 未出），client 只見乾淨 connection-reset（重試級）、不會收到殘缺 HTTP framing——
+    # 與本 issue 要消滅的「回應斷頭」不同類。但 server 端該請求可能已跑完 upstream
+    # 往返才死在 header flush → 代價是**浪費一次 upstream 呼叫**（client 重試 = 同一
+    # 邏輯請求打兩次 upstream），對 rate-limit 預算是真實成本。間隙寬度隨當下 idle
+    # 連線數放大（逐一 shutdown 的迴圈時間），非恆微秒級。
     try:
         server.server_close()
     except Exception:
