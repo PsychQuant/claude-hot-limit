@@ -39,13 +39,15 @@ def port_up(port, timeout=0.25):
 
 
 def run_launcher(subcmd, env_overrides, timeout=20):
-    """跑 launcher subprocess；環境先剝掉宿主的相關變數再套 overrides（測試隔離）。"""
+    """跑 launcher subprocess；環境先剝掉宿主的相關變數再套 overrides（測試隔離）。
+    subcmd 可為 str（單一子命令）或 list（子命令 + flags，如 ["stop", "--force"]，#27）。"""
     env = {k: v for k, v in os.environ.items()
            if not k.startswith("CLAUDE_HOT_LIMIT_")
            and not k.startswith("RATE_LIMIT_PROXY_")
            and k != "ANTHROPIC_BASE_URL"}
     env.update(env_overrides)
-    proc = subprocess.run([sys.executable, LAUNCHER, subcmd],
+    args = subcmd if isinstance(subcmd, list) else [subcmd]
+    proc = subprocess.run([sys.executable, LAUNCHER] + args,
                           capture_output=True, text=True, env=env, timeout=timeout)
     return proc.returncode, proc.stdout, proc.stderr
 
@@ -182,6 +184,113 @@ class ProxyLauncherTest(unittest.TestCase):
         finally:
             victim.kill()
             victim.wait()
+
+
+# --- #27 graceful stop / restart ---
+
+# 假 daemon：cmdline 內含 "rate-limit-proxy" 字串以通過 stop() 的身分驗證。
+FAKE_SLOW_EXIT = (
+    "# rate-limit-proxy test-fake (slow exit)\n"
+    "import signal, sys, time\n"
+    "flag = []\n"
+    "signal.signal(signal.SIGTERM, lambda *a: flag.append(time.time()))\n"
+    "t0 = time.time()\n"
+    "while time.time() - t0 < 30:\n"
+    "    time.sleep(0.1)\n"
+    "    if flag and time.time() - flag[0] >= 2.0:\n"
+    "        sys.exit(0)\n"
+)
+FAKE_IGNORE_SIGTERM = (
+    "# rate-limit-proxy test-fake (ignores SIGTERM)\n"
+    "import signal, time\n"
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "time.sleep(60)\n"
+)
+
+
+class GracefulStopTest(unittest.TestCase):
+    """#27 — stop 預設 graceful（等 daemon 真的死 + SIGKILL fallback）、--force 逃生、restart。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.data = self.tmp.name
+        self.port = free_port()
+        self.env = {
+            "CLAUDE_HOT_LIMIT_DATA": self.data,
+            "RATE_LIMIT_PROXY_PORT": str(self.port),
+        }
+        self.fake = None
+
+    def tearDown(self):
+        if self.fake is not None and self.fake.poll() is None:
+            self.fake.kill()
+            self.fake.wait()
+        run_launcher("stop", self.env)
+        self.tmp.cleanup()
+
+    def opted(self, **extra):
+        e = dict(self.env, CLAUDE_HOT_LIMIT_PROXY="1")
+        e.update(extra)
+        return e
+
+    def read_pid(self):
+        p = os.path.join(self.data, "proxy.pid")
+        return open(p).read().strip() if os.path.exists(p) else None
+
+    def _spawn_fake(self, code):
+        self.fake = subprocess.Popen([sys.executable, "-c", code])
+        with open(os.path.join(self.data, "proxy.pid"), "w") as f:
+            f.write(str(self.fake.pid))
+        return self.fake
+
+    def test_stop_waits_until_daemon_actually_dead(self):
+        fake = self._spawn_fake(FAKE_SLOW_EXIT)  # SIGTERM 後 ~2s 才退（模擬 drain 中）
+        code, out, err = run_launcher("stop", dict(self.env, RATE_LIMIT_PROXY_DRAIN_CAP="4"))
+        self.assertEqual(code, 0)
+        self.assertIsNotNone(fake.poll(),
+                             "stop 返回時 daemon 必須已死（現行 2s port-only 等待會提早返回）")
+        self.assertIsNone(self.read_pid(), "pidfile 應在確認死亡後清除")
+
+    def test_stop_escalates_sigkill_on_stuck_daemon(self):
+        fake = self._spawn_fake(FAKE_IGNORE_SIGTERM)  # SIGTERM 無效 → 必須 SIGKILL fallback
+        t0 = time.time()
+        code, out, err = run_launcher("stop", dict(self.env, RATE_LIMIT_PROXY_DRAIN_CAP="1"),
+                                      timeout=30)
+        elapsed = time.time() - t0
+        self.assertEqual(code, 0)
+        time.sleep(0.3)  # SIGKILL 生效時間
+        self.assertIsNotNone(fake.poll(), "卡死 daemon 應被 SIGKILL fallback 收掉")
+        self.assertLess(elapsed, 20, "等待窗應有界（cap+5+margin）")
+        self.assertIn("SIGKILL", out + err, "escalation 應有可見警告")
+
+    def test_stop_force_kills_immediately(self):
+        fake = self._spawn_fake(FAKE_IGNORE_SIGTERM)
+        t0 = time.time()
+        code, out, err = run_launcher(["stop", "--force"], self.env)
+        elapsed = time.time() - t0
+        self.assertEqual(code, 0)
+        time.sleep(0.3)
+        self.assertIsNotNone(fake.poll(), "--force 應立即收掉 daemon")
+        self.assertLess(elapsed, 5, "--force 不等 drain")
+
+    def test_restart_replaces_daemon(self):
+        code, out, err = run_launcher("ensure", self.opted())
+        self.assertEqual(code, 0)
+        self.assertTrue(port_up(self.port), "前置：ensure 起 daemon")
+        old_pid = self.read_pid()
+        self.assertIsNotNone(old_pid)
+
+        code, out, err = run_launcher("restart", self.opted(), timeout=30)
+        self.assertEqual(code, 0, "restart 應是合法子命令（現行 usage exit 2）: %s" % err)
+        self.assertTrue(port_up(self.port), "restart 後 port 應回到 UP")
+        new_pid = self.read_pid()
+        self.assertIsNotNone(new_pid)
+        self.assertNotEqual(new_pid, old_pid, "restart 應是新 process")
+        try:
+            os.kill(int(old_pid), 0)
+            self.fail("舊 daemon 應已死")
+        except ProcessLookupError:
+            pass
 
 
 if __name__ == "__main__":

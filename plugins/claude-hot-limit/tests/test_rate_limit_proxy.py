@@ -13,7 +13,9 @@ fail-open 行為。不 mock urllib，用真實 socket 溝通，才驗得到 stre
 import http.server
 import json
 import os
+import signal
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -1134,6 +1136,133 @@ class UnifiedHeaderFamilyTest(unittest.TestCase):
             self.assertEqual(row["rl_unified_representative_claim"], "five_hour")
         finally:
             proxy_server.shutdown()
+
+
+PROXY_SCRIPT = os.path.join(PROXY_DIR, "rate-limit-proxy.py")
+
+_DRAIN_CHUNKS = [
+    b'event: message_start\ndata: {"type":"message_start"}\n\n',
+    b'data: {"type":"content_block_delta"}\n\n',
+    b'data: {"type":"content_block_delta"}\n\n',
+    b'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":9}}\n\n',
+]
+
+
+class GracefulDrainTest(unittest.TestCase):
+    """#27 — daemon 收 SIGTERM 必須 graceful drain：拒新連線、讓 in-flight streams
+    走完（有界）、record 經既有 finally 落地，而非瞬死斷頭 + record 蒸發。
+    signal 行為 in-process harness 測不到 → 真 subprocess 黑箱。"""
+
+    def setUp(self):
+        self.mock, self.mock_url = start_mock_upstream()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state_file = os.path.join(self.tmp.name, "rate-state.jsonl")
+        self.proc = None
+
+    def tearDown(self):
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait(timeout=5)
+        self.mock.shutdown()
+        self.tmp.cleanup()
+
+    def _spawn_proxy(self, drain_cap):
+        port = free_port()
+        env = dict(os.environ)
+        env.update({
+            "RATE_LIMIT_PROXY_PORT": str(port),
+            "RATE_LIMIT_PROXY_UPSTREAM": self.mock_url,
+            "CLAUDE_HOT_LIMIT_DATA": self.tmp.name,
+            "RATE_LIMIT_PROXY_DRAIN_CAP": drain_cap,
+        })
+        self.proc = subprocess.Popen([sys.executable, PROXY_SCRIPT], env=env,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            s = socket.socket()
+            try:
+                s.settimeout(0.2)
+                s.connect(("127.0.0.1", port))
+                s.close()
+                return port
+            except OSError:
+                s.close()
+                time.sleep(0.05)
+        self.fail("proxy subprocess 未在 5s 內開 port")
+
+    @staticmethod
+    def _reader(url, out):
+        req = urllib.request.Request(url + "/v1/messages",
+                                     data=b'{"model": "claude-sonnet-5"}', method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                out["body"] = resp.read()
+            out["ok"] = True
+        except Exception as e:
+            out["err"] = repr(e)
+
+    def test_sigterm_drains_inflight_stream_and_writes_record(self):
+        MockUpstreamHandler.response_status = 200
+        MockUpstreamHandler.response_headers = {}
+        MockUpstreamHandler.sse_chunks = list(_DRAIN_CHUNKS)
+        MockUpstreamHandler.chunk_delay = 0.6  # 全流 ~2.4s
+
+        port = self._spawn_proxy(drain_cap="10")
+        out = {}
+        t = threading.Thread(target=self._reader, args=("http://127.0.0.1:%d" % port, out))
+        t.start()
+        time.sleep(1.0)  # stream 進行中
+        self.proc.send_signal(signal.SIGTERM)
+        t.join(timeout=15)
+        self.assertTrue(out.get("ok"), "in-flight stream 應完整走完，got %r" % out.get("err"))
+        self.assertEqual(out["body"], b"".join(_DRAIN_CHUNKS), "client 必須收到完整 stream")
+        self.assertEqual(self.proc.wait(timeout=15), 0, "drain 後應 clean exit(0)")
+        time.sleep(0.2)
+        rows = read_jsonl(self.state_file)
+        self.assertEqual(len(rows), 1, "record 不得蒸發（L3）")
+        self.assertEqual((rows[0].get("usage") or {}).get("output_tokens"), 9)
+        self.assertFalse(rows[0].get("truncated"), "完整走完不該標 truncated")
+
+    def test_drain_refuses_new_connections_while_completing_inflight(self):
+        MockUpstreamHandler.response_status = 200
+        MockUpstreamHandler.response_headers = {}
+        MockUpstreamHandler.sse_chunks = list(_DRAIN_CHUNKS)
+        MockUpstreamHandler.chunk_delay = 0.6
+
+        port = self._spawn_proxy(drain_cap="10")
+        out = {}
+        t = threading.Thread(target=self._reader, args=("http://127.0.0.1:%d" % port, out))
+        t.start()
+        time.sleep(1.0)
+        self.proc.send_signal(signal.SIGTERM)
+        time.sleep(0.7)  # 給 listening socket 關閉時間
+        with self.assertRaises((urllib.error.URLError, OSError),
+                               msg="drain 期間新連線應被拒"):
+            req = urllib.request.Request("http://127.0.0.1:%d/v1/messages" % port,
+                                         data=b'{"model":"x"}', method="POST")
+            urllib.request.urlopen(req, timeout=2)
+        t.join(timeout=15)
+        self.assertTrue(out.get("ok"), "既有 in-flight 仍應完整走完，got %r" % out.get("err"))
+        self.assertEqual(self.proc.wait(timeout=15), 0)
+
+    def test_drain_cap_bounds_shutdown(self):
+        MockUpstreamHandler.response_status = 200
+        MockUpstreamHandler.response_headers = {}
+        MockUpstreamHandler.sse_chunks = [b'data: {"type":"content_block_delta"}\n\n'] * 12
+        MockUpstreamHandler.chunk_delay = 0.5  # 全流 ~6s，遠超 cap=1
+
+        port = self._spawn_proxy(drain_cap="1")
+        out = {}
+        t = threading.Thread(target=self._reader, args=("http://127.0.0.1:%d" % port, out))
+        t.start()
+        time.sleep(0.8)
+        t0 = time.time()
+        self.proc.send_signal(signal.SIGTERM)
+        rc = self.proc.wait(timeout=8)
+        elapsed = time.time() - t0
+        self.assertEqual(rc, 0, "超時 fallback 也應 clean exit(0)，不是被 signal 打死")
+        self.assertLess(elapsed, 5, "drain cap=1s 應在 ~cap+margin 內退出，實測 %.1fs" % elapsed)
+        t.join(timeout=10)
 
 
 if __name__ == "__main__":

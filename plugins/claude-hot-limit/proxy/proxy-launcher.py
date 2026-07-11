@@ -217,11 +217,37 @@ def _pid_command(pid):
         return None
 
 
-def stop():
-    """SIGTERM pidfile 記錄的 daemon 並清 pidfile。冪等：無 pidfile / process 已死都安靜成功。
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+def _drain_cap():
+    """與 rate-limit-proxy 的 RATE_LIMIT_PROXY_DRAIN_CAP 共用同一 env（#27）；壞值回 120。"""
+    try:
+        v = float(os.environ.get("RATE_LIMIT_PROXY_DRAIN_CAP", "120"))
+        return v if v >= 0 else 120.0
+    except (ValueError, TypeError):
+        return 120.0
+
+
+def stop(force=False):
+    """停 pidfile 記錄的 daemon 並清 pidfile。冪等：無 pidfile / process 已死都安靜成功。
+
+    #27 graceful 語意（預設）：SIGTERM 後**等到 process 真的死**（daemon 端會 drain
+    in-flight streams，等待窗 = DRAIN_CAP + 5s，每 2s 印進度）；超時 → SIGKILL fallback
+    + 警告。`--force` → 立即 SIGKILL（逃生路徑，接受切斷並發 streams）。
+    pidfile 在**確認死亡後**才清（先刪會讓中途失敗留下無主 daemon）。
 
     身分驗證（verify findings 10/11）：pidfile 可能因 daemon 死亡 + OS PID reuse 而指向無關
-    process——SIGTERM 前先看 command line 含 rate-limit-proxy 才殺；確認是別人 → 不殺、警告、
+    process——kill 前先看 command line 含 rate-limit-proxy 才殺；確認是別人 → 不殺、警告、
     只清 stale pidfile。查不到 command（unknown，如無 ps 的平台）→ 沿用舊行為照殺（保守的
     另一面：讓 stop 在 degraded 平台仍能運作）。"""
     d = data_dir()
@@ -233,14 +259,37 @@ def stop():
             print("[claude-hot-limit] ⚠️ pidfile 的 pid {pid} 不是 rate-limit-proxy"
                   "（command: {cmd}；PID reuse？）——不 kill，僅清除 stale pidfile。".format(
                       pid=pid, cmd=cmd[:120]))
+        elif force:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            deadline = time.time() + 3.0
+            while time.time() < deadline and _pid_alive(pid):
+                time.sleep(0.05)
         else:
             try:
                 os.kill(pid, signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
                 pass
-            deadline = time.time() + 2.0
-            while time.time() < deadline and port_up(port):
-                time.sleep(0.05)
+            deadline = time.time() + _drain_cap() + 5.0
+            next_progress = time.time() + 2.0
+            while time.time() < deadline and (_pid_alive(pid) or port_up(port)):
+                if time.time() >= next_progress:
+                    print("[claude-hot-limit] graceful stop：等待 daemon drain in-flight "
+                          "streams…（pid {p}）".format(p=pid))
+                    next_progress = time.time() + 2.0
+                time.sleep(0.1)
+            if _pid_alive(pid):
+                print("[claude-hot-limit] ⚠️ daemon 未在 drain 窗內退出 → SIGKILL fallback"
+                      "（pid {p}）".format(p=pid))
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                deadline = time.time() + 3.0
+                while time.time() < deadline and _pid_alive(pid):
+                    time.sleep(0.05)
     try:
         os.remove(_pid_path(d))
     except FileNotFoundError:
@@ -248,6 +297,15 @@ def stop():
     except Exception:
         pass
     return 0
+
+
+def restart():
+    """graceful stop → ensure（#27）。dead-port 窗口最小化：port 釋放後立刻 re-spawn。
+    ensure 的 opt-in gate 照舊——未 opt-in（無導流/強制旗標）時 stop 完就結束，不硬起。"""
+    rc = stop()
+    if rc != 0:
+        return rc
+    return ensure()
 
 
 def status():
@@ -273,13 +331,16 @@ def status():
 
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "ensure"
+    flags = sys.argv[2:]
     if cmd == "ensure":
         sys.exit(ensure())
     if cmd == "stop":
-        sys.exit(stop())
+        sys.exit(stop(force=("--force" in flags)))
+    if cmd == "restart":
+        sys.exit(restart())
     if cmd == "status":
         sys.exit(status())
-    print("usage: proxy-launcher.py {ensure|stop|status}", file=sys.stderr)
+    print("usage: proxy-launcher.py {ensure|stop [--force]|restart|status}", file=sys.stderr)
     sys.exit(2)
 
 

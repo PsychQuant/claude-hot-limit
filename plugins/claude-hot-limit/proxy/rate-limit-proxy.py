@@ -22,8 +22,10 @@ HTTP response header，也管不到主迴圈自己的一般對話輪。要拿到
 import http.server
 import json
 import os
+import signal
 import socketserver
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -395,6 +397,25 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 record["truncated"] = True
             write_state_record(self._state_file(), record)
 
+    # --- in-flight 計數（#27 graceful drain 用）---
+    # BaseRequestHandler 保證 finish() 走 finally → 計數必配對遞減。
+    # in-process 測試用的 plain HTTPServer 沒有這兩個屬性 → getattr 容忍（零行為差）。
+    def setup(self):
+        super().setup()
+        lock = getattr(self.server, "inflight_lock", None)
+        if lock is not None:
+            with lock:
+                self.server.inflight += 1
+
+    def finish(self):
+        try:
+            super().finish()
+        finally:
+            lock = getattr(self.server, "inflight_lock", None)
+            if lock is not None:
+                with lock:
+                    self.server.inflight -= 1
+
     do_GET = _handle
     do_POST = _handle
     do_PUT = _handle
@@ -403,18 +424,57 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    # daemon_threads=True 刻意保留（#27）：drain 是「有界」等待，超時後殘留的
+    # 卡死 stream 不得綁架 process 退出——daemon thread 是這條上限的 backstop。
     daemon_threads = True
+
+
+def resolve_drain_cap():
+    """graceful drain 等待上限（秒）。壞值 fail-open 回預設 120。"""
+    try:
+        v = float(os.environ.get("RATE_LIMIT_PROXY_DRAIN_CAP", "120"))
+        return v if v >= 0 else 120.0
+    except (ValueError, TypeError):
+        return 120.0
 
 
 def main():
     port = int(os.environ.get("RATE_LIMIT_PROXY_PORT", DEFAULT_PORT))
     server = ThreadingHTTPServer(("127.0.0.1", port), ProxyHandler)
+    server.inflight = 0
+    server.inflight_lock = threading.Lock()
+
+    def _request_drain(signum, frame):
+        # shutdown() 會等 serve_forever 迴圈退出——在 signal handler（main thread）
+        # 直呼必死鎖（serve_forever 被 handler 暫停、無法前進）→ 丟到別的 thread。
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _request_drain)
+    signal.signal(signal.SIGINT, _request_drain)
+
     print("[rate-limit-proxy] listening on 127.0.0.1:%d, upstream=%s" % (port, resolve_upstream()),
           file=sys.stderr)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+
+    # --- graceful drain（#27）---
+    # 順序：先關 listening socket（新連線立即 refused，消除「backlog 掛住」），
+    # 再有界等待 in-flight handler threads 走完（records 經既有 per-request finally
+    # 自然落地）。超時 → 直接返回（exit 0），殘留 daemon threads 隨 process 終結。
+    try:
+        server.server_close()
+    except Exception:
+        pass
+    deadline = time.time() + resolve_drain_cap()
+    while time.time() < deadline:
+        with server.inflight_lock:
+            remaining = server.inflight
+        if remaining <= 0:
+            break
+        time.sleep(0.2)
+    print("[rate-limit-proxy] drained (inflight=%d), exiting" % server.inflight, file=sys.stderr)
 
 
 if __name__ == "__main__":
