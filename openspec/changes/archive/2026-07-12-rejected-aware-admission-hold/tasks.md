@@ -19,5 +19,5 @@
 - [x] [P] 3.1 plugins/claude-hot-limit/CLAUDE.md：「Proxy 誠實邊界」段翻新——「明確排除 Phase 2 主動排程」改寫為「v1 已含 rejected-aware hold（opt-in、有界、fail-open）；utilization 軟 delay 定案不做；序列化/佇列仍排除留 v2」+ 參數表新增兩 env + sched-off 旗標 + HOLD_CAP<DRAIN_CAP 配置張力一句
 - [x] [P] 3.2 plugins/claude-hot-limit/README.md：proxy env 表新增 `RATE_LIMIT_PROXY_SCHEDULE` / `_SCHED_HOLD_CAP` 兩列 + opt-in 說明（含「hold 期間該呼叫觀感變慢屬預期」一句）
 - [x] 3.3 plugins/claude-hot-limit/CHANGELOG.md 1.19.0 段 + 兩 manifest bump（plugin.json / marketplace.json）
-- [ ] 3.4 release：push + marketplace sync + 安裝版更新 + `proxy-launcher.py restart`（graceful，#27 紀律：pre-check 近 60s 活動）——排程 code 在 daemon 端，restart 才生效；預設關，部署後行為零改變
-- [ ] 3.5 live 驗證計畫記錄：下次真實 `rejected` 窗（水位滿時段）以 `RATE_LIMIT_PROXY_SCHEDULE=1` 開啟觀測——成功判準 = 出現 `sched_held_ms > 0` 的 record 且其 status=200（hold 把 429 換成 200 的直接證據）；寫入 issue #7 comment 作為 gating 記錄
+- [x] 3.4 release：push + marketplace sync + 安裝版更新 + `proxy-launcher.py restart`（graceful，#27 紀律：pre-check 近 60s 活動）——排程 code 在 daemon 端，restart 才生效；預設關，部署後行為零改變
+- [x] 3.5 live 驗證計畫記錄：下次真實 `rejected` 窗（水位滿時段）以 `RATE_LIMIT_PROXY_SCHEDULE=1` 開啟觀測——成功判準 = 出現 `sched_held_ms > 0` 的 record 且其 status=200（hold 把 429 換成 200 的直接證據）；寫入 issue #7 comment 作為 gating 記錄
