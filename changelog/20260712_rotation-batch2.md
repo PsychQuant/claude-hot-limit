@@ -31,3 +31,13 @@
 ## 安裝版
 
 1.17.0 → **1.18.1**；live daemon v1.18.1（PID 98748）。rate-state 首次自然歸檔預計 ~1 天內（49.9 MiB / 64 MiB cap）。
+
+## #7 Phase 2 v1 — rejected-aware admission hold（spectra apply，v1.19.0）
+
+`/spectra-discuss` → `/spectra-propose`（change `rejected-aware-admission-hold`，proposal/design/spec/tasks、analyzer 0 findings）→ `/spectra-apply` **15/15 tasks**：
+
+- **v1 定案**：rejected/429-aware 有界 hold（`5h_status=rejected` ∧ reset ≤ `SCHED_HOLD_CAP` 90s → hold 到 reset+0.5s）；**utilization 軟 delay 定案砍除**；序列化留 v2。
+- **實作**：`schedule_admission()` gate（`_handle()` urlopen 前）+ in-memory `_LAST_UNIFIED` 快照（零檔案 I/O）+ 安全三件套（預設關 / `sched-off` 旗標即時逃生 / fail-open 鐵律）+ `sched_held_ms` audit field（三寫入路徑明確 0）。
+- **TDD**：+8 tests（`AdmissionHoldTest`），RED 6F+1E → GREEN，全套件 **230 綠**。artifact 修訂一則：`1e308` 歸箝制（240）不歸壞值——hold cap 無乘法溢位類風險，`min(v,240)` 是結構性保護。
+- **部署**：v1.19.0 released + graceful restart（PID 98748 → **14072**）；排程預設關 = 行為零改變（live smoke：新 record 帶 `sched_held_ms: 0`）。
+- **Live gating（#7 close 前最後一塊）**：挑高水位時段以 `RATE_LIMIT_PROXY_SCHEDULE=1` 開啟；成功判準 = `sched_held_ms > 0` 且 `status == 200` 的 record（hold 把 429 換成 200 的直接證據）。
