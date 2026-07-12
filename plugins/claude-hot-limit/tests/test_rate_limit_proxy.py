@@ -1523,5 +1523,212 @@ class StateFileRotationTest(unittest.TestCase):
                       "rotation 失敗應印警告，stderr=%r" % captured.getvalue())
 
 
+class AdmissionHoldTest(unittest.TestCase):
+    """#7 v1 — spec「Rejected-aware admission hold」+「Admission decision audit field」。
+
+    opt-in（RATE_LIMIT_PROXY_SCHEDULE=1）時：最近快照 5h_status==rejected 且 reset 在
+    SCHED_HOLD_CAP 內 → hold 到 reset+0.5s 再轉發；其餘一律立即轉發。fail-open 鐵律。
+    record 一律帶 sched_held_ms（未 hold = 明確 0，非缺席）。
+    """
+
+    def setUp(self):
+        self.mock, self.mock_url = start_mock_upstream()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = os.path.join(self.tmp.name, "rate-state.jsonl")
+        self._env_keys = ("RATE_LIMIT_PROXY_SCHEDULE", "RATE_LIMIT_PROXY_SCHED_HOLD_CAP")
+        self._old_env = {k: os.environ.get(k) for k in self._env_keys}
+        for k in self._env_keys:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k, v in self._old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.mock.shutdown()
+        self.tmp.cleanup()
+
+    def _mock_plain_200(self, extra_headers=None):
+        MockUpstreamHandler.response_status = 200
+        h = {"Content-Type": "application/json"}
+        h.update(extra_headers or {})
+        MockUpstreamHandler.response_headers = h
+        MockUpstreamHandler.response_body = b'{"ok": true}'
+        MockUpstreamHandler.sse_chunks = None
+
+    def _post(self, proxy_url):
+        req = urllib.request.Request(proxy_url + "/v1/messages",
+                                     data=b'{"model":"claude-opus-4-8"}', method="POST")
+        return urllib.request.urlopen(req)
+
+    def test_hold_until_reset_within_cap(self):
+        # spec Example「rejected window inside cap」的縮時版（測試現實：reset ~1.6s 而非 45s，
+        # 比例語意相同：hold ≈ (reset-now)+0.5s、record 帶對應毫秒、回應照常 200）
+        os.environ["RATE_LIMIT_PROXY_SCHEDULE"] = "1"
+        reset_epoch = int(time.time() + 1.6)
+        self._mock_plain_200({
+            "anthropic-ratelimit-unified-5h-status": "rejected",
+            "anthropic-ratelimit-unified-5h-reset": str(reset_epoch),
+        })
+        proxy_server, proxy_url, rlp = start_proxy(self.mock_url, self.state)
+        try:
+            self._post(proxy_url)  # 第一發：快照尚空 → 不 hold；回應把 rejected 快照種進 daemon
+            t0 = time.time()
+            resp = self._post(proxy_url)  # 第二發：admission 看到 rejected → hold 到 reset+0.5
+            elapsed = time.time() - t0
+        finally:
+            proxy_server.shutdown()
+        self.assertEqual(resp.status, 200, "hold 結束後應照常轉發")
+        self.assertGreaterEqual(elapsed, 1.0,
+                                "rejected 窗內（reset 在 cap 內）應 hold 到 reset，實測 %.2fs" % elapsed)
+        self.assertLess(elapsed, 6.0, "hold 必須有界")
+        records = read_jsonl(self.state)
+        self.assertGreaterEqual(records[-1].get("sched_held_ms", 0), 1000,
+                                "hold 過的 record 應帶實際毫秒（audit field）")
+
+    def test_reset_beyond_cap_forwards_immediately(self):
+        # spec Scenario「Reset beyond cap forwards immediately」
+        os.environ["RATE_LIMIT_PROXY_SCHEDULE"] = "1"
+        self._mock_plain_200()
+        proxy_server, proxy_url, rlp = start_proxy(self.mock_url, self.state)
+        try:
+            rlp._LAST_UNIFIED = {"status": "rejected",
+                                 "reset": time.time() + 300,  # 遠超 cap 90
+                                 "observed_at": time.time()}
+            t0 = time.time()
+            resp = self._post(proxy_url)
+            elapsed = time.time() - t0
+        finally:
+            proxy_server.shutdown()
+        self.assertEqual(resp.status, 200)
+        self.assertLess(elapsed, 1.0, "reset 超過 cap 應立即轉發（不做超長 hold）")
+        self.assertEqual(read_jsonl(self.state)[-1].get("sched_held_ms"), 0)
+
+    def test_non_rejected_or_stale_snapshot_never_holds(self):
+        # spec Scenario「Stale or non-rejected snapshot never holds」
+        os.environ["RATE_LIMIT_PROXY_SCHEDULE"] = "1"
+        self._mock_plain_200()
+        proxy_server, proxy_url, rlp = start_proxy(self.mock_url, self.state)
+        try:
+            for snap in (
+                {"status": "allowed_warning", "reset": time.time() + 30, "observed_at": time.time()},
+                {"status": "rejected", "reset": time.time() - 5, "observed_at": time.time() - 10},
+                None,
+            ):
+                rlp._LAST_UNIFIED = snap
+                t0 = time.time()
+                self._post(proxy_url)
+                self.assertLess(time.time() - t0, 1.0,
+                                "snap=%r 不該 hold" % (snap,))
+        finally:
+            proxy_server.shutdown()
+
+    def test_disabled_by_default(self):
+        # spec Scenario「Disabled by default」——env 未設，rejected 窗也零 hold
+        self._mock_plain_200()
+        proxy_server, proxy_url, rlp = start_proxy(self.mock_url, self.state)
+        try:
+            rlp._LAST_UNIFIED = {"status": "rejected", "reset": time.time() + 2,
+                                 "observed_at": time.time()}
+            t0 = time.time()
+            resp = self._post(proxy_url)
+            elapsed = time.time() - t0
+        finally:
+            proxy_server.shutdown()
+        self.assertEqual(resp.status, 200)
+        self.assertLess(elapsed, 0.8, "未 opt-in 行為必須與 Phase 1 完全相同")
+        self.assertEqual(read_jsonl(self.state)[-1].get("sched_held_ms"), 0)
+
+    def test_sched_off_flag_escape_hatch(self):
+        # spec Scenario「File-flag escape hatch」——同一 daemon 不重啟：旗標在→不 hold；旗標除→恢復 hold
+        os.environ["RATE_LIMIT_PROXY_SCHEDULE"] = "1"
+        self._mock_plain_200()
+        flag = os.path.join(self.tmp.name, "sched-off")
+        proxy_server, proxy_url, rlp = start_proxy(self.mock_url, self.state)
+        try:
+            with open(flag, "w") as f:
+                f.write("")
+            rlp._LAST_UNIFIED = {"status": "rejected", "reset": time.time() + 2,
+                                 "observed_at": time.time()}
+            t0 = time.time()
+            self._post(proxy_url)
+            self.assertLess(time.time() - t0, 0.8, "sched-off 旗標存在時不得 hold")
+            os.remove(flag)
+            rlp._LAST_UNIFIED = {"status": "rejected", "reset": time.time() + 1.2,
+                                 "observed_at": time.time()}
+            t0 = time.time()
+            self._post(proxy_url)
+            self.assertGreaterEqual(time.time() - t0, 0.7,
+                                    "旗標移除後應恢復 hold（免重啟即時生效）")
+        finally:
+            proxy_server.shutdown()
+
+    def test_scheduling_failure_is_fail_open(self):
+        # spec Scenario「Scheduling failure is fail-open」——毒快照（reset 非數值）
+        os.environ["RATE_LIMIT_PROXY_SCHEDULE"] = "1"
+        self._mock_plain_200()
+        proxy_server, proxy_url, rlp = start_proxy(self.mock_url, self.state)
+        import io
+        captured = io.StringIO()
+        old_stderr = sys.stderr
+        sys.stderr = captured
+        try:
+            rlp._LAST_UNIFIED = {"status": "rejected", "reset": "not-a-number",
+                                 "observed_at": time.time()}
+            t0 = time.time()
+            resp = self._post(proxy_url)
+            elapsed = time.time() - t0
+            time.sleep(0.1)
+        finally:
+            sys.stderr = old_stderr
+            proxy_server.shutdown()
+        self.assertEqual(resp.status, 200, "fail-open：排程層例外不得影響轉發")
+        self.assertLess(elapsed, 0.8)
+        self.assertIn("WARNING", captured.getvalue(),
+                      "排程層例外應留 stderr 警告，got %r" % captured.getvalue())
+        self.assertEqual(read_jsonl(self.state)[-1].get("sched_held_ms"), 0)
+
+    def test_hold_cap_bad_value_discipline(self):
+        # design 決策 6：parse 失敗/非有限 → 90；≤0 → None（停用）；上限箝 240
+        rlp = _load_proxy_module()
+        # 1e308 歸「箝制」不歸「壞值」：此處無乘法溢位風險（#17 ROTATE_MB 的教訓不適用），
+        # min(v, 240) 對任何有限正值均勻生效——結構性保護勝過任意的「太大算壞值」界線
+        cases = {"abc": 90.0, "nan": 90.0, "": 90.0,
+                 "0": None, "-5": None, "999": 240.0, "1e308": 240.0, "30": 30.0}
+        for raw, expect in cases.items():
+            os.environ["RATE_LIMIT_PROXY_SCHED_HOLD_CAP"] = raw
+            self.assertEqual(rlp.resolve_sched_hold_cap(), expect,
+                             "cap=%r 應解析為 %r" % (raw, expect))
+
+    def test_all_record_paths_carry_explicit_zero(self):
+        # spec Scenario「Non-held record carries explicit zero」——buffered / HTTPError / streaming
+        # 三條寫入路徑都要有明確 0（缺席=None 會重演 #25 null-blindness 歧義）
+        proxy_server, proxy_url, rlp = start_proxy(self.mock_url, self.state)
+        try:
+            self._mock_plain_200()
+            self._post(proxy_url)  # buffered 200
+            MockUpstreamHandler.response_status = 429
+            MockUpstreamHandler.response_body = b'{"error": "rate_limited"}'
+            try:
+                self._post(proxy_url)  # HTTPError 路徑
+            except urllib.error.HTTPError:
+                pass
+            MockUpstreamHandler.response_status = 200
+            MockUpstreamHandler.response_headers = {"Content-Type": "text/event-stream"}
+            MockUpstreamHandler.sse_chunks = [
+                b'data: {"type":"message_stop"}\n\n',
+            ]
+            self._post(proxy_url).read()  # streaming 路徑
+            time.sleep(0.2)
+        finally:
+            proxy_server.shutdown()
+        records = read_jsonl(self.state)
+        self.assertGreaterEqual(len(records), 3)
+        for r in records[-3:]:
+            self.assertEqual(r.get("sched_held_ms"), 0,
+                             "未 hold 的 record 必須帶明確 0（非缺席）：%r" % r)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

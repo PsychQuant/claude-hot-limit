@@ -91,9 +91,13 @@ proxy 相關 env（與上面「設定」表的 hook env 分開）：
 | `RATE_LIMIT_PROXY_UPSTREAM` | `https://api.anthropic.com` | proxy 轉發的上游。**與 `ANTHROPIC_BASE_URL` 刻意分離**——導流改的是 Claude Code 打哪裡，proxy 自己打上游走這個變數，不會自我迴圈 |
 | `CLAUDE_HOT_LIMIT_PROXY` | — | 設 `1` 強制 opt-in（測試／預熱用；正常走 `ANTHROPIC_BASE_URL` 即可） |
 | `RATE_LIMIT_PROXY_DRAIN_CAP` | `120` | graceful drain 等待上限秒數（SIGTERM 後等 in-flight streams 走完；#27） |
+| `RATE_LIMIT_PROXY_SCHEDULE` | `—` | 設 `1` 啟用 **admission hold**（#7 Phase 2 v1）：最近觀測到帳號級 `5h_status=rejected` 且 reset 在 cap 內 → 該請求 hold 到 reset 再送 upstream（把「必然 429」換成「等一下就成功」）。**hold 期間該次呼叫觀感變慢屬預期**。預設關＝行為與純觀測完全相同。`<data_dir>/sched-off` 檔案旗標可即時停用（免重啟） |
+| `RATE_LIMIT_PROXY_SCHED_HOLD_CAP` | `90` | hold 上限秒數（float；上限箝 240、`≤0` 停用排程；reset 比 cap 遠的請求不 hold 直接放行） |
 | `RATE_LIMIT_PROXY_ROTATE_MB` | `64` | `rate-state.jsonl` 輪替門檻（float MiB；超過→歸檔成 `rate-state-<ts>.jsonl` **全保留**（校準語料，手動清理）；`≤0` 停用；#17） |
 | `RATE_LIMIT_PROXY_LOG_ROTATE_MB` | `32` | `proxy.log` spawn 前輪替門檻（float MiB；轉 `proxy.log.1` 只留一代；`≤0` 停用；#17） |
 | `RATE_LIMIT_PROXY_DEBUG_HEADERS` | — | 設 `1` 時把每筆回應的 header **名單** + `anthropic-*` header 的**值**寫進 `<data>/proxy-headers-debug.jsonl`（診斷「rate-limit header 到底在不在回應上」用；#12）。只記 `anthropic-*` 的值，Authorization/Cookie 等只留名。**預設關 → 零影響**。查完記得關 |
+
+> `RATE_LIMIT_PROXY_SCHEDULE` 是獨立於「導流」之外的第二層 opt-in：不設就是純觀測（Phase 1 行為不變），設了才會主動 hold 請求。
 
 ## 設定
 

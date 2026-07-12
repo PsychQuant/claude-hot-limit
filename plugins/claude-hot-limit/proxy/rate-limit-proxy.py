@@ -360,6 +360,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def _handle(self):
         body = self._read_request_body()
         req_model = extract_model_from_request(body)  # #4：請求 body 的 model，供 rate_state_heat 分桶
+        # #7 v1：admission gate——rejected 窗內（reset 在 cap 內）hold 到 reset 再送 upstream。
+        # 預設關（opt-in）、fail-open（任何例外回 0 直接轉發）。req_model 保留給 v2 序列化。
+        sched_held_ms = schedule_admission(os.path.dirname(self._state_file()) or ".")
         url = self._upstream().rstrip("/") + self.path
         req = urllib.request.Request(url, data=body if body else None,
                                       method=self.command, headers=self._forward_headers())
@@ -374,27 +377,31 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             status = e.code
             resp_headers = list(e.headers.items()) if e.headers else []
             resp_body = e.read()
-            self._record_state(status, resp_headers, resp_body, req_model)
+            self._record_state(status, resp_headers, resp_body, req_model, sched_held_ms)
             self._forward_buffered(status, resp_headers, resp_body)
             return
 
         content_type = dict((k.lower(), v) for k, v in resp_headers).get("content-type", "")
         if content_type.startswith("text/event-stream"):
-            self._forward_streaming(status, resp_headers, upstream_resp, req_model)
+            self._forward_streaming(status, resp_headers, upstream_resp, req_model, sched_held_ms)
         else:
             resp_body = upstream_resp.read()
-            self._record_state(status, resp_headers, resp_body, req_model)
+            self._record_state(status, resp_headers, resp_body, req_model, sched_held_ms)
             self._forward_buffered(status, resp_headers, resp_body)
 
-    def _record_state(self, status, resp_headers, resp_body, req_model=None):
+    def _record_state(self, status, resp_headers, resp_body, req_model=None, sched_held_ms=0):
         maybe_debug_dump_headers(self._state_file(), resp_headers)  # #12 opt-in 診斷（預設 no-op）
         # status（#13）：**admission-time** 非-2xx 撞牆訊號——upstream 直接回 HTTP 429/529 時，
         # status 由 HTTPError.e.code 取得、零 header 依賴（補 #12 缺口）。**涵蓋邊界（誠實）**：
         # 只捕捉 admission-time HTTP status；**不含** ① mid-stream SSE in-band error（HTTP 200 +
         # error event，status 仍 200）② transport failure（URLError，無 HTTP status，該 request
         # 不寫 record）③ client-side local throttle。也不含 remaining budget（predictive 見 #7）。
-        record = {"ts": time.time(), "model": req_model, "status": status}
-        record.update(extract_rate_limit_fields(resp_headers))
+        record = {"ts": time.time(), "model": req_model, "status": status,
+                  # #7：audit field 永遠明確寫（未 hold=0 非缺席——#25 null-blindness 教訓）
+                  "sched_held_ms": int(sched_held_ms or 0)}
+        fields = extract_rate_limit_fields(resp_headers)
+        _update_unified_snapshot(fields)  # #7：admission gate 的快照供給點
+        record.update(fields)
         record["usage"] = extract_usage_from_body(resp_body)
         write_state_record(self._state_file(), record)
 
@@ -408,7 +415,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(resp_body)
 
-    def _forward_streaming(self, status, resp_headers, upstream_resp, req_model=None):
+    def _forward_streaming(self, status, resp_headers, upstream_resp, req_model=None,
+                           sched_held_ms=0):
         """逐 byte 讀、逐 byte 轉發（HTTP chunked encoding），保證不整段 buffer 才轉發。
 
         側路（不影響轉發時序）累積每個 SSE event 的 usage 欄位；串流結束（EOF）後才把
@@ -465,8 +473,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             #（#25 burn-rate）辨識。寫入自身 fail-open（write_state_record 已吞例外），絕不遮蔽原始例外。
             maybe_debug_dump_headers(self._state_file(), resp_headers)  # #12 opt-in 診斷（streaming 路徑）
             maybe_debug_dump_sse_sample(self._state_file(), resp_headers, sample_head)  # #26 歸因
-            record = {"ts": time.time(), "model": req_model, "status": status}  # status（#13）：同 _record_state
-            record.update(extract_rate_limit_fields(resp_headers))
+            record = {"ts": time.time(), "model": req_model, "status": status,  # status（#13）：同 _record_state
+                      "sched_held_ms": int(sched_held_ms or 0)}  # #7：audit field（明確 0 非缺席）
+            fields = extract_rate_limit_fields(resp_headers)
+            _update_unified_snapshot(fields)  # #7：streaming 路徑同樣供給快照
+            record.update(fields)
             record["usage"] = usage_acc or None
             if not completed:
                 record["truncated"] = True
@@ -525,6 +536,81 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     # daemon_threads=True 刻意保留（#27）：drain 是「有界」等待，超時後殘留的
     # 卡死 stream 不得綁架 process 退出——daemon thread 是這條上限的 backstop。
     daemon_threads = True
+
+
+def resolve_sched_hold_cap():
+    """#7 v1：admission hold 上限秒數；None = 排程停用。
+
+    `RATE_LIMIT_PROXY_SCHED_HOLD_CAP` float 秒，預設 90、上限箝 240（hold 超過 4 分鐘
+    無正當場景，且必須 < 常見 client timeout）。壞值紀律比照 ROTATE_MB（#17 F1）：
+    parse 失敗 / 非有限 → 預設；≤0 → 停用。
+    """
+    default_s = 90.0
+    try:
+        v = float(os.environ.get("RATE_LIMIT_PROXY_SCHED_HOLD_CAP", default_s))
+    except (ValueError, TypeError):
+        v = default_s
+    if v != v or v in (float("inf"), float("-inf")):
+        v = default_s
+    if v <= 0:
+        return None
+    return min(v, 240.0)
+
+
+# #7 v1：帳號級 unified 快照（單一 dict 引用替換 = CPython 原子；讀到前一瞬舊值無害——
+# 排程是 advisory 行為）。不重讀 rate-state.jsonl：零 I/O、不與 #17 rotation 稀薄窗交互。
+_LAST_UNIFIED = None
+_SCHED_WARNED = False  # fail-open 警告一次性節流（daemon 生涯一則，不刷 log）
+
+
+def _update_unified_snapshot(fields):
+    """record 寫入點順手刷新快照。訊號寧缺勿假：status 缺席就不更新（不自造猜測）。"""
+    global _LAST_UNIFIED
+    try:
+        status = fields.get("rl_unified_5h_status")
+        if status is not None:
+            _LAST_UNIFIED = {"status": str(status),
+                             "reset": fields.get("rl_unified_5h_reset"),
+                             "observed_at": time.time()}
+    except Exception:
+        pass  # 快照更新失敗不影響 record 寫入
+
+
+def schedule_admission(flag_dir):
+    """#7 v1：rejected-aware 有界 hold。回傳實際 hold 毫秒（int；未 hold = 0）。
+
+    判準（全部成立才 hold）：env opt-in ∧ sched-off 旗標不存在 ∧ 快照 status=="rejected"
+    ∧ now < reset ∧ reset-now ≤ cap → sleep 到 reset+0.5s 後照常轉發。reset 超過 cap →
+    立即轉發（誠實邊界：不超長 hold 綁架流量）。fail-open 鐵律：任何例外 → 回 0 直接轉發。
+    """
+    global _SCHED_WARNED
+    try:
+        if os.environ.get("RATE_LIMIT_PROXY_SCHEDULE") != "1":
+            return 0
+        cap = resolve_sched_hold_cap()
+        if cap is None:
+            return 0
+        if os.path.exists(os.path.join(flag_dir, "sched-off")):
+            return 0  # 檔案旗標即時逃生（每 admission 一個 stat，免重啟）
+        snap = _LAST_UNIFIED
+        if not snap or snap.get("status") != "rejected":
+            return 0
+        now = time.time()
+        reset = float(snap.get("reset"))  # None/非數值 → 例外 → fail-open
+        if not (now < reset):
+            return 0  # 快照過期（reset 已到）→ 自然失效，無需清理
+        wait = reset - now
+        if wait > cap:
+            return 0
+        t0 = time.monotonic()
+        time.sleep(wait + 0.5)  # +0.5s 緩衝錯開 reset 邊界
+        return int((time.monotonic() - t0) * 1000)
+    except Exception as e:
+        if not _SCHED_WARNED:
+            _SCHED_WARNED = True
+            print("[rate-limit-proxy] WARNING: schedule_admission failed (fail-open, "
+                  "forwarding immediately): %s" % e, file=sys.stderr)
+        return 0
 
 
 def resolve_drain_cap():

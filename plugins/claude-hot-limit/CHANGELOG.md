@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.19.0
+
+- **feat（rejected-aware admission hold，#7 Phase 2 v1）**：proxy 從純觀測跨出第一步主動干預——**opt-in** admission gate（`RATE_LIMIT_PROXY_SCHEDULE=1`）：`_handle()` 送 upstream 前讀 in-memory 帳號級快照 `_LAST_UNIFIED`（每筆 response 的 `rl_unified_5h_*` 順手更新，零檔案 I/O、不與 #17 rotation 交互），`5h_status=rejected` ∧ reset 在 `RATE_LIMIT_PROXY_SCHED_HOLD_CAP`（float 秒，預設 **90**、上限箝 **240**、≤0 停用、壞值回預設）內 → **hold 到 reset+0.5s 再轉發**（把「必然 429」換成「等一下就 200」，消 retry storm、省 upstream 浪費）；reset 更遠 → 立即轉發（不超長 hold 綁架流量）。
+- **安全契約**：預設關（未 opt-in 行為與 Phase 1 完全相同）；`<data_dir>/sched-off` 檔案旗標即時逃生（每 admission 一個 stat、免重啟）；**fail-open 鐵律**（排程層任何例外 → 直接轉發 + 一次性 stderr 警告）；快照訊號寧缺勿假（status 缺席不自造猜測）。
+- **audit field**：每筆 record 新增 `sched_held_ms`（int；未 hold **明確 0** 非缺席——#25 null-blindness 教訓），三條寫入路徑（buffered / HTTPError / streaming）全帶——供事後校準「hold 是否真把 429 換成 200」。
+- **定案不做（discuss 2026-07-12）**：utilization-threshold 軟 delay（delay 改變不了撞牆結局、UX 成本真實、告知已歸 #25 nudge）；同桶序列化/佇列留 v2（唯一治 burst 的手段，但公平性/drain 交互屬最重審議）。
+- **配置張力（明文）**：HOLD_CAP(90) < DRAIN_CAP(120)——hold 中請求計為 in-flight、graceful drain 會等；調 HOLD_CAP ≥ DRAIN_CAP 時 drain 超時由 `daemon_threads=True` 兜底。
+- **test（+8，全套件 230 綠）**：`AdmissionHoldTest`——hold 觸發（實測 elapsed + `sched_held_ms` 毫秒審計）/ reset 超 cap 立即轉發 / 非 rejected・過期快照・無快照三態不 hold / 預設關零行為改變 / sched-off 旗標建立→生效・刪除→恢復（同 daemon 免重啟）/ fail-open（毒快照 → 200 + WARNING + 0）/ cap 壞值紀律（含 1e308 歸箝制不歸壞值——此處無乘法溢位類風險，min(v,240) 對任何有限正值均勻生效）/ 三寫入路徑明確 0。
+
 ## 1.18.1
 
 - **verify 輪硬化（#17，6-AI：5×sonnet + Codex xhigh，aggregate FAIL → 全修）**：
