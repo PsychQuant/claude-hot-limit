@@ -1,5 +1,7 @@
 # claude-hot-limit
 
+**繁體中文** | [English](./README.en.md) | [日本語](./README.ja.md)
+
 > 致敬 T.M.Revolution [《HOT LIMIT》](https://www.youtube.com/watch?v=vBmU5v2EyxM)——一個防 fan-out 暴衝撞上限的 Claude Code plugin。（[命名由來 →](#-命名由來--hot-limit)）
 > 這個 repo 同時是 **plugin 本體** 與 **單一 plugin 的 marketplace**。
 
@@ -53,11 +55,7 @@ claude --plugin-dir ./plugins/claude-hot-limit
 
 ## 🥁 命名由來 — HOT LIMIT
 
-**EN** — Named after T.M.Revolution's 1998 classic. In July 2026 — 28 years later — Takanori Nishikawa, now 55, walked onto THE FIRST TAKE in *that* outfit and nailed it in one take: 10M views in 3 days, the fastest in the channel's history. All these years on, the man remains unshaken. This plugin guards a different kind of hot limit, but the spirit is the same: run hot, don't melt down.
-
-**中文** — 名字致敬 T.M.Revolution 1998 年的《HOT LIMIT》。2026 年 7 月——28 年後——55 歲的西川貴教穿著當年 MV 的同款戰衣登上 THE FIRST TAKE 一鏡到底，3 天破千萬觀看、創頻道史上最速紀錄。隔了這麼多年，他還是屹立不搖。本 plugin 守的是另一種 hot limit，精神相通：全力燃燒，但不燒穿。
-
-**日本語** — 名前の由来は T.M.Revolution の 1998 年の名曲「HOT LIMIT」。2026 年 7 月——あれから 28 年——55 歳の西川貴教が"あの衣装"のまま THE FIRST TAKE に登場し、一発撮りで歌い切った（3 日で 1000 万再生、チャンネル史上最速）。何年経っても、彼は揺るがない。
+名字致敬 T.M.Revolution 1998 年的《HOT LIMIT》。2026 年 7 月——28 年後——55 歲的西川貴教穿著當年 MV 的同款戰衣登上 THE FIRST TAKE 一鏡到底，3 天破千萬觀看、創頻道史上最速紀錄。隔了這麼多年，他還是屹立不搖。本 plugin 守的是另一種 hot limit，精神相通：全力燃燒，但不燒穿。
 
 > 🎵 **YO! SAY, CLAUDE が胸を刺激する** <sub>（原曲：「夏が胸を刺激する」）</sub>
 
