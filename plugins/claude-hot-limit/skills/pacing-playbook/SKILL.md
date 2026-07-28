@@ -106,6 +106,37 @@ export CLAUDE_HOT_LIMIT_OFF=1                          # 全域停用
 touch ~/.cache/claude-hot-limit/disabled              # 或檔案旗標停用（帳號級帳本）
 ```
 
+## Hook 照不到的另一種燒法：Stop hook 空轉
+
+> **這一節不是守衛，是知識。** pacing-guard 攔的是 `Workflow`/`Agent` 的**啟動**；下面講的空轉發生在完全不同的生命週期點（turn 結束時），**本 plugin 不會攔它**。別把這節當成「已經有保護」。
+
+`/goal` 之類的功能會裝一個 session-scoped **Stop hook**：每輪結束時檢查完成條件，未滿足就擋住、要求繼續。條件若**根本達不到**，就變成每輪擋一次——而**每一次擋都是一個完整的 model turn**（重送整個 context ＋ 產出一則回覆）。使用者在撞到上限之前看不到任何「這在空轉」的訊號。
+
+達到上限時 harness 才會介入：
+
+```
+A hook blocked the turn from ending N consecutive times — overriding and ending turn.
+For Stop/SubagentStop hooks, check stop_hook_active in the input and return success
+while it's true. Set CLAUDE_CODE_STOP_HOOK_BLOCK_CAP to raise this limit.
+```
+
+### 判準：條件是否依賴使用者本人的動作
+
+這是唯一要記的分界。
+
+| 條件類型 | 例子 | 該怎麼辦 |
+|---|---|---|
+| **助理可達成，但需多輪迭代** | 「跑到測試全過」「重構到 lint 乾淨」 | 正常用 `/goal`。預設上限若不夠，這才是調高 `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP` 的正當理由 |
+| **依賴使用者本人的動作** | 登入、輸入帳密、實體操作、等第三方回信 | 用 `/goal clear` 收掉。助理再多輪也達不成，留著只是空轉 |
+
+**調高上限通常不是解法。** 那個上限是安全閥——它今晚做的事就是把一個達不到的目標停下來。條件本來就達不到時，調高只會讓空轉更久、更貴。
+
+### 寫 hook 的人：讀 `stop_hook_active`
+
+harness 訊息把這條列在第一位是有道理的——它是唯一能在**不放棄目標**的前提下避免空轉的做法。Stop / SubagentStop hook 應讀 input 的 `stop_hook_active`，為 true 時直接回成功，讓該輪正常結束。
+
+> **關於 `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP` 的預設值**：本文**不列**具體數字。該變數在官方文檔（`/docs/en/env-vars`、`/docs/en/hooks`）的可讀範圍內查不到，唯一來源是 harness 的執行期訊息。要用實際數字前請自行以當下的 harness 訊息或官方文檔為準——把推測寫成事實，正是這份 playbook 想避免的那種浪費。
+
 ## 決策檢查表(動手前)
 
 - [ ] 只是查 1-3 個確定事實嗎？→ 用 1-2 個 `WebSearch`/`WebFetch`,別啟動 deep-research / fan-out workflow(見「工具選擇 gate」)。
@@ -115,3 +146,4 @@ touch ~/.cache/claude-hot-limit/disabled              # 或檔案旗標停用（
 - [ ] 有沒有 idempotent guard？沒有 → 先加，否則重跑全是重工。
 - [ ] 真要 fan-out → 並發壓到 3-4，先 probe 再 commit 整批。
 - [ ] 要 fan-out 的 subagent，我 pin dispatch model 了嗎？寬 fan-out → `agent(..., {model:'sonnet'})`（別讓它繼承 session 的貴 model；Fable 5 session 更是別開 Workflow）。
+- [ ] 要設 `/goal` 的話——它的完成條件**只靠助理**達得到嗎？若需要我本人登入 / 授權 / 實體操作，改用別的方式追蹤，別讓 Stop hook 每輪空轉一次（見「Hook 照不到的另一種燒法」）。
