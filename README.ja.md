@@ -18,6 +18,18 @@ Claude Code が **agents や workflows** を起動する際、連発バースト
 
 > プラグインの完全な挙動表とすべてのパラメータは [`plugins/claude-hot-limit/README.md`](./plugins/claude-hot-limit/README.md) を参照。
 
+### 🛑 usage 水位 limiter（任意 · 既定はオフ）
+
+壁に当たるのは**事後**のシグナルです。limiter は API が返すアカウント級の **5 時間枠 utilization** を
+事前シグナルとして使います：プラン別のしきい値（Max 5x → 0.90、Max 20x → 0.95、`claudeMaxTier` から
+自動検出）に達すると、proxy が**ラッチを作成してすべての API トラフィックを保持**し、同時に
+pacing-guard がツール呼び出しをブロックして理由を表示します。
+
+- **opt-in は 2 ステップ**：まず `ANTHROPIC_BASE_URL` の転送設定（上記）、次に `RATE_LIMIT_PROXY_LIMITER=1`。未設定なら挙動は一切変わりません。
+- **2 つのフラグファイルは意味が正反対——消し間違えに注意**：`<data_dir>/limiter-tripped` は**ラッチ本体**（消す＝作業再開、保護は有効なまま）、`<data_dir>/limiter-off` は**機能全体の無効化**（消す＝保護が戻る）。
+- **無人の長時間実行は人が戻るまでラッチされたまま——これは仕様であり、ハングではありません。** limiter の目的は「自分では間に合わない一時停止を機械が代わりに行う」ことなので、`/loop` やスケジュールジョブは停止し、誰かがラッチファイルを削除するのを待ちます。
+
+
 ## インストール
 
 ```shell

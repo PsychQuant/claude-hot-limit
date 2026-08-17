@@ -655,6 +655,30 @@ def main():
     if os.path.exists(os.path.join(data_dir, "disabled")):
         allow_silent()
 
+    # --- #33 limiter 閂鎖：guard 是閂鎖的**讀取端**，不是門檻的擁有者 ---
+    # 為什麼 guard 要管這件事：proxy 在 HTTP 路徑上，能做的只有延遲或回錯誤，**無法把訊息
+    # 送到使用者眼前**。閂鎖檔是唯一能解釋「為什麼停住、怎麼恢復」的載體，而 hook 是唯一
+    # 讀得到它又講得出話的位置。
+    # 單一真相紀律：這裡**只**讀檔案存在與內容，絕不解析 tier / 門檻 / utilization——那些
+    # 全在 proxy。兩處各自解析會漂移成互相矛盾的兩個真相（見 .claude/rules/per-bucket-settings.md）。
+    # 位置：在 disabled 之後（全域 off 位階更高）、override 檔讀取之前（FIFO block 風險同理）。
+    # 檔名與 proxy 的 LIMITER_LATCH_FILENAME 對應（跨 process，無法共用常數）。
+    latch_body = None
+    try:
+        latch_path = os.path.join(data_dir, "limiter-tripped")
+        if os.path.isfile(latch_path):
+            with open(latch_path) as f:
+                latch_body = f.read(2048)  # bounded read，比照既有 override 檔紀律
+    except Exception:
+        latch_body = None  # fail-open：可見度層不得成為新的失敗點
+    if latch_body:
+        deny(
+            "[claude-hot-limit] limiter 閂鎖中——帳號級 5h 水位已達門檻，proxy 正在持住所有 "
+            "API 流量。這是你事先設定的保護，不是當機。",
+            latch_body.strip() + "\n\n"
+            "（本訊息由 pacing-guard 讀取閂鎖檔顯示；門檻與閂鎖狀態由 rate-limit-proxy 擁有。）",
+        )
+
     # --- MAX / MIN_GAP：檔案旗標優先（#3，需要 data_dir 已解析，故在此讀）---
     # `echo 5 > <data_dir>/max-override` 立即對所有並發 session 生效，不必重開；
     # 刪掉檔案即回到 env var / code default。

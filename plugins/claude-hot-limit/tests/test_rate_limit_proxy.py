@@ -11,6 +11,7 @@ fail-open 行為。不 mock urllib，用真實 socket 溝通，才驗得到 stre
     python3 tests/test_rate_limit_proxy.py
 """
 import http.server
+import io
 import json
 import os
 import signal
@@ -1729,6 +1730,453 @@ class AdmissionHoldTest(unittest.TestCase):
             self.assertEqual(r.get("sched_held_ms"), 0,
                              "未 hold 的 record 必須帶明確 0（非缺席）：%r" % r)
 
+
+class PlanTierDetectionTest(unittest.TestCase):
+    """spec「Plan-tier threshold resolution」的偵測層 — resolve_plan_tier()。
+
+    五條失敗路徑一律回 None（未判定）而非拋例外，且**絕不**把設定檔其餘內容
+    帶進回傳值、warning 或任何輸出（該檔含本機路徑，屬敏感資料）。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cfg = os.path.join(self.tmp.name, "claude.json")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write(self, obj):
+        with open(self.cfg, "w") as f:
+            f.write(obj if isinstance(obj, str) else json.dumps(obj))
+
+    def _resolve(self):
+        rlp = _load_proxy_module()
+        return rlp.resolve_plan_tier(self.cfg)
+
+    def test_known_tiers_detected(self):
+        for tier in ("5x", "20x"):
+            self._write({"claudeMaxTier": tier})
+            self.assertEqual(self._resolve(), tier,
+                             "已知 tier %r 應被偵測到" % tier)
+
+    def test_absent_file_is_undetermined(self):
+        self.assertIsNone(self._resolve(), "設定檔缺席應回 None，不得拋例外")
+
+    def test_unreadable_file_is_undetermined(self):
+        self._write({"claudeMaxTier": "5x"})
+        os.chmod(self.cfg, 0o000)
+        try:
+            self.assertIsNone(self._resolve(), "不可讀應回 None，不得拋例外")
+        finally:
+            os.chmod(self.cfg, 0o600)
+
+    def test_malformed_json_is_undetermined(self):
+        self._write("{not json at all")
+        self.assertIsNone(self._resolve(), "格式異常應回 None，不得拋例外")
+
+    def test_missing_key_is_undetermined(self):
+        self._write({"someOtherKey": "value"})
+        self.assertIsNone(self._resolve(), "缺 claudeMaxTier 鍵應回 None")
+
+    def test_unrecognised_value_is_undetermined(self):
+        for bad in ("7x", "", "  ", "MAX", 5, None, [], {}):
+            self._write({"claudeMaxTier": bad})
+            self.assertIsNone(self._resolve(),
+                              "不認得的值 %r 應回 None（未判定）" % (bad,))
+
+    def test_other_config_content_never_leaks(self):
+        """隱私鐵律：只讀 claudeMaxTier，其餘內容不得進入回傳值或 stderr。"""
+        secret = "SENTINEL-projects-path-must-not-leak"
+        self._write({"claudeMaxTier": "5x", "projects": {secret: {"x": 1}},
+                     "oauthAccount": {"emailAddress": secret}})
+        captured = io.StringIO()
+        old_stderr = sys.stderr
+        sys.stderr = captured
+        try:
+            got = self._resolve()
+        finally:
+            sys.stderr = old_stderr
+        self.assertEqual(got, "5x")
+        self.assertNotIn(secret, captured.getvalue(),
+                         "設定檔其餘內容不得出現在 stderr")
+        self.assertNotIn(secret, repr(got),
+                         "設定檔其餘內容不得出現在回傳值")
+
+    def test_malformed_file_warning_omits_content(self):
+        """格式異常時可以警告，但警告內容不得回貼檔案內文。"""
+        secret = "SENTINEL-malformed-body-must-not-leak"
+        self._write("{broken " + secret)
+        captured = io.StringIO()
+        old_stderr = sys.stderr
+        sys.stderr = captured
+        try:
+            self.assertIsNone(self._resolve())
+        finally:
+            sys.stderr = old_stderr
+        self.assertNotIn(secret, captured.getvalue(),
+                         "警告訊息不得包含設定檔內文，stderr=%r" % captured.getvalue())
+
+
+class LimiterThresholdResolutionTest(unittest.TestCase):
+    """spec「Plan-tier threshold resolution」— tier-to-threshold Example 表四列 + 覆寫鏈。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        self._env = os.environ.get("RATE_LIMIT_PROXY_LIMITER_THRESHOLD")
+        os.environ.pop("RATE_LIMIT_PROXY_LIMITER_THRESHOLD", None)
+
+    def tearDown(self):
+        if self._env is None:
+            os.environ.pop("RATE_LIMIT_PROXY_LIMITER_THRESHOLD", None)
+        else:
+            os.environ["RATE_LIMIT_PROXY_LIMITER_THRESHOLD"] = self._env
+        self.tmp.cleanup()
+
+    def _resolve(self, tier):
+        return _load_proxy_module().resolve_limiter_threshold(self.dir, tier)
+
+    def test_example_table_rows(self):
+        """spec Example 表逐列（不自行發明額外值——表就是議定規格）。"""
+        rlp = _load_proxy_module()
+        default = rlp._LIMITER_DEFAULT_THRESHOLD
+        for tier, expect, note in (("5x", 0.90, "default for this tier"),
+                                   ("20x", 0.95, "default for this tier"),
+                                   ("7x", default, "unrecognised tier, fail open"),
+                                   (None, default, "key missing from configuration file")):
+            self.assertAlmostEqual(self._resolve(tier), expect, places=6,
+                                   msg="tier=%r（%s）門檻應為 %r" % (tier, note, expect))
+
+    def test_conservative_default_is_the_lower_tier(self):
+        """未判定時取較低門檻：早停可逆，漏停不可逆。"""
+        rlp = _load_proxy_module()
+        self.assertEqual(rlp._LIMITER_DEFAULT_THRESHOLD, 0.90)
+
+    def test_file_override_wins_over_tier_default(self):
+        with open(os.path.join(self.dir, "limiter-20x"), "w") as f:
+            f.write("0.5\n")
+        self.assertAlmostEqual(self._resolve("20x"), 0.5, places=6)
+
+    def test_env_override_used_when_no_file(self):
+        os.environ["RATE_LIMIT_PROXY_LIMITER_THRESHOLD"] = "0.42"
+        self.assertAlmostEqual(self._resolve("5x"), 0.42, places=6)
+
+    def test_bad_override_falls_back_to_tier_default(self):
+        for bad in ("abc", "", "0", "-0.5", "1.5", "nan", "inf", "-inf"):
+            with open(os.path.join(self.dir, "limiter-5x"), "w") as f:
+                f.write(bad)
+            self.assertAlmostEqual(self._resolve("5x"), 0.90, places=6,
+                                   msg="壞值 %r 應落回 tier 預設 0.90" % bad)
+
+    def test_boundary_one_is_accepted(self):
+        with open(os.path.join(self.dir, "limiter-5x"), "w") as f:
+            f.write("1.0")
+        self.assertAlmostEqual(self._resolve("5x"), 1.0, places=6,
+                               msg="1.0 在 (0, 1] 內，應被接受")
+
+
+class LimiterLatchTest(unittest.TestCase):
+    """spec「Utilization-threshold admission latch」— 觸發邊界、opt-in／逃生、閂鎖語意。
+
+    單元層直接餵 `_LAST_UNIFIED` 快照，才驗得到 0.899/0.900 這種邊界；hold cap 設極小
+    值讓測試不真的睡。
+    """
+
+    ENV_KEYS = ("RATE_LIMIT_PROXY_LIMITER", "RATE_LIMIT_PROXY_LIMITER_HOLD_CAP",
+                "RATE_LIMIT_PROXY_LIMITER_THRESHOLD")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        self._old = {k: os.environ.get(k) for k in self.ENV_KEYS}
+        for k in self.ENV_KEYS:
+            os.environ.pop(k, None)
+        os.environ["RATE_LIMIT_PROXY_LIMITER"] = "1"
+        os.environ["RATE_LIMIT_PROXY_LIMITER_HOLD_CAP"] = "0.01"  # 不真睡
+        self.rlp = _load_proxy_module()
+        self.latch = os.path.join(self.dir, "limiter-tripped")
+        self.offflag = os.path.join(self.dir, "limiter-off")
+
+    def tearDown(self):
+        for k, v in self._old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.tmp.cleanup()
+
+    def _snap(self, util_5h=None, util_7d=None):
+        """建構**真實**的 _LAST_UNIFIED 窄投影形狀（不是原始 header 欄位名）。
+
+        用原始欄位名捏快照會讓單元測試綠、真實路徑永不觸發——#33 實作時正是這樣被
+        整合測試抓到的。7d 值刻意不放進快照：投影本來就只帶 5h，這也是「觸發訊號
+        只取 5h」在資料結構層的體現。
+        """
+        self.rlp._LAST_UNIFIED = {"status": "allowed", "reset": None,
+                                  "utilization": util_5h,
+                                  "observed_at": time.time()}
+
+    def _admit(self, tier="5x"):
+        return self.rlp.limiter_admission(self.dir, tier=tier)
+
+    # --- 觸發邊界（門檻 0.90）---
+
+    def test_below_threshold_does_not_trip(self):
+        self._snap(util_5h=0.899)
+        self.assertEqual(self._admit(), 0, "0.899 < 0.90 不應閂鎖")
+        self.assertFalse(os.path.exists(self.latch), "不應建立閂鎖檔")
+
+    def test_exactly_at_threshold_trips(self):
+        self._snap(util_5h=0.900)
+        self.assertGreater(self._admit(), 0, "0.900 達門檻應閂鎖並持住")
+        self.assertTrue(os.path.exists(self.latch), "應建立閂鎖檔")
+
+    def test_above_threshold_trips(self):
+        self._snap(util_5h=0.910)
+        self.assertGreater(self._admit(), 0, "0.910 > 0.90 應閂鎖並持住")
+
+    def test_seven_day_window_never_trips(self):
+        """觸發訊號只取 5 小時窗——7 天窗達標不得閂鎖。"""
+        self._snap(util_5h=0.10, util_7d=0.99)
+        self.assertEqual(self._admit(), 0, "7d 達標但 5h 低，不應閂鎖")
+        self.assertFalse(os.path.exists(self.latch))
+
+    def test_missing_utilization_does_not_trip(self):
+        self._snap(util_5h=None)
+        self.assertEqual(self._admit(), 0, "無 5h 水位資料不應閂鎖（fail-open）")
+
+    # --- opt-in / 逃生 ---
+
+    def test_disabled_by_default(self):
+        os.environ.pop("RATE_LIMIT_PROXY_LIMITER", None)
+        rlp = _load_proxy_module()
+        rlp._LAST_UNIFIED = {"status": "allowed", "utilization": 0.99,
+                             "reset": None, "observed_at": time.time()}
+        self.assertEqual(rlp.limiter_admission(self.dir, tier="5x"), 0,
+                         "未 opt-in 時行為與現況相同：不閂鎖、不持住")
+        self.assertFalse(os.path.exists(self.latch), "未 opt-in 不得建立閂鎖檔")
+
+    def test_off_flag_suppresses(self):
+        open(self.offflag, "w").close()
+        self._snap(util_5h=0.99)
+        self.assertEqual(self._admit(), 0, "limiter-off 存在應即時停用")
+        self.assertFalse(os.path.exists(self.latch))
+
+    def test_latch_creation_failure_fails_open(self):
+        real_open = self.rlp.io.open if hasattr(self.rlp, "io") else open
+
+        def boom(*a, **k):
+            raise OSError("simulated latch write failure")
+
+        self._snap(util_5h=0.99)
+        captured = io.StringIO()
+        old_stderr, old_writer = sys.stderr, self.rlp._write_latch_file
+        sys.stderr = captured
+        self.rlp._write_latch_file = boom
+        try:
+            self.assertEqual(self._admit(), 0, "閂鎖檔寫不出來必須 fail-open 立即轉發")
+        finally:
+            sys.stderr = old_stderr
+            self.rlp._write_latch_file = old_writer
+        self.assertIn("WARNING", captured.getvalue())
+
+    # --- 閂鎖語意（持滿上限後轉發，只能人工解除）---
+
+    def test_every_admission_holds_while_latched(self):
+        self._snap(util_5h=0.99)
+        first = self._admit()
+        self.assertGreater(first, 0)
+        for _ in range(3):
+            self.assertGreater(self._admit(), 0, "閂鎖期間每個 admission 都要持住")
+
+    def test_latch_persists_below_threshold(self):
+        self._snap(util_5h=0.99)
+        self._admit()
+        self._snap(util_5h=0.10)  # 水位回落
+        self.assertGreater(self._admit(), 0, "水位回落不解除閂鎖——只有刪檔才解除")
+
+    def test_deleting_latch_restores_forwarding(self):
+        self._snap(util_5h=0.99)
+        self._admit()
+        os.unlink(self.latch)
+        self._snap(util_5h=0.10)
+        self.assertEqual(self._admit(), 0, "刪除閂鎖檔後下一個請求應立即轉發")
+
+    def test_latch_survives_module_reload(self):
+        """閂鎖是檔案狀態，daemon 重啟（等同重新載入模組）不解除。"""
+        self._snap(util_5h=0.99)
+        self._admit()
+        fresh = _load_proxy_module()
+        fresh._LAST_UNIFIED = {"status": "allowed", "utilization": 0.10,
+                               "reset": None, "observed_at": time.time()}
+        self.assertGreater(fresh.limiter_admission(self.dir, tier="5x"), 0,
+                           "重新載入後閂鎖仍在")
+
+
+class LatchStateFileContractTest(unittest.TestCase):
+    """spec「Latch state file contract」— 五項必備資訊 + 兩個旗標檔語意分離。"""
+
+    ENV_KEYS = ("RATE_LIMIT_PROXY_LIMITER", "RATE_LIMIT_PROXY_LIMITER_HOLD_CAP",
+                "RATE_LIMIT_PROXY_LIMITER_THRESHOLD")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        self._old = {k: os.environ.get(k) for k in self.ENV_KEYS}
+        os.environ["RATE_LIMIT_PROXY_LIMITER"] = "1"
+        os.environ["RATE_LIMIT_PROXY_LIMITER_HOLD_CAP"] = "0.01"
+        os.environ.pop("RATE_LIMIT_PROXY_LIMITER_THRESHOLD", None)
+        self.rlp = _load_proxy_module()
+        self.latch = os.path.join(self.dir, self.rlp.LIMITER_LATCH_FILENAME)
+        self.offflag = os.path.join(self.dir, self.rlp.LIMITER_OFF_FILENAME)
+
+    def tearDown(self):
+        for k, v in self._old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.tmp.cleanup()
+
+    def _trip(self, util=0.93, tier="5x"):
+        self.rlp._LAST_UNIFIED = {"status": "allowed", "utilization": util,
+                                  "reset": None, "observed_at": time.time()}
+        return self.rlp.limiter_admission(self.dir, tier=tier)
+
+    def test_latch_file_records_all_five_items(self):
+        self._trip(util=0.9321, tier="5x")
+        with open(self.latch) as f:
+            body = f.read()
+        self.assertRegex(body, r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}",
+                         "① 觸發時間")
+        self.assertIn("0.9321", body, "② 當時 utilization")
+        self.assertIn("0.9000", body, "③ 當時門檻")
+        self.assertIn("5x", body, "④ 偵測到的 tier")
+        self.assertIn(self.rlp.LIMITER_LATCH_FILENAME, body, "⑤ 解除方式須指名該檔")
+        self.assertTrue(any(w in body for w in ("刪除", "delete")),
+                        "⑤ 解除方式須說明是「刪除」，body=%r" % body)
+
+    def test_latch_file_names_undetermined_tier_explicitly(self):
+        self._trip(tier=None)
+        with open(self.latch) as f:
+            body = f.read()
+        self.assertIn("undetermined", body,
+                      "tier 未判定時必須明說，不得留空讓人以為偵測成功")
+
+    def test_latch_file_warns_about_the_other_flag(self):
+        """兩個旗標只差一個詞，刪錯的後果完全不同——檔案本身必須警告。"""
+        self._trip()
+        with open(self.latch) as f:
+            body = f.read()
+        self.assertIn(self.rlp.LIMITER_OFF_FILENAME, body,
+                      "閂鎖檔須提到另一個旗標並區隔語意")
+
+    # --- 兩個旗標檔語意分離 ---
+
+    def test_two_flags_have_distinct_names(self):
+        self.assertNotEqual(self.rlp.LIMITER_LATCH_FILENAME, self.rlp.LIMITER_OFF_FILENAME)
+
+    def test_deleting_latch_does_not_disable_limiter(self):
+        """刪閂鎖 = 恢復運作（limiter 仍在守）；不等於把 limiter 關掉。"""
+        self._trip()
+        os.unlink(self.latch)
+        self.rlp._LAST_UNIFIED = {"status": "allowed", "utilization": 0.10,
+                                  "reset": None, "observed_at": time.time()}
+        self.assertEqual(self.rlp.limiter_admission(self.dir, tier="5x"), 0)
+        # limiter 仍然有效：水位再度達標會重新閂鎖
+        self.assertGreater(self._trip(), 0, "刪閂鎖後 limiter 仍應繼續守")
+
+    def test_creating_off_flag_does_not_clear_latch(self):
+        """設停用旗標 = 整個 limiter 不跑；閂鎖檔仍在原地，不會被順手清掉。"""
+        self._trip()
+        open(self.offflag, "w").close()
+        self.assertEqual(self.rlp.limiter_admission(self.dir, tier="5x"), 0,
+                         "off flag 應讓 limiter 完全不作用")
+        self.assertTrue(os.path.exists(self.latch),
+                        "off flag 不得刪除閂鎖檔——兩者互不影響")
+        os.unlink(self.offflag)
+        self.assertGreater(self.rlp.limiter_admission(self.dir, tier="5x"), 0,
+                           "移除 off flag 後，原本的閂鎖仍然生效")
+
+
+class LatchDecisionAuditFieldTest(unittest.TestCase):
+    """spec「Latch decision audit field」— limiter 欄位獨立於 sched_held_ms，未持住寫明確 0。"""
+
+    ENV_KEYS = ("RATE_LIMIT_PROXY_LIMITER", "RATE_LIMIT_PROXY_LIMITER_HOLD_CAP",
+                "RATE_LIMIT_PROXY_SCHEDULE", "RATE_LIMIT_PROXY_SCHED_HOLD_CAP")
+
+    def setUp(self):
+        self.mock, self.mock_url = start_mock_upstream()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = os.path.join(self.tmp.name, "rate-state.jsonl")
+        self._old = {k: os.environ.get(k) for k in self.ENV_KEYS}
+        for k in self.ENV_KEYS:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k, v in self._old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.mock.shutdown()
+        self.tmp.cleanup()
+
+    def _mock_200(self, headers=None):
+        MockUpstreamHandler.response_status = 200
+        h = {"Content-Type": "application/json"}
+        h.update(headers or {})
+        MockUpstreamHandler.response_headers = h
+        MockUpstreamHandler.response_body = b'{"ok": true}'
+        MockUpstreamHandler.sse_chunks = None
+
+    def _post(self, base):
+        req = urllib.request.Request(base + "/v1/messages", data=b'{"model":"claude-opus-5"}',
+                                     method="POST", headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req).read()
+
+    def test_field_present_and_zero_when_limiter_disabled(self):
+        self._mock_200()
+        server, base, _ = start_proxy(self.mock_url, state_file=self.state)
+        try:
+            self._post(base)
+        finally:
+            server.shutdown()
+        rec = read_jsonl(self.state)[-1]
+        self.assertIn("limiter_held_ms", rec,
+                      "未持住也必須帶明確欄位（非缺席）：%r" % rec)
+        self.assertEqual(rec["limiter_held_ms"], 0)
+
+    def test_two_mechanisms_are_separately_countable(self):
+        """兩機制同時啟用時，兩個欄位必須可分別統計。"""
+        self._mock_200({"anthropic-ratelimit-unified-5h-utilization": "0.99",
+                        "anthropic-ratelimit-unified-5h-status": "allowed"})
+        server, base, _ = start_proxy(self.mock_url, state_file=self.state, env_overrides={
+            "RATE_LIMIT_PROXY_LIMITER": "1",
+            "RATE_LIMIT_PROXY_LIMITER_HOLD_CAP": "0.05",
+            "RATE_LIMIT_PROXY_SCHEDULE": "1",
+        })
+        try:
+            self._post(base)   # 第一發：尚無快照 → 不閂鎖
+            self._post(base)   # 第二發：快照已達 0.99 → 閂鎖並持住
+        finally:
+            server.shutdown()
+        recs = read_jsonl(self.state)
+        self.assertGreaterEqual(len(recs), 2)
+        for r in recs:
+            self.assertIn("limiter_held_ms", r)
+            self.assertIn("sched_held_ms", r)
+        self.assertEqual(recs[0]["limiter_held_ms"], 0,
+                         "第一發時還沒有快照，不該閂鎖")
+        self.assertGreater(recs[1]["limiter_held_ms"], 0,
+                           "第二發應被 limiter 持住：%r" % recs[1])
+        self.assertEqual(recs[1]["sched_held_ms"], 0,
+                         "limiter 持住時不得同時記成 sched hold（不得持兩次）")
+        limiter_total = sum(r["limiter_held_ms"] for r in recs)
+        sched_total = sum(r["sched_held_ms"] for r in recs)
+        self.assertGreater(limiter_total, 0)
+        self.assertEqual(sched_total, 0,
+                         "兩個欄位可分別統計，互不污染")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

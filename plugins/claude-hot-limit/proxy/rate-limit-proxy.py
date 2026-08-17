@@ -362,7 +362,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         req_model = extract_model_from_request(body)  # #4：請求 body 的 model，供 rate_state_heat 分桶
         # #7 v1：admission gate——rejected 窗內（reset 在 cap 內）hold 到 reset 再送 upstream。
         # 預設關（opt-in）、fail-open（任何例外回 0 直接轉發）。req_model 保留給 v2 序列化。
-        sched_held_ms = schedule_admission(os.path.dirname(self._state_file()) or ".")
+        flag_dir = os.path.dirname(self._state_file()) or "."
+        # #33 limiter：**先於** #7 的 rejected-aware hold 評估。兩者都成立時只持一次
+        # （spec「Limiter latch takes precedence」）——重複持住會讓單一請求等兩倍 cap，
+        # 且兩個 audit 欄位會同時非零、事後無法歸因。
+        limiter_held_ms = limiter_admission(flag_dir, tier=cached_plan_tier())
+        sched_held_ms = 0 if limiter_held_ms else schedule_admission(flag_dir)
         url = self._upstream().rstrip("/") + self.path
         req = urllib.request.Request(url, data=body if body else None,
                                       method=self.command, headers=self._forward_headers())
@@ -377,19 +382,23 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             status = e.code
             resp_headers = list(e.headers.items()) if e.headers else []
             resp_body = e.read()
-            self._record_state(status, resp_headers, resp_body, req_model, sched_held_ms)
+            self._record_state(status, resp_headers, resp_body, req_model, sched_held_ms,
+                               limiter_held_ms)
             self._forward_buffered(status, resp_headers, resp_body)
             return
 
         content_type = dict((k.lower(), v) for k, v in resp_headers).get("content-type", "")
         if content_type.startswith("text/event-stream"):
-            self._forward_streaming(status, resp_headers, upstream_resp, req_model, sched_held_ms)
+            self._forward_streaming(status, resp_headers, upstream_resp, req_model, sched_held_ms,
+                                    limiter_held_ms)
         else:
             resp_body = upstream_resp.read()
-            self._record_state(status, resp_headers, resp_body, req_model, sched_held_ms)
+            self._record_state(status, resp_headers, resp_body, req_model, sched_held_ms,
+                               limiter_held_ms)
             self._forward_buffered(status, resp_headers, resp_body)
 
-    def _record_state(self, status, resp_headers, resp_body, req_model=None, sched_held_ms=0):
+    def _record_state(self, status, resp_headers, resp_body, req_model=None, sched_held_ms=0,
+                      limiter_held_ms=0):
         maybe_debug_dump_headers(self._state_file(), resp_headers)  # #12 opt-in 診斷（預設 no-op）
         # status（#13）：**admission-time** 非-2xx 撞牆訊號——upstream 直接回 HTTP 429/529 時，
         # status 由 HTTPError.e.code 取得、零 header 依賴（補 #12 缺口）。**涵蓋邊界（誠實）**：
@@ -398,7 +407,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         # 不寫 record）③ client-side local throttle。也不含 remaining budget（predictive 見 #7）。
         record = {"ts": time.time(), "model": req_model, "status": status,
                   # #7：audit field 永遠明確寫（未 hold=0 非缺席——#25 null-blindness 教訓）
-                  "sched_held_ms": int(sched_held_ms or 0)}
+                  "sched_held_ms": int(sched_held_ms or 0),
+                  # #33：limiter 的持住毫秒**獨立欄位**——與 sched_held_ms 共用會讓
+                  # 「429 下降是哪個機制造成的」事後不可回答（驗收依賴此歸因）。
+                  "limiter_held_ms": int(limiter_held_ms or 0)}
         fields = extract_rate_limit_fields(resp_headers)
         _update_unified_snapshot(fields)  # #7：admission gate 的快照供給點
         record.update(fields)
@@ -416,7 +428,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(resp_body)
 
     def _forward_streaming(self, status, resp_headers, upstream_resp, req_model=None,
-                           sched_held_ms=0):
+                           sched_held_ms=0, limiter_held_ms=0):
         """逐 byte 讀、逐 byte 轉發（HTTP chunked encoding），保證不整段 buffer 才轉發。
 
         側路（不影響轉發時序）累積每個 SSE event 的 usage 欄位；串流結束（EOF）後才把
@@ -474,7 +486,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             maybe_debug_dump_headers(self._state_file(), resp_headers)  # #12 opt-in 診斷（streaming 路徑）
             maybe_debug_dump_sse_sample(self._state_file(), resp_headers, sample_head)  # #26 歸因
             record = {"ts": time.time(), "model": req_model, "status": status,  # status（#13）：同 _record_state
-                      "sched_held_ms": int(sched_held_ms or 0)}  # #7：audit field（明確 0 非缺席）
+                      "sched_held_ms": int(sched_held_ms or 0),  # #7：audit field（明確 0 非缺席）
+                      "limiter_held_ms": int(limiter_held_ms or 0)}  # #33：獨立欄位，可分別統計
             fields = extract_rate_limit_fields(resp_headers)
             _update_unified_snapshot(fields)  # #7：streaming 路徑同樣供給快照
             record.update(fields)
@@ -557,6 +570,117 @@ def resolve_sched_hold_cap():
     return min(v, 240.0)
 
 
+# #33 limiter：已知訂閱方案別 → 預設門檻。canonical 是「桶」以外的**第三個軸**——
+# 既不是 model 桶（per-bucket-settings.md 管的）、也不是既有的單一帳號值。
+_LIMITER_TIER_DEFAULTS = {"5x": 0.90, "20x": 0.95}
+# tier 未判定時的保守預設：取**較低**者。方向刻意——早一點閂鎖只是早一點停下來（可逆、
+# 人刪檔即恢復），晚一點閂鎖則是保護沒發生（不可逆的額度已經燒掉）。
+_LIMITER_DEFAULT_THRESHOLD = min(_LIMITER_TIER_DEFAULTS.values())
+# 設定檔讀取上限。`~/.claude.json` 實測可達數 MB（projects 區塊），但仍必須有界：
+# 無上限的 read() 對上病態大檔 / 特殊檔案會讓 daemon 啟動卡死。
+_CLAUDE_CONFIG_MAX_BYTES = 64 * 1024 * 1024
+
+
+def default_claude_config_path():
+    """Claude Code 自身設定檔路徑（本 proxy 唯一的外部資料來源）。"""
+    return os.path.expanduser("~/.claude.json")
+
+
+def resolve_plan_tier(config_path=None):
+    """#33：訂閱方案別（`"5x"` / `"20x"`）或 None（未判定）。
+
+    **隱私鐵律**：只取 `claudeMaxTier` 這一個鍵。該檔其餘內容（`projects` 的本機路徑、
+    `oauthAccount` 等）**不得**進入回傳值、warning、log 或任何 record——所以本函式的
+    except 分支一律只印「哪一步失敗」，絕不回貼檔案內文。
+
+    **fail-open**：檔案缺席 / 不可讀 / 格式異常 / 缺鍵 / 值不認得，一律回 None，由
+    `resolve_limiter_threshold()` 退回單一預設門檻。**非公開契約**：`claudeMaxTier` 是
+    Claude Code 的內部欄位，改名或消失不會有通知，故未判定必須是正常路徑而非錯誤。
+    """
+    path = config_path or default_claude_config_path()
+    try:
+        if not os.path.isfile(path):
+            return None  # 特殊檔案（FIFO 等）的 open 可能永久 block——比照 file_override_* 紀律
+        if os.path.getsize(path) > _CLAUDE_CONFIG_MAX_BYTES:
+            print("[rate-limit-proxy] WARNING: Claude config exceeds read cap; "
+                  "plan tier undetermined (falling back to default threshold)", file=sys.stderr)
+            return None
+        with open(path) as f:
+            tier = json.load(f).get("claudeMaxTier")
+    except Exception:
+        # 訊息刻意不含 path 之外的任何檔案內容（隱私鐵律）。
+        print("[rate-limit-proxy] WARNING: could not read plan tier from Claude config; "
+              "falling back to default threshold", file=sys.stderr)
+        return None
+    if isinstance(tier, str) and tier.strip() in _LIMITER_TIER_DEFAULTS:
+        return tier.strip()
+    return None  # 非字串 / 空字串 / 不認得的 tier 一律未判定
+
+
+def resolve_limiter_threshold(data_dir, tier=None):
+    """#33：limiter 觸發門檻（0 < v ≤ 1）。
+
+    解析鏈：偵測到的 tier 預設 → 顯式覆寫（`<data_dir>/limiter-<tier>` 檔 → env
+    `RATE_LIMIT_PROXY_LIMITER_THRESHOLD`）→ 單一預設。覆寫優先於 tier 預設；壞值
+    （非數值 / 非有限 / 不在 (0, 1]）一律丟棄並落回 tier 預設，比照 ROTATE_MB（#17 F1）
+    與 SCHED_HOLD_CAP 的既有壞值紀律。
+
+    `tier=None`（未判定）時用 `_LIMITER_DEFAULT_THRESHOLD`——取兩級中較低者，因為早停
+    可逆、漏停不可逆。
+    """
+    base = _LIMITER_TIER_DEFAULTS.get(tier, _LIMITER_DEFAULT_THRESHOLD)
+    raw = file_override_str(data_dir, "limiter-%s" % (tier or "default"),
+                            "RATE_LIMIT_PROXY_LIMITER_THRESHOLD", None)
+    if raw is None:
+        return base
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return base
+    if v != v or v in (float("inf"), float("-inf")):
+        return base
+    return v if 0 < v <= 1 else base
+
+
+def resolve_limiter_hold_cap():
+    """#33：limiter 每次 admission 的持住秒數；None = limiter 停用。
+
+    **刻意獨立於 `RATE_LIMIT_PROXY_SCHED_HOLD_CAP`**：兩者是不同機制，共用一個旋鈕會讓
+    「我把 SCHED_HOLD_CAP 設 0 關掉舊東西」意外改到 limiter（Confused Developer lens）。
+    壞值紀律與 clamp 上限比照 SCHED_HOLD_CAP：預設 90、上限 240（必須 < 常見 client
+    timeout）、parse 失敗 / 非有限 → 預設、≤0 → 停用。
+    """
+    default_s = 90.0
+    try:
+        v = float(os.environ.get("RATE_LIMIT_PROXY_LIMITER_HOLD_CAP", default_s))
+    except (ValueError, TypeError):
+        v = default_s
+    if v != v or v in (float("inf"), float("-inf")):
+        v = default_s
+    if v <= 0:
+        return None
+    return min(v, 240.0)
+
+
+def file_override_str(data_dir, filename, env_name, default):
+    """檔案旗標優先的字串參數（比照 hooks/pacing-guard.py 的同名慣例）：
+    `<data_dir>/<filename>` → env var → default。
+
+    為什麼要檔案這層：env var 對已在跑的 daemon 不 hot-reload，改它得重啟；檔案每次
+    解析都重讀磁碟。bounded read（64 bytes）、全程 fail-open。
+    """
+    try:
+        path = os.path.join(data_dir, filename)
+        if os.path.isfile(path):
+            with open(path) as f:
+                val = f.read(64).strip()
+            if val:
+                return val
+    except Exception:
+        pass  # fail-open：讀取異常一律退回 env/default
+    return os.environ.get(env_name, default)
+
+
 # #7 v1：帳號級 unified 快照（單一 dict 引用替換 = CPython 原子；讀到前一瞬舊值無害——
 # 排程是 advisory 行為）。不重讀 rate-state.jsonl：零 I/O、不與 #17 rotation 稀薄窗交互。
 _LAST_UNIFIED = None
@@ -571,6 +695,10 @@ def _update_unified_snapshot(fields):
         if status is not None:
             _LAST_UNIFIED = {"status": str(status),
                              "reset": fields.get("rl_unified_5h_reset"),
+                             # #33：limiter 的觸發訊號。快照刻意維持「窄投影」（不是整包
+                             # fields），所以新消費者要用哪個欄位就得在這裡明確加一欄——
+                             # 漏加會讓消費端恆讀到 None 而**靜默不觸發**（#33 實作時踩到）。
+                             "utilization": fields.get("rl_unified_5h_utilization"),
                              "observed_at": time.time()}
     except Exception:
         pass  # 快照更新失敗不影響 record 寫入
@@ -613,6 +741,92 @@ def schedule_admission(flag_dir):
         return 0
 
 
+_LIMITER_WARNED = False  # fail-open 警告一次性節流（比照 _SCHED_WARNED）
+LIMITER_LATCH_FILENAME = "limiter-tripped"   # 閂鎖本身：存在 = 已觸發、持住中
+LIMITER_OFF_FILENAME = "limiter-off"         # 停用旗標：存在 = 整個 limiter 不跑
+
+
+def _write_latch_file(path, util, threshold, tier):
+    """#33：閂鎖檔內容（spec「Latch state file contract」）。
+
+    五項缺一不可——觸發時間、當時 utilization、當時門檻、偵測到的 tier、解除方式。
+    人可讀是硬需求：proxy 在 HTTP 路徑上無法跟使用者說話，這個檔案是唯一能解釋
+    「為什麼停住」的載體，pacing-guard hook 直接把它印給使用者看。
+    """
+    with open(path, "w") as f:
+        f.write(
+            "claude-hot-limit limiter tripped\n"
+            "\n"
+            "tripped at : %s\n"
+            "utilization: %.4f (unified 5h)\n"
+            "threshold  : %.4f\n"
+            "plan tier  : %s\n"
+            "\n"
+            "到解除為止，每個 API 請求都會被持住約 %s 秒後才轉發。\n"
+            "解除方式   : 刪除本檔案（%s）——立即生效，不需重啟 daemon。\n"
+            "注意       : 不要改動 %s，那是「整個 limiter 停用」，語意不同。\n"
+            % (time.strftime("%Y-%m-%d %H:%M:%S %z"), util, threshold,
+               tier if tier else "undetermined (using default threshold)",
+               resolve_limiter_hold_cap(), path, LIMITER_OFF_FILENAME))
+
+
+def limiter_admission(flag_dir, tier=None):
+    """#33：utilization 門檻閂鎖。回傳實際持住毫秒（int；未持住 = 0）。
+
+    判準（依序）：env opt-in ∧ cap 有效 ∧ 停用旗標不存在 → 若已閂鎖則直接持住；否則看
+    最近快照的 **5h** utilization ≥ 門檻才閂鎖。閂鎖一旦建立，**只有刪除閂鎖檔**能解除
+    ——水位回落不解除、daemon 重啟不解除。這是本功能的核心：機器執行那個使用者來不及
+    執行的暫停，然後停在原地等人決定。
+
+    fail-open 鐵律：任何例外（含閂鎖檔寫不出來）→ 回 0 直接轉發。
+    """
+    global _LIMITER_WARNED
+    try:
+        if os.environ.get("RATE_LIMIT_PROXY_LIMITER") != "1":
+            return 0
+        cap = resolve_limiter_hold_cap()
+        if cap is None:
+            return 0
+        # 停用旗標必須在閂鎖檢查**之前**——否則已閂鎖的使用者無法用 off flag 逃生。
+        if os.path.exists(os.path.join(flag_dir, LIMITER_OFF_FILENAME)):
+            return 0
+        latch = os.path.join(flag_dir, LIMITER_LATCH_FILENAME)
+        if not os.path.exists(latch):
+            snap = _LAST_UNIFIED
+            util = (snap or {}).get("utilization")  # 快照的窄投影欄位名，非原始 header 欄位名
+            if util is None:
+                return 0  # 無水位資料 → 不猜（7d 有值也不代用，觸發訊號只取 5h）
+            util = float(util)
+            threshold = resolve_limiter_threshold(flag_dir, tier)
+            if util < threshold:
+                return 0
+            _write_latch_file(latch, util, threshold, tier)
+        t0 = time.monotonic()
+        time.sleep(cap)
+        return int((time.monotonic() - t0) * 1000)
+    except Exception as e:
+        if not _LIMITER_WARNED:
+            _LIMITER_WARNED = True
+            print("[rate-limit-proxy] WARNING: limiter failed (fail-open, forwarding "
+                  "immediately): %s" % e, file=sys.stderr)
+        return 0
+
+
+_PLAN_TIER_UNSET = object()
+_PLAN_TIER_CACHE = _PLAN_TIER_UNSET
+
+
+def cached_plan_tier():
+    """#33：方案別解析**一次**並快取——不讓 admission 熱路徑每個請求都讀設定檔。
+
+    daemon 於 `main()` 啟動時預熱；未預熱時 lazy 解析一次（測試 / 直接 import 情境）。
+    """
+    global _PLAN_TIER_CACHE
+    if _PLAN_TIER_CACHE is _PLAN_TIER_UNSET:
+        _PLAN_TIER_CACHE = resolve_plan_tier()
+    return _PLAN_TIER_CACHE
+
+
 def resolve_drain_cap():
     """graceful drain 等待上限（秒）。壞值（含 inf/nan/負值，#27 verify F7）fail-open 回預設 120。"""
     try:
@@ -624,6 +838,7 @@ def resolve_drain_cap():
 
 
 def main():
+    cached_plan_tier()  # #33：啟動時預熱一次，之後 admission 路徑零檔案 I/O
     port = int(os.environ.get("RATE_LIMIT_PROXY_PORT", DEFAULT_PORT))
     server = ThreadingHTTPServer(("127.0.0.1", port), ProxyHandler)
     server.inflight = 0

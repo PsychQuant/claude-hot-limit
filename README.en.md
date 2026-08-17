@@ -18,6 +18,18 @@ When Claude Code launches **agents or workflows**, this plugin prevents back-to-
 
 > Full behavior table + all parameters: [`plugins/claude-hot-limit/README.md`](./plugins/claude-hot-limit/README.md).
 
+### 🛑 Usage-watermark limiter (optional · off by default)
+
+Hitting the wall is a *lagging* signal. The limiter uses the account-level **5-hour utilization** the API
+itself reports as a leading one: once it reaches the plan-tier threshold (Max 5x → 0.90, Max 20x → 0.95,
+detected from `claudeMaxTier`), the proxy **trips a latch and holds all API traffic**, and pacing-guard
+denies tool launches while printing why.
+
+- **Two-step opt-in**: set up `ANTHROPIC_BASE_URL` routing (above), then add `RATE_LIMIT_PROXY_LIMITER=1`. Unset = behavior is unchanged.
+- **The two flag files mean opposite things — don't delete the wrong one**: `<data_dir>/limiter-tripped` is **the latch itself** (delete it to resume work; the guard stays on); `<data_dir>/limiter-off` **disables the whole feature** (delete it to get the guard back).
+- **An unattended long run will stay latched until a human returns — that is the feature, not a hang.** The whole point is that the machine performs the pause you never get to perform yourself, so `/loop` and scheduled jobs stop and wait for someone to delete the latch file.
+
+
 ## Install
 
 ```shell

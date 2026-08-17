@@ -93,11 +93,29 @@ proxy 相關 env（與上面「設定」表的 hook env 分開）：
 | `RATE_LIMIT_PROXY_DRAIN_CAP` | `120` | graceful drain 等待上限秒數（SIGTERM 後等 in-flight streams 走完；#27） |
 | `RATE_LIMIT_PROXY_SCHEDULE` | `—` | 設 `1` 啟用 **admission hold**（#7 Phase 2 v1）：最近觀測到帳號級 `5h_status=rejected` 且 reset 在 cap 內 → 該請求 hold 到 reset 再送 upstream（把「必然 429」換成「等一下就成功」）。**hold 期間該次呼叫觀感變慢屬預期**。預設關＝行為與純觀測完全相同。`<data_dir>/sched-off` 檔案旗標可即時停用（免重啟） |
 | `RATE_LIMIT_PROXY_SCHED_HOLD_CAP` | `90` | hold 上限秒數（float；上限箝 240、`≤0` 停用排程；reset 比 cap 遠的請求不 hold 直接放行） |
+| `RATE_LIMIT_PROXY_LIMITER` | `—` | 設 `1` 啟用 **utilization 水位 limiter**（#33）：帳號級 unified **5h** utilization 達方案別門檻 → 建立閂鎖並持住流量。與 `RATE_LIMIT_PROXY_SCHEDULE` 是**兩個獨立機制**（前者 proactive 看水位、後者 reactive 看 `rejected`），各自 opt-in、各自的 audit 欄位 |
+| `RATE_LIMIT_PROXY_LIMITER_HOLD_CAP` | `90` | limiter 閂鎖期間每個請求持住的秒數（float；上限箝 240、`≤0` 停用 limiter）。**刻意獨立於 `SCHED_HOLD_CAP`**——共用旋鈕會讓「關掉舊機制」意外改到 limiter |
+| `RATE_LIMIT_PROXY_LIMITER_THRESHOLD` | 依方案別 | 覆寫觸發門檻（0 < v ≤ 1）。未設時依 `claudeMaxTier` 取 `5x`→`0.90`、`20x`→`0.95`；**偵測不到方案別則取較低的 `0.90`**（早停可逆、漏停不可逆） |
 | `RATE_LIMIT_PROXY_ROTATE_MB` | `64` | `rate-state.jsonl` 輪替門檻（float MiB；超過→歸檔成 `rate-state-<ts>.jsonl` **全保留**（校準語料，手動清理）；`≤0` 停用；#17） |
 | `RATE_LIMIT_PROXY_LOG_ROTATE_MB` | `32` | `proxy.log` spawn 前輪替門檻（float MiB；轉 `proxy.log.1` 只留一代；`≤0` 停用；#17） |
 | `RATE_LIMIT_PROXY_DEBUG_HEADERS` | — | 設 `1` 時把每筆回應的 header **名單** + `anthropic-*` header 的**值**寫進 `<data>/proxy-headers-debug.jsonl`（診斷「rate-limit header 到底在不在回應上」用；#12）。只記 `anthropic-*` 的值，Authorization/Cookie 等只留名。**預設關 → 零影響**。查完記得關 |
 
 > `RATE_LIMIT_PROXY_SCHEDULE` 是獨立於「導流」之外的第二層 opt-in：不設就是純觀測（Phase 1 行為不變），設了才會主動 hold 請求。
+
+### ⚠️ limiter 的兩個檔案旗標語意完全不同（刪錯會得到完全不同的結果）
+
+| 檔案 | 意義 | 刪掉它 |
+|------|------|--------|
+| `<data_dir>/limiter-tripped` | **閂鎖本身**：limiter 已觸發、正在持住每個請求 | **解除閂鎖、恢復正常轉發**；limiter 仍在守，水位再達標會重新閂鎖 |
+| `<data_dir>/limiter-off` | **停用旗標**：整個 limiter 不作用 | 讓 limiter 重新開始作用（若閂鎖檔還在，閂鎖立刻恢復生效） |
+
+兩個檔名只差一個詞，但**刪錯的後果是相反的**：想恢復工作的人若誤刪 `limiter-off`，limiter
+會立刻回來閂住他；想關掉保護的人若誤刪 `limiter-tripped`，保護其實還開著。閂鎖檔本身的內容
+也會提醒這件事——它記錄觸發時間、當時 utilization、當時門檻、偵測到的方案別，以及解除方式。
+
+**unattended 長跑會被閂到人回來——這是特性不是當機。** limiter 的全部價值就是「機器執行那個你
+來不及執行的暫停，然後停在原地等你決定」。所以 `/loop`、排程 job、背景 agent 在水位達標後會停住
+不動，直到有人刪掉閂鎖檔。若你看到自動化流程無故卡住，先看 `<data_dir>/limiter-tripped` 在不在。
 
 ## 設定
 

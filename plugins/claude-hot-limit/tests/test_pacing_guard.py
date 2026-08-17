@@ -1516,5 +1516,96 @@ class UnifiedUtilizationHeatTest(unittest.TestCase):
         self.assertIn("95", parsed.get("systemMessage", ""))
 
 
+
+class LimiterLatchGuardTest(unittest.TestCase):
+    """#33 — guard 是閂鎖的**讀取端**：擋下工具呼叫 + 印出閂鎖 context。
+
+    guard **不擁有門檻**：不解析 tier、不算 utilization、不讀設定檔。讀不到閂鎖檔一律
+    放行——它是可見度層，不得成為新的失敗點。
+    """
+
+    LATCH = "limiter-tripped"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.data = self.tmp.name
+        self.latch = os.path.join(self.data, self.LATCH)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _env(self, **extra):
+        env = {"CLAUDE_HOT_LIMIT_DATA": self.data, "CLAUDE_HOT_LIMIT_MAX": "999"}
+        env.update(extra)
+        return env
+
+    def _write_latch(self, body=None):
+        """fixture 刻意比照 proxy `_write_latch_file()` 的真實輸出形狀。
+
+        用簡化的假內容會讓「使用者看得到怎麼恢復」的斷言變成空話——guard 只是把檔案
+        原樣轉呈，內容的完整性是 proxy 的契約（見 LatchStateFileContractTest）。
+        """
+        if body is None:
+            body = ("claude-hot-limit limiter tripped\n\n"
+                    "tripped at : 2026-08-17 22:30:00 +0800\n"
+                    "utilization: 0.9321 (unified 5h)\n"
+                    "threshold  : 0.9000\n"
+                    "plan tier  : 5x\n\n"
+                    "解除方式   : 刪除本檔案（%s）——立即生效，不需重啟 daemon。\n"
+                    % os.path.join(self.data, self.LATCH))
+        with open(self.latch, "w") as f:
+            f.write(body)
+
+    def test_latch_denies_tool_launch(self):
+        self._write_latch()
+        code, parsed, raw = run_hook(tool="Workflow", env_overrides=self._env())
+        self.assertEqual(code, 0)
+        self.assertTrue(is_deny(parsed), "閂鎖存在時應 deny，raw=%r" % raw)
+
+    def test_deny_output_carries_latch_context(self):
+        self._write_latch()
+        _, parsed, raw = run_hook(tool="Agent", env_overrides=self._env())
+        blob = json.dumps(parsed, ensure_ascii=False)
+        self.assertIn("0.9321", blob, "應把當時 utilization 帶給使用者看")
+        self.assertIn("0.9000", blob, "應把當時門檻帶給使用者看")
+        self.assertIn(self.LATCH, blob, "應告訴使用者刪哪個檔可以恢復")
+
+    def test_absent_latch_allows(self):
+        code, parsed, raw = run_hook(tool="Workflow", env_overrides=self._env())
+        self.assertFalse(is_deny(parsed), "無閂鎖時不得擋，raw=%r" % raw)
+
+    def test_unreadable_latch_allows(self):
+        """讀不到就放行——guard 是可見度層，不得成為新的失敗點。"""
+        os.mkdir(self.latch)  # 目錄同名 → open() 失敗
+        code, parsed, raw = run_hook(tool="Workflow", env_overrides=self._env())
+        self.assertEqual(code, 0)
+        self.assertFalse(is_deny(parsed), "閂鎖檔不可讀應放行，raw=%r" % raw)
+
+    def test_global_off_bypasses_latch(self):
+        """既有全域 off switch 位階高於閂鎖（與其他 gate 一致）。"""
+        self._write_latch()
+        _, parsed, _ = run_hook(tool="Workflow",
+                                env_overrides=self._env(CLAUDE_HOT_LIMIT_OFF="1"))
+        self.assertFalse(is_deny(parsed))
+
+    def test_disabled_flag_bypasses_latch(self):
+        self._write_latch()
+        open(os.path.join(self.data, "disabled"), "w").close()
+        _, parsed, _ = run_hook(tool="Workflow", env_overrides=self._env())
+        self.assertFalse(is_deny(parsed))
+
+    def test_guard_does_not_own_the_threshold(self):
+        """單一真相：門檻只在 proxy。guard 內不得出現 tier / 門檻 / 設定檔解析。"""
+        src = open(HOOK).read()
+        for forbidden in ("claudeMaxTier", "resolve_limiter_threshold",
+                          "_LIMITER_TIER_DEFAULTS", "LIMITER_THRESHOLD"):
+            self.assertNotIn(forbidden, src,
+                             "guard 不得自行解析 %r——limiter 門檻的真相只有 proxy 一份" % forbidden)
+        # 反面校準：#25 既有的 0.80 warn 門檻**本來就**由 guard 擁有，且讀 utilization。
+        # 本次設計明說不動它——所以「guard 不得讀 utilization」是錯的斷言，
+        # 正確的邊界是「guard 不得擁有 **limiter** 的門檻」。
+        self.assertIn("_util_warn_threshold", src,
+                      "#25 既有的警示門檻應原封不動")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
