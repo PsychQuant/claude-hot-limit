@@ -536,3 +536,52 @@ The two audit fields SHALL be separately countable, so that a change in downstre
 
 - **WHEN** state records are aggregated over a period in which both mechanisms were enabled
 - **THEN** the count of limiter-held requests SHALL be derivable independently of the count of rejected-aware holds
+
+---
+### Requirement: Request model capture
+
+The proxy SHALL parse the JSON request body of each forwarded request to extract the top-level `model` field and record it in the same state-file record that captures that response's rate-limit headers and usage. Extraction SHALL be fail-open: if the request body is not valid JSON, has no `model` field, or cannot be parsed, the proxy SHALL record `null` for the model field and SHALL forward the request and response unaffected.
+
+#### Scenario: Request body includes a model field
+
+- **WHEN** a client sends a Messages API request whose JSON body has top-level `"model": "claude-sonnet-5"`
+- **THEN** the state-file record for that response SHALL include `"model": "claude-sonnet-5"`
+
+#### Scenario: Request body has no model field
+
+- **WHEN** a forwarded request body is valid JSON but has no top-level `model` field
+- **THEN** the proxy SHALL record `"model": null` and SHALL forward the request and response unmodified
+
+#### Scenario: Request body is not JSON
+
+- **WHEN** a forwarded request body cannot be parsed as JSON
+- **THEN** the proxy SHALL record `"model": null`, SHALL emit no error to the client, and SHALL forward the request and response unmodified
+
+<!-- @trace
+source: per-model-bucket-normalization
+updated: 2026-08-19
+code:
+  - plugins/claude-hot-limit/CLAUDE.md
+  - changelog/20260712_rotation-batch2.md
+  - plugins/claude-hot-limit/hooks/pacing-guard.py
+  - plugins/claude-hot-limit/hooks/hooks.json
+  - changelog/20260818_limiter-disable-releases-and-latch-ttl.md
+  - plugins/claude-hot-limit/hooks/session-fable-nudge.py
+  - README.ja.md
+  - plugins/claude-hot-limit/skills/pacing-playbook/SKILL.md
+  - plugins/claude-hot-limit/README.md
+  - .claude-plugin/marketplace.json
+  - plugins/claude-hot-limit/proxy/proxy-launcher.py
+  - plugins/claude-hot-limit/proxy/rate-limit-proxy.py
+  - README.en.md
+  - changelog/20260817_utilization-threshold-admission-latch.md
+  - plugins/claude-hot-limit/CHANGELOG.md
+  - README.md
+  - plugins/claude-hot-limit/.claude-plugin/plugin.json
+  - changelog/20260711_unified-headers-and-graceful-drain.md
+  - changelog/20260818_limiter-auto-release-and-higher-thresholds.md
+tests:
+  - plugins/claude-hot-limit/tests/test_pacing_guard.py
+  - plugins/claude-hot-limit/tests/test_proxy_launcher.py
+  - plugins/claude-hot-limit/tests/test_rate_limit_proxy.py
+-->
