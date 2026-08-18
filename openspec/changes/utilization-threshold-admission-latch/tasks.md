@@ -53,4 +53,4 @@
 - [x] 9.4 實作閂鎖時效：`_write_latch_file` 增寫機器可讀的觸發時間欄位（epoch 秒），guard 解析該欄位計算年齡、超過一個 5 小時窗即放行；解析失敗退回檔案 mtime。guard 仍不解析 tier／門檻／utilization。驗證：9.3 的測試轉綠，且既有「閂鎖存在時 deny 並顯示 context」與「讀取失敗一律放行」兩個測試維持綠燈。
 - [x] 9.5 修正四份 README 中因 C1／C2 而失準的敘述：`limiter-off` 的說明須寫明它**同時釋放閂鎖**（不再是「閂鎖檔留在原地」）；「閂鎖至多持續到當前 5 小時配額窗結束」須補上「proxy 不在場時由 guard 的時效判定兜底」。驗證：四份檔案經內容審閱皆已更新且不再宣稱需要手動刪檔才能從停用狀態恢復。
 - [x] 9.6 於 changelog 目錄新增 C1／C2 修正條目，記錄「停用曾把閂鎖凍結成永久 deny」這個失敗模式、兩項修正、以及部署需求。驗證：檔案存在且內容審閱確認含上述三項。
-- [ ] 9.7 部署修正版：bump 版本、commit、同步 marketplace、graceful restart daemon，並實測一次「閂鎖存在時建立 `limiter-off` → 閂鎖檔消失」。驗證：daemon 跑新版本，且該實測在真實 data 目錄上重現成功。
+- [x] 9.7 部署修正版：bump 版本、commit、同步 marketplace、graceful restart daemon，並實測一次「閂鎖存在時建立 `limiter-off` → 閂鎖檔消失」。驗證：daemon 跑新版本，且該實測在真實 data 目錄上重現成功。
