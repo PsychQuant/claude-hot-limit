@@ -276,6 +276,8 @@ When admission scheduling is enabled, the proxy SHALL delay forwarding a request
 
 Scheduling SHALL be opt-in: it activates only when `RATE_LIMIT_PROXY_SCHEDULE` is set to `1` at daemon start, and SHALL be suppressed at any time by the presence of the `<data_dir>/sched-off` file flag (checked per admission). The hold duration SHALL never exceed the resolved hold cap (`RATE_LIMIT_PROXY_SCHED_HOLD_CAP`, default 90 seconds, clamped to at most 240; non-finite or unparseable values SHALL fall back to the default; values ≤ 0 SHALL disable scheduling).
 
+**Empirical status (recorded 2026-08-17, non-normative).** This requirement's trigger condition has never fired in production. Across 31 days and 410,716 state records, 1,194 snapshots reported `rejected` status, and the smallest observed distance between the snapshot and its reset epoch was 3.9 minutes — larger than the maximum permitted hold cap of 240 seconds. The reset field denotes the quota window boundary rather than a retry-after interval, so a rejected window clears through utilization decay long before its reset epoch arrives. The requirement remains in force as written; the record exists so that future readers understand this path is dormant rather than assume it is exercised.
+
 #### Scenario: Hold until reset within cap
 
 - **WHEN** scheduling is enabled, the latest snapshot has `5h_status == "rejected"` with a reset epoch 45 seconds in the future, and a new request arrives
@@ -312,6 +314,11 @@ Scheduling SHALL be opt-in: it activates only when `RATE_LIMIT_PROXY_SCHEDULE` i
 - **WHEN** the admission decision raises any exception (corrupt snapshot, clock anomaly, flag-stat failure)
 - **THEN** the proxy SHALL forward the request immediately and emit a warning to stderr, and the response SHALL reach the client unchanged
 
+#### Scenario: Limiter latch takes precedence
+
+- **WHEN** the limiter latch is in force and a rejected snapshot would also call for a hold
+- **THEN** the request SHALL be held once for the limiter's hold duration, SHALL NOT be held twice, and the two audit fields SHALL record which mechanism performed the hold
+
 ---
 ### Requirement: Admission decision audit field
 
@@ -326,3 +333,206 @@ Every state record written by the proxy SHALL include a `sched_held_ms` integer 
 
 - **WHEN** a request is forwarded without any hold
 - **THEN** its state record SHALL carry `sched_held_ms == 0` (explicit zero, not a missing field)
+
+---
+### Requirement: Plan-tier threshold resolution
+
+The proxy SHALL resolve the limiter threshold from the account's subscription tier, and SHALL fail open to a single default threshold whenever the tier cannot be determined. Tier detection SHALL read exactly one key (`claudeMaxTier`) from the Claude Code configuration file, and SHALL NOT copy any other content of that file into logs, state records, or error messages. Detection SHALL run once at daemon start and SHALL NOT be performed on the per-request admission path.
+
+The resolution chain SHALL be: detected tier, then explicit override (a per-tier threshold file in the data directory, then an environment variable), then the default. Values outside the open interval (0, 1], non-finite values, and unparseable values SHALL fall back to the default. An unrecognised tier string SHALL be treated as undetermined.
+
+#### Scenario: Known tier resolves to its threshold
+
+- **WHEN** tier detection returns a recognised tier and no explicit override is present
+- **THEN** the proxy SHALL use that tier's default threshold
+
+##### Example: tier to threshold mapping
+
+| Detected tier | Resolved threshold | Notes |
+| ------------- | ------------------ | ----- |
+| `5x` | 0.96 | default for this tier |
+| `20x` | 0.98 | default for this tier |
+| `7x` | single default | unrecognised tier, fail open |
+| absent | single default | key missing from configuration file |
+
+#### Scenario: Explicit override wins over detection
+
+- **WHEN** a per-tier threshold override is present in the data directory or the environment
+- **THEN** the proxy SHALL use the override value and SHALL ignore the detected tier's default
+
+#### Scenario: Detection failure is fail-open
+
+- **WHEN** the configuration file is absent, unreadable, malformed, or lacks the tier key
+- **THEN** the proxy SHALL use the single default threshold, SHALL emit a warning to stderr, and SHALL NOT block or drop any request
+
+#### Scenario: Bad override value falls back to default
+
+- **WHEN** an override resolves to a non-finite value, an unparseable value, or a value outside (0, 1]
+- **THEN** the proxy SHALL discard that value and SHALL fall back to the tier default
+
+---
+### Requirement: Utilization-threshold admission latch
+
+When the limiter is enabled, the proxy SHALL trip a latch as soon as the most recently observed account-level unified five-hour utilization reaches the resolved threshold, and SHALL hold every subsequent admission for the full hold cap before forwarding it unchanged. The proxy SHALL clear the latch as soon as the most recently observed utilization falls below that same threshold, and SHALL forward the admission that observed the fall without any hold. The threshold governing the clear SHALL be the same resolved value that governs the trip; the proxy SHALL NOT apply a separate release threshold, a hysteresis band, or a minimum latch duration. Deletion of the latch state file SHALL remain an equally valid way to clear the latch. The proxy SHALL NOT clear the latch on a timer, on daemon restart, or while no utilization observation is available.
+
+The limiter SHALL be opt-in: it activates only when its enabling environment variable is set at daemon start, and SHALL be suppressed at any time by the presence of a disable flag file in the data directory, checked per admission. Whenever the limiter is suppressed by any means — the enabling environment variable unset, a non-positive hold cap, or the disable flag file present — the proxy SHALL delete the latch state file if it exists. Suppressing the limiter SHALL NOT leave a latch state file behind, because no other code path would then remove it and the pacing guard would keep denying work forever. The limiter SHALL be fail-open: any internal error in the latch decision SHALL result in immediate forwarding, never in blocking or dropping the request.
+
+The limiter SHALL evaluate the five-hour window only. Seven-day utilization SHALL NOT trip the latch in this capability.
+
+#### Scenario: Threshold reached trips the latch
+
+- **WHEN** the limiter is enabled, no latch exists, and the latest snapshot reports five-hour utilization at or above the resolved threshold
+- **THEN** the proxy SHALL create the latch state file and SHALL hold that request for the full hold cap before forwarding it unchanged
+
+##### Example: boundary at the threshold
+
+| Resolved threshold | Observed utilization | Latch tripped |
+| ------------------ | -------------------- | ------------- |
+| 0.96 | 0.959 | no |
+| 0.96 | 0.960 | yes |
+| 0.96 | 0.970 | yes |
+| 0.98 | 0.970 | no |
+
+#### Scenario: Every admission holds while latched and utilization stays high
+
+- **WHEN** the latch state file exists, a new request arrives, and the latest snapshot reports utilization at or above the resolved threshold
+- **THEN** the proxy SHALL hold that request for the full hold cap and SHALL then forward it unchanged
+
+#### Scenario: Utilization falling below the threshold clears the latch
+
+- **WHEN** the latch state file exists and the latest snapshot reports utilization below the resolved threshold
+- **THEN** the proxy SHALL delete the latch state file and SHALL forward that request immediately without any hold
+
+##### Example: symmetric boundary for trip and clear
+
+| Resolved threshold | Observed utilization | Latch state after admission |
+| ------------------ | -------------------- | --------------------------- |
+| 0.96 | 0.960 | latched (trip boundary is inclusive) |
+| 0.96 | 0.959 | cleared |
+| 0.96 | 0.000 | cleared |
+
+#### Scenario: Latch persists while no utilization observation exists
+
+- **WHEN** the latch state file exists and no five-hour utilization value has been observed, such as immediately after a daemon restart
+- **THEN** the proxy SHALL keep holding admissions, because clearing the latch without an observation would be a guess
+
+#### Scenario: Latch file deletion failure is fail-open
+
+- **WHEN** utilization has fallen below the threshold but the latch state file cannot be deleted
+- **THEN** the proxy SHALL forward the request immediately without any hold, SHALL emit a warning to stderr, and SHALL NOT retry the deletion within that admission
+
+#### Scenario: Deleting the latch restores normal forwarding
+
+- **WHEN** the latch state file is deleted while the daemon is running
+- **THEN** the very next admission SHALL forward immediately without any hold, and no daemon restart SHALL be required
+
+#### Scenario: Disabled by default
+
+- **WHEN** the limiter enabling environment variable is unset and utilization reaches the threshold
+- **THEN** the proxy SHALL forward immediately, SHALL NOT create a latch state file, and SHALL behave exactly as it did before this capability existed
+
+#### Scenario: Disable flag suppresses the limiter
+
+- **WHEN** the limiter is enabled by environment variable but the disable flag file exists in the data directory
+- **THEN** the proxy SHALL forward immediately for as long as that flag file exists, without requiring a daemon restart
+
+#### Scenario: Suppressing the limiter releases an existing latch
+
+- **WHEN** a latch state file exists and the limiter is then suppressed by any of the three means — enabling environment variable unset, hold cap set to zero or below, or disable flag file created
+- **THEN** the proxy SHALL delete the latch state file on the next admission and SHALL forward immediately, so that the pacing guard stops denying work without any manual file removal
+
+##### Example: every suppression path releases
+
+| Suppression means | Latch file afterwards |
+| ----------------- | --------------------- |
+| enabling environment variable unset | deleted |
+| hold cap ≤ 0 | deleted |
+| disable flag file present | deleted |
+
+#### Scenario: Releasing on suppression tolerates a missing latch
+
+- **WHEN** the limiter is suppressed and no latch state file exists
+- **THEN** the proxy SHALL forward immediately and SHALL NOT treat the absent file as an error
+
+#### Scenario: Latch decision failure is fail-open
+
+- **WHEN** the latch decision raises any exception, or the latch state file cannot be created
+- **THEN** the proxy SHALL forward the request immediately, SHALL emit a warning to stderr, and the response SHALL reach the client unchanged
+
+---
+### Requirement: Latch state file contract
+
+The latch state file SHALL be the sole interface through which the latch is observed, and SHALL be one of the two ways it is cleared, the other being the proxy's own release when utilization falls below the threshold. Its content SHALL be human-readable and SHALL record the wall-clock time the latch tripped, the utilization value observed at that moment, the threshold in force, the detected tier, and the instruction for clearing it. It SHALL additionally record the trip time in a machine-readable form, so that a reader can determine the latch's age without parsing localised text. Consumers SHALL treat the existence of the file as the latch signal and SHALL NOT infer latch state from any other source.
+
+The disable flag file and the latch state file SHALL be distinct files with distinct names, because deleting the wrong one produces silently different outcomes: clearing the latch resumes normal operation, whereas setting the disable flag turns the limiter off entirely.
+
+#### Scenario: Latch file records the tripping context
+
+- **WHEN** the latch trips
+- **THEN** the latch state file SHALL contain the trip time, the observed utilization, the threshold in force, the detected tier, and the clearing instruction
+
+#### Scenario: Latch file states both release paths
+
+- **WHEN** the latch state file is written
+- **THEN** its clearing instruction SHALL state both that the proxy releases the latch automatically once utilization falls below the threshold and that deleting the file releases it immediately, so that the operator does not read the file as requiring manual action
+
+#### Scenario: Guard surfaces the latch to the operator
+
+- **WHEN** the latch state file exists and a tool launch is intercepted by the pacing guard
+- **THEN** the guard SHALL deny that launch and SHALL print the latch context, so that the operator learns why work stopped and how to resume
+
+#### Scenario: Guard ignores a latch older than one quota window
+
+- **WHEN** the pacing guard reads a latch state file whose trip time is more than one five-hour window in the past
+- **THEN** the guard SHALL allow the tool launch, because a latch outliving the window it protected means no proxy is releasing it — the daemon died, the machine restarted, or traffic no longer flows through the proxy
+
+##### Example: latch age decides
+
+| Latch age | Guard behaviour |
+| --------- | --------------- |
+| 1 minute | deny |
+| 4 hours 59 minutes | deny |
+| 5 hours 1 minute | allow |
+| 3 days | allow |
+
+#### Scenario: Guard falls back to file mtime when the trip time is unreadable
+
+- **WHEN** the latch state file carries no parseable machine-readable trip time, such as a file written by an earlier version or a truncated write
+- **THEN** the guard SHALL determine the latch's age from the file's modification time rather than treating the latch as ageless
+
+#### Scenario: Latch staleness is the one bound the guard owns
+
+- **WHEN** the guard decides whether a latch is stale
+- **THEN** it SHALL derive that decision only from the latch state file's trip time and the fixed window length, and SHALL still NOT resolve the tier, the threshold, or the utilization value; this bound is deliberately independent of the proxy because it exists to survive the proxy being absent
+
+#### Scenario: Guard failure never blocks work
+
+- **WHEN** the pacing guard cannot read the latch state file for any reason
+- **THEN** the guard SHALL allow the tool launch to proceed, because the guard is a visibility layer and SHALL NOT introduce a new failure point
+
+#### Scenario: Guard does not own the threshold
+
+- **WHEN** the pacing guard evaluates latch state
+- **THEN** it SHALL read only the latch state file, and SHALL NOT resolve the tier, the threshold, or the utilization value independently
+
+---
+### Requirement: Latch decision audit field
+
+Every state record written by the proxy SHALL include an integer field recording the milliseconds a request was held by the limiter, and this field SHALL be distinct from the field recording holds performed by the rejected-aware admission hold. Records for requests the limiter did not hold SHALL carry an explicit zero rather than omitting the field.
+
+The two audit fields SHALL be separately countable, so that a change in downstream error rates can be attributed to one mechanism rather than the other.
+
+#### Scenario: Latched request is auditable
+
+- **WHEN** a request was held by the limiter for approximately N milliseconds before forwarding
+- **THEN** its state record SHALL carry the limiter field within measurement tolerance of N
+
+#### Scenario: Non-latched record carries explicit zero
+
+- **WHEN** a request is forwarded without a limiter hold
+- **THEN** its state record SHALL carry the limiter field set to zero, not a missing field
+
+#### Scenario: Mechanisms are distinguishable after the fact
+
+- **WHEN** state records are aggregated over a period in which both mechanisms were enabled
+- **THEN** the count of limiter-held requests SHALL be derivable independently of the count of rejected-aware holds
