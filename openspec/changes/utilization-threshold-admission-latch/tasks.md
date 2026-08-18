@@ -33,7 +33,7 @@
 
 - [x] 7.1 [P] 同步 README.md、README.en.md、README.ja.md 與 plugins/claude-hot-limit/README.md：新增 limiter 段落，明寫 opt-in 方式、兩個旗標檔的語意差異、以及「unattended 長跑會被閂到人回來是特性不是當機」。驗證：四份檔案經內容審閱皆含這三點。
 - [x] 7.2 [P] 於 changelog 目錄新增本次條目，記錄行為變更、部署需求（daemon graceful restart）與兩層回退路徑（建立停用旗標即時停用、移除環境變數並重啟完全回退）。驗證：檔案存在且內容審閱確認含上述三項。
-- [ ] 7.3 部署並釘住驗收 baseline：以帶 opt-in 環境變數的方式 graceful restart daemon，並把 baseline 數字（2026-07-16 起 31 天、429 共 8,489 筆、395 個叢集、最大叢集 1,032 筆／20.8 分鐘）寫進 issue #33 供日後對照。驗證：daemon 程序環境含該變數，且 issue 留有可對照的 baseline 紀錄。
+- [x] 7.3 部署並釘住驗收 baseline：以帶 opt-in 環境變數的方式 graceful restart daemon，並把 baseline 數字（2026-07-16 起 31 天、429 共 8,489 筆、395 個叢集、最大叢集 1,032 筆／20.8 分鐘）寫進 issue #33 供日後對照。驗證：daemon 程序環境含該變數，且 issue 留有可對照的 baseline 紀錄。
 
 ## 8. 門檻上調與危機解除即自動解除
 
