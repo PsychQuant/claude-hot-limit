@@ -2130,6 +2130,80 @@ class LimiterAutoReleaseTest(unittest.TestCase):
         self.assertIn("WARNING", captured.getvalue(), "應留下可歸因的警告")
 
 
+class LimiterSuppressionReleasesLatchTest(unittest.TestCase):
+    """spec「Suppressing the limiter releases an existing latch」— 停用即釋放（audit C1）。
+
+    原實作三條停用路徑都是單純的 early return，於是「停用」把閂鎖凍結在磁碟上：proxy 不再
+    持住流量，但 pacing-guard 仍依閂鎖檔存在與否 deny，而唯一會刪該檔的自動解除分支永遠
+    到不了。文件推薦的第一個復原動作，正好讓中斷變成永久。
+    """
+
+    ENV_KEYS = ("RATE_LIMIT_PROXY_LIMITER", "RATE_LIMIT_PROXY_LIMITER_HOLD_CAP",
+                "RATE_LIMIT_PROXY_LIMITER_THRESHOLD")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        self._old = {k: os.environ.get(k) for k in self.ENV_KEYS}
+        os.environ["RATE_LIMIT_PROXY_LIMITER"] = "1"
+        os.environ["RATE_LIMIT_PROXY_LIMITER_HOLD_CAP"] = "0.01"
+        os.environ["RATE_LIMIT_PROXY_LIMITER_THRESHOLD"] = "0.96"
+        self.rlp = _load_proxy_module()
+        self.latch = os.path.join(self.dir, self.rlp.LIMITER_LATCH_FILENAME)
+        self.offflag = os.path.join(self.dir, self.rlp.LIMITER_OFF_FILENAME)
+
+    def tearDown(self):
+        for k, v in self._old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.tmp.cleanup()
+
+    def _snap(self, util):
+        self.rlp._LAST_UNIFIED = {"status": "allowed", "reset": None,
+                                  "utilization": util, "observed_at": time.time()}
+
+    def _trip(self):
+        self._snap(0.99)
+        self.assertGreater(self.rlp.limiter_admission(self.dir, tier="5x"), 0, "前置：應先閂鎖")
+        self.assertTrue(os.path.exists(self.latch), "前置：閂鎖檔應存在")
+
+    # --- spec Example「every suppression path releases」逐列 ---
+
+    def test_env_unset_releases_latch(self):
+        self._trip()
+        os.environ.pop("RATE_LIMIT_PROXY_LIMITER", None)
+        self.assertEqual(self.rlp.limiter_admission(self.dir, tier="5x"), 0)
+        self.assertFalse(os.path.exists(self.latch),
+                         "停用（env 未設）必須釋放閂鎖，不能凍結它")
+
+    def test_non_positive_hold_cap_releases_latch(self):
+        self._trip()
+        os.environ["RATE_LIMIT_PROXY_LIMITER_HOLD_CAP"] = "0"
+        self.assertEqual(self.rlp.limiter_admission(self.dir, tier="5x"), 0)
+        self.assertFalse(os.path.exists(self.latch),
+                         "停用（hold cap ≤ 0）必須釋放閂鎖")
+
+    def test_off_flag_releases_latch(self):
+        """README 推薦的復原動作——它必須真的讓人恢復工作。"""
+        self._trip()
+        open(self.offflag, "w").close()
+        self.assertEqual(self.rlp.limiter_admission(self.dir, tier="5x"), 0)
+        self.assertFalse(os.path.exists(self.latch),
+                         "建立 limiter-off 必須釋放閂鎖，否則 guard 會永久 deny")
+
+    def test_suppression_without_latch_is_not_an_error(self):
+        for label, mutate in (("env unset", lambda: os.environ.pop("RATE_LIMIT_PROXY_LIMITER", None)),
+                              ("cap<=0", lambda: os.environ.__setitem__("RATE_LIMIT_PROXY_LIMITER_HOLD_CAP", "0")),
+                              ("off flag", lambda: open(self.offflag, "w").close())):
+            with self.subTest(path=label):
+                self.setUp()
+                mutate()
+                self.assertEqual(self.rlp.limiter_admission(self.dir, tier="5x"), 0,
+                                 "%s：閂鎖不存在時停用路徑不得報錯" % label)
+
+
 class LatchStateFileContractTest(unittest.TestCase):
     """spec「Latch state file contract」— 五項必備資訊 + 兩個旗標檔語意分離。"""
 
@@ -2218,17 +2292,38 @@ class LatchStateFileContractTest(unittest.TestCase):
         # limiter 仍然有效：水位再度達標會重新閂鎖
         self.assertGreater(self._trip(), 0, "刪閂鎖後 limiter 仍應繼續守")
 
-    def test_creating_off_flag_does_not_clear_latch(self):
-        """設停用旗標 = 整個 limiter 不跑；閂鎖檔仍在原地，不會被順手清掉。"""
+    def test_creating_off_flag_releases_the_latch(self):
+        """設停用旗標 = 整個 limiter 不跑，**且釋放閂鎖**（audit C1）。
+
+        舊契約是「閂鎖檔留在原地，兩者互不影響」，但 guard 依閂鎖檔存在與否 deny，
+        於是停用會把工具呼叫凍結成永久被擋。停用必須意味著釋放。
+
+        兩個檔案的語意仍然不同：`limiter-off` 說「這個功能別跑」，`limiter-tripped` 說
+        「現在正閂著」。差別在於前者現在會連帶清掉後者，而不是把它冷凍起來。
+        """
         self._trip()
         open(self.offflag, "w").close()
         self.assertEqual(self.rlp.limiter_admission(self.dir, tier="5x"), 0,
                          "off flag 應讓 limiter 完全不作用")
-        self.assertTrue(os.path.exists(self.latch),
-                        "off flag 不得刪除閂鎖檔——兩者互不影響")
+        self.assertFalse(os.path.exists(self.latch),
+                         "off flag 必須釋放閂鎖，否則 guard 會永久 deny")
+
+    def test_removing_off_flag_re_trips_from_current_watermark(self):
+        """重新啟用後閂鎖來自**當下水位**，不是靠殘留檔案復活。"""
+        self._trip()
+        open(self.offflag, "w").close()
+        self.rlp.limiter_admission(self.dir, tier="5x")  # 釋放
         os.unlink(self.offflag)
-        self.assertGreater(self.rlp.limiter_admission(self.dir, tier="5x"), 0,
-                           "移除 off flag 後，原本的閂鎖仍然生效")
+        self._trip_snapshot_low()
+        self.assertEqual(self.rlp.limiter_admission(self.dir, tier="5x"), 0,
+                         "水位已低 → 重新啟用不應閂鎖（舊契約會讓殘留閂鎖復活）")
+        self.assertFalse(os.path.exists(self.latch))
+        self._trip()  # 水位仍高 → 照常重新閂鎖
+        self.assertTrue(os.path.exists(self.latch), "水位仍達標時應重新閂鎖")
+
+    def _trip_snapshot_low(self):
+        self.rlp._LAST_UNIFIED = {"status": "allowed", "utilization": 0.10,
+                                  "reset": None, "observed_at": time.time()}
 
 
 class LatchDecisionAuditFieldTest(unittest.TestCase):

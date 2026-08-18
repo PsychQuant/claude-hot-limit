@@ -759,6 +759,9 @@ def _write_latch_file(path, util, threshold, tier):
             "claude-hot-limit limiter tripped\n"
             "\n"
             "tripped at : %s\n"
+            # 機器可讀的觸發時間：guard 用它判斷閂鎖是否已過期（audit C2）。人類讀上面
+            # 那行就好；這行存在的唯一理由是不必為了算年齡去解析在地化的時間字串。
+            "tripped at (epoch): %d\n"
             "utilization: %.4f (unified 5h)\n"
             "threshold  : %.4f\n"
             "plan tier  : %s\n"
@@ -772,7 +775,7 @@ def _write_latch_file(path, util, threshold, tier):
             "     水位確實仍在門檻之上時，這是唯一能強制放行的手段。\n"
             "\n"
             "注意       : 不要改動 %s，那是「整個 limiter 停用」，語意不同。\n"
-            % (time.strftime("%Y-%m-%d %H:%M:%S %z"), util, threshold,
+            % (time.strftime("%Y-%m-%d %H:%M:%S %z"), int(time.time()), util, threshold,
                tier if tier else "undetermined (using default threshold)",
                resolve_limiter_hold_cap(), threshold, path, LIMITER_OFF_FILENAME))
 
@@ -812,15 +815,19 @@ def limiter_admission(flag_dir, tier=None):
     """
     global _LIMITER_WARNED
     try:
-        if os.environ.get("RATE_LIMIT_PROXY_LIMITER") != "1":
+        latch = os.path.join(flag_dir, LIMITER_LATCH_FILENAME)
+        # 三條停用路徑（env 未設 / cap ≤ 0 / off 旗標）一律「停用即釋放」：返回前先刪閂鎖。
+        # 早期實作是單純的 early return，於是停用把閂鎖**凍結**在磁碟上——proxy 不再持住，
+        # 但 pacing-guard 仍依閂鎖檔存在與否 deny，而唯一會刪它的自動解除分支永遠到不了。
+        # 使用者照文件建立 limiter-off 之後，狀況從「每個請求慢」變成「工具呼叫永久被擋」。
+        # disable 必須意味著 release，不是 freeze（audit C1）。
+        if (os.environ.get("RATE_LIMIT_PROXY_LIMITER") != "1"
+                or resolve_limiter_hold_cap() is None
+                or os.path.exists(os.path.join(flag_dir, LIMITER_OFF_FILENAME))):
+            if os.path.exists(latch):
+                _clear_latch_file(latch)
             return 0
         cap = resolve_limiter_hold_cap()
-        if cap is None:
-            return 0
-        # 停用旗標必須在閂鎖檢查**之前**——否則已閂鎖的使用者無法用 off flag 逃生。
-        if os.path.exists(os.path.join(flag_dir, LIMITER_OFF_FILENAME)):
-            return 0
-        latch = os.path.join(flag_dir, LIMITER_LATCH_FILENAME)
         snap = _LAST_UNIFIED
         util = (snap or {}).get("utilization")  # 快照的窄投影欄位名，非原始 header 欄位名
         util = float(util) if util is not None else None  # 無水位資料 → 不猜（7d 不代用）

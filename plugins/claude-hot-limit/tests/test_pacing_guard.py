@@ -1594,6 +1594,52 @@ class LimiterLatchGuardTest(unittest.TestCase):
         _, parsed, _ = run_hook(tool="Workflow", env_overrides=self._env())
         self.assertFalse(is_deny(parsed))
 
+    # --- 閂鎖時效（audit C2）：proxy 不在場時的唯一保險 ---
+
+    def _write_latch_with_epoch(self, epoch, include_epoch=True):
+        body = ("claude-hot-limit limiter tripped\n\n"
+                "tripped at : 2026-08-17 22:30:00 +0800\n")
+        if include_epoch:
+            body += "tripped at (epoch): %d\n" % int(epoch)
+        body += ("utilization: 0.9721 (unified 5h)\n"
+                 "threshold  : 0.9600\n"
+                 "plan tier  : 5x\n")
+        with open(self.latch, "w") as f:
+            f.write(body)
+
+    def test_latch_age_decides(self):
+        """spec Example「latch age decides」逐列。
+
+        閂鎖比它保護的那個窗還老 = 沒有 proxy 在釋放它（daemon 死了／機器重開／流量
+        不再經過 proxy）。這時繼續 deny 就是永久 deny，因為沒有任何程序會再清它。
+        """
+        now = time.time()
+        for label, age_s, expect_deny in (("1 分鐘", 60, True),
+                                          ("4h59m", 4 * 3600 + 59 * 60, True),
+                                          ("5h01m", 5 * 3600 + 60, False),
+                                          ("3 天", 3 * 86400, False)):
+            with self.subTest(age=label):
+                self._write_latch_with_epoch(now - age_s)
+                _, parsed, raw = run_hook(tool="Workflow", env_overrides=self._env())
+                self.assertEqual(is_deny(parsed), expect_deny,
+                                 "閂鎖年齡 %s 應%s，raw=%r"
+                                 % (label, "deny" if expect_deny else "放行", raw))
+
+    def test_missing_epoch_falls_back_to_mtime(self):
+        """舊格式／被截斷的閂鎖檔不得因此變成「永不過期」。"""
+        self._write_latch_with_epoch(0, include_epoch=False)
+        old = time.time() - (6 * 3600)
+        os.utime(self.latch, (old, old))
+        _, parsed, raw = run_hook(tool="Workflow", env_overrides=self._env())
+        self.assertFalse(is_deny(parsed),
+                         "無 epoch 欄位時應改用 mtime 判定年齡，raw=%r" % raw)
+
+    def test_missing_epoch_with_fresh_mtime_still_denies(self):
+        self._write_latch_with_epoch(0, include_epoch=False)
+        _, parsed, raw = run_hook(tool="Workflow", env_overrides=self._env())
+        self.assertTrue(is_deny(parsed),
+                        "無 epoch 但檔案是新的 → 仍應 deny，raw=%r" % raw)
+
     def test_guard_does_not_own_the_threshold(self):
         """單一真相：門檻只在 proxy。guard 內不得出現 tier / 門檻 / 設定檔解析。"""
         src = open(HOOK).read()

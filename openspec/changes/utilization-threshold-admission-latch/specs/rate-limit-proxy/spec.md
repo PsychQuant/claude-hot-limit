@@ -41,7 +41,7 @@ The resolution chain SHALL be: detected tier, then explicit override (a per-tier
 
 When the limiter is enabled, the proxy SHALL trip a latch as soon as the most recently observed account-level unified five-hour utilization reaches the resolved threshold, and SHALL hold every subsequent admission for the full hold cap before forwarding it unchanged. The proxy SHALL clear the latch as soon as the most recently observed utilization falls below that same threshold, and SHALL forward the admission that observed the fall without any hold. The threshold governing the clear SHALL be the same resolved value that governs the trip; the proxy SHALL NOT apply a separate release threshold, a hysteresis band, or a minimum latch duration. Deletion of the latch state file SHALL remain an equally valid way to clear the latch. The proxy SHALL NOT clear the latch on a timer, on daemon restart, or while no utilization observation is available.
 
-The limiter SHALL be opt-in: it activates only when its enabling environment variable is set at daemon start, and SHALL be suppressed at any time by the presence of a disable flag file in the data directory, checked per admission. The limiter SHALL be fail-open: any internal error in the latch decision SHALL result in immediate forwarding, never in blocking or dropping the request.
+The limiter SHALL be opt-in: it activates only when its enabling environment variable is set at daemon start, and SHALL be suppressed at any time by the presence of a disable flag file in the data directory, checked per admission. Whenever the limiter is suppressed by any means — the enabling environment variable unset, a non-positive hold cap, or the disable flag file present — the proxy SHALL delete the latch state file if it exists. Suppressing the limiter SHALL NOT leave a latch state file behind, because no other code path would then remove it and the pacing guard would keep denying work forever. The limiter SHALL be fail-open: any internal error in the latch decision SHALL result in immediate forwarding, never in blocking or dropping the request.
 
 The limiter SHALL evaluate the five-hour window only. Seven-day utilization SHALL NOT trip the latch in this capability.
 
@@ -102,6 +102,24 @@ The limiter SHALL evaluate the five-hour window only. Seven-day utilization SHAL
 - **WHEN** the limiter is enabled by environment variable but the disable flag file exists in the data directory
 - **THEN** the proxy SHALL forward immediately for as long as that flag file exists, without requiring a daemon restart
 
+#### Scenario: Suppressing the limiter releases an existing latch
+
+- **WHEN** a latch state file exists and the limiter is then suppressed by any of the three means — enabling environment variable unset, hold cap set to zero or below, or disable flag file created
+- **THEN** the proxy SHALL delete the latch state file on the next admission and SHALL forward immediately, so that the pacing guard stops denying work without any manual file removal
+
+##### Example: every suppression path releases
+
+| Suppression means | Latch file afterwards |
+| ----------------- | --------------------- |
+| enabling environment variable unset | deleted |
+| hold cap ≤ 0 | deleted |
+| disable flag file present | deleted |
+
+#### Scenario: Releasing on suppression tolerates a missing latch
+
+- **WHEN** the limiter is suppressed and no latch state file exists
+- **THEN** the proxy SHALL forward immediately and SHALL NOT treat the absent file as an error
+
 #### Scenario: Latch decision failure is fail-open
 
 - **WHEN** the latch decision raises any exception, or the latch state file cannot be created
@@ -111,7 +129,7 @@ The limiter SHALL evaluate the five-hour window only. Seven-day utilization SHAL
 
 ### Requirement: Latch state file contract
 
-The latch state file SHALL be the sole interface through which the latch is observed, and SHALL be one of the two ways it is cleared, the other being the proxy's own release when utilization falls below the threshold. Its content SHALL be human-readable and SHALL record the wall-clock time the latch tripped, the utilization value observed at that moment, the threshold in force, the detected tier, and the instruction for clearing it. Consumers SHALL treat the existence of the file as the latch signal and SHALL NOT infer latch state from any other source.
+The latch state file SHALL be the sole interface through which the latch is observed, and SHALL be one of the two ways it is cleared, the other being the proxy's own release when utilization falls below the threshold. Its content SHALL be human-readable and SHALL record the wall-clock time the latch tripped, the utilization value observed at that moment, the threshold in force, the detected tier, and the instruction for clearing it. It SHALL additionally record the trip time in a machine-readable form, so that a reader can determine the latch's age without parsing localised text. Consumers SHALL treat the existence of the file as the latch signal and SHALL NOT infer latch state from any other source.
 
 The disable flag file and the latch state file SHALL be distinct files with distinct names, because deleting the wrong one produces silently different outcomes: clearing the latch resumes normal operation, whereas setting the disable flag turns the limiter off entirely.
 
@@ -129,6 +147,30 @@ The disable flag file and the latch state file SHALL be distinct files with dist
 
 - **WHEN** the latch state file exists and a tool launch is intercepted by the pacing guard
 - **THEN** the guard SHALL deny that launch and SHALL print the latch context, so that the operator learns why work stopped and how to resume
+
+#### Scenario: Guard ignores a latch older than one quota window
+
+- **WHEN** the pacing guard reads a latch state file whose trip time is more than one five-hour window in the past
+- **THEN** the guard SHALL allow the tool launch, because a latch outliving the window it protected means no proxy is releasing it — the daemon died, the machine restarted, or traffic no longer flows through the proxy
+
+##### Example: latch age decides
+
+| Latch age | Guard behaviour |
+| --------- | --------------- |
+| 1 minute | deny |
+| 4 hours 59 minutes | deny |
+| 5 hours 1 minute | allow |
+| 3 days | allow |
+
+#### Scenario: Guard falls back to file mtime when the trip time is unreadable
+
+- **WHEN** the latch state file carries no parseable machine-readable trip time, such as a file written by an earlier version or a truncated write
+- **THEN** the guard SHALL determine the latch's age from the file's modification time rather than treating the latch as ageless
+
+#### Scenario: Latch staleness is the one bound the guard owns
+
+- **WHEN** the guard decides whether a latch is stale
+- **THEN** it SHALL derive that decision only from the latch state file's trip time and the fixed window length, and SHALL still NOT resolve the tier, the threshold, or the utilization value; this bound is deliberately independent of the proxy because it exists to survive the proxy being absent
 
 #### Scenario: Guard failure never blocks work
 

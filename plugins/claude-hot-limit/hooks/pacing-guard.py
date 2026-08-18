@@ -663,12 +663,27 @@ def main():
     # 全在 proxy。兩處各自解析會漂移成互相矛盾的兩個真相（見 .claude/rules/per-bucket-settings.md）。
     # 位置：在 disabled 之後（全域 off 位階更高）、override 檔讀取之前（FIFO block 風險同理）。
     # 檔名與 proxy 的 LIMITER_LATCH_FILENAME 對應（跨 process，無法共用常數）。
+    # 時效（audit C2）：閂鎖比它保護的那個窗還老 → 沒有 proxy 在釋放它（daemon 死了、
+    # 機器重開、或流量不再經過 proxy）。這時繼續 deny 就是**永久** deny，因為沒有任何
+    # 程序會再清它。這是本 hook 唯一自行判定的量，且刻意獨立於 proxy——它要防的正是
+    # proxy 不在場，建立在 proxy 之上的保險在該情境下不會執行。判的是**時間**不是門檻，
+    # 所以「guard 不擁有門檻」的紀律仍然成立。
+    LATCH_MAX_AGE_S = 5 * 3600  # 一個完整的 5 小時配額窗
     latch_body = None
     try:
         latch_path = os.path.join(data_dir, "limiter-tripped")
         if os.path.isfile(latch_path):
             with open(latch_path) as f:
                 latch_body = f.read(2048)  # bounded read，比照既有 override 檔紀律
+            tripped_at = None
+            m = re.search(r"tripped at \(epoch\)\s*:\s*(\d+)", latch_body or "")
+            if m:
+                tripped_at = float(m.group(1))
+            if tripped_at is None:
+                # 舊版寫的檔、或被截斷的殘檔：改用 mtime，不讓它變成「永不過期」。
+                tripped_at = os.path.getmtime(latch_path)
+            if (time.time() - tripped_at) > LATCH_MAX_AGE_S:
+                latch_body = None  # 過期 → 當作沒有閂鎖
     except Exception:
         latch_body = None  # fail-open：可見度層不得成為新的失敗點
     if latch_body:

@@ -44,3 +44,13 @@
 - [x] 8.5 [P] 同步 README.md、README.en.md、README.ja.md 與 plugins/claude-hot-limit/README.md 的 limiter 段落：新門檻值、自動解除語意、以及「閂鎖至多持續到當前 5 小時配額窗結束，不再需要人回來才恢復」。驗證：四份檔案經內容審閱皆含這三點，且原有的兩個旗標檔語意差異警語未被移除。
 - [x] 8.6 [P] 於 changelog 目錄新增本次行為變更條目：門檻上調、自動解除、以及「原 2026-08-18 事故（閂鎖於危機解除後續留四小時）」的對照說明。驗證：檔案存在且內容審閱確認含上述三項。
 - [ ] 8.7 部署並觀察一次完整的自動解除：graceful restart daemon 後，於下一次閂鎖觸發至配額窗切換之間，確認 rate-state 記錄出現「limiter_held_ms 由 90000 級距轉為 0 且閂鎖檔消失」的轉折，且該轉折發生在 rl_unified_5h_reset 跳轉之後的第一或第二個請求。驗證：以 rate-state.jsonl 取出該時段樣本，確認轉折存在且無人工刪檔介入。
+
+## 9. audit C1／C2：停用即釋放、閂鎖時效
+
+- [x] 9.1 先寫停用即釋放的測試（TDD 紅燈），落實 **停用即釋放，絕不把閂鎖凍結在原地**：閂鎖存在時，分別以「opt-in 環境變數未設」「hold cap ≤ 0」「`limiter-off` 存在」三條路徑各跑一次 admission，斷言回傳 0 **且閂鎖檔已被刪除**；另斷言閂鎖不存在時三條路徑都不拋例外。驗證：於 plugins/claude-hot-limit/tests/test_rate_limit_proxy.py 新增的測試在實作前失敗（現行實作只 early return、不刪檔）。
+- [x] 9.2 於 `limiter_admission` 實作停用即釋放：三條停用路徑在回傳 0 之前都先嘗試刪除閂鎖檔，沿用 `_clear_latch_file` 的 fail-open 紀律（刪不掉一樣回傳 0、不阻塞）。驗證：9.1 的測試轉綠，且既有的「未 opt-in 時行為與現況逐位元相同」測試在**閂鎖不存在**的前提下仍為綠。
+- [x] 9.3 先寫閂鎖時效的 guard 測試（TDD 紅燈），落實 **閂鎖時效由 guard 獨立判定（唯一容許的第二判準）**：spec Example「latch age decides」四列逐列（1 分鐘 deny、4h59m deny、5h01m allow、3 天 allow）；另一測試斷言缺少機器可讀觸發時間的舊格式閂鎖改用檔案 mtime 判定年齡。驗證：於 plugins/claude-hot-limit/tests/test_pacing_guard.py 新增的測試在實作前失敗。
+- [x] 9.4 實作閂鎖時效：`_write_latch_file` 增寫機器可讀的觸發時間欄位（epoch 秒），guard 解析該欄位計算年齡、超過一個 5 小時窗即放行；解析失敗退回檔案 mtime。guard 仍不解析 tier／門檻／utilization。驗證：9.3 的測試轉綠，且既有「閂鎖存在時 deny 並顯示 context」與「讀取失敗一律放行」兩個測試維持綠燈。
+- [x] 9.5 修正四份 README 中因 C1／C2 而失準的敘述：`limiter-off` 的說明須寫明它**同時釋放閂鎖**（不再是「閂鎖檔留在原地」）；「閂鎖至多持續到當前 5 小時配額窗結束」須補上「proxy 不在場時由 guard 的時效判定兜底」。驗證：四份檔案經內容審閱皆已更新且不再宣稱需要手動刪檔才能從停用狀態恢復。
+- [x] 9.6 於 changelog 目錄新增 C1／C2 修正條目，記錄「停用曾把閂鎖凍結成永久 deny」這個失敗模式、兩項修正、以及部署需求。驗證：檔案存在且內容審閱確認含上述三項。
+- [ ] 9.7 部署修正版：bump 版本、commit、同步 marketplace、graceful restart daemon，並實測一次「閂鎖存在時建立 `limiter-off` → 閂鎖檔消失」。驗證：daemon 跑新版本，且該實測在真實 data 目錄上重現成功。
