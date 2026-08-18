@@ -15,8 +15,8 @@ The resolution chain SHALL be: detected tier, then explicit override (a per-tier
 
 | Detected tier | Resolved threshold | Notes |
 | ------------- | ------------------ | ----- |
-| `5x` | 0.90 | default for this tier |
-| `20x` | 0.95 | default for this tier |
+| `5x` | 0.96 | default for this tier |
+| `20x` | 0.98 | default for this tier |
 | `7x` | single default | unrecognised tier, fail open |
 | absent | single default | key missing from configuration file |
 
@@ -39,7 +39,7 @@ The resolution chain SHALL be: detected tier, then explicit override (a per-tier
 
 ### Requirement: Utilization-threshold admission latch
 
-When the limiter is enabled, the proxy SHALL trip a latch as soon as the most recently observed account-level unified five-hour utilization reaches the resolved threshold, and SHALL hold every subsequent admission for the full hold cap before forwarding it unchanged. The latch SHALL be cleared only by deletion of the latch state file; the proxy SHALL NOT clear it on a timer, on utilization falling back below the threshold, or on daemon restart.
+When the limiter is enabled, the proxy SHALL trip a latch as soon as the most recently observed account-level unified five-hour utilization reaches the resolved threshold, and SHALL hold every subsequent admission for the full hold cap before forwarding it unchanged. The proxy SHALL clear the latch as soon as the most recently observed utilization falls below that same threshold, and SHALL forward the admission that observed the fall without any hold. The threshold governing the clear SHALL be the same resolved value that governs the trip; the proxy SHALL NOT apply a separate release threshold, a hysteresis band, or a minimum latch duration. Deletion of the latch state file SHALL remain an equally valid way to clear the latch. The proxy SHALL NOT clear the latch on a timer, on daemon restart, or while no utilization observation is available.
 
 The limiter SHALL be opt-in: it activates only when its enabling environment variable is set at daemon start, and SHALL be suppressed at any time by the presence of a disable flag file in the data directory, checked per admission. The limiter SHALL be fail-open: any internal error in the latch decision SHALL result in immediate forwarding, never in blocking or dropping the request.
 
@@ -54,20 +54,38 @@ The limiter SHALL evaluate the five-hour window only. Seven-day utilization SHAL
 
 | Resolved threshold | Observed utilization | Latch tripped |
 | ------------------ | -------------------- | ------------- |
-| 0.90 | 0.899 | no |
-| 0.90 | 0.900 | yes |
-| 0.90 | 0.910 | yes |
-| 0.95 | 0.940 | no |
+| 0.96 | 0.959 | no |
+| 0.96 | 0.960 | yes |
+| 0.96 | 0.970 | yes |
+| 0.98 | 0.970 | no |
 
-#### Scenario: Every admission holds while latched
+#### Scenario: Every admission holds while latched and utilization stays high
 
-- **WHEN** the latch state file exists and a new request arrives
-- **THEN** the proxy SHALL hold that request for the full hold cap and SHALL then forward it unchanged, regardless of the current utilization value
+- **WHEN** the latch state file exists, a new request arrives, and the latest snapshot reports utilization at or above the resolved threshold
+- **THEN** the proxy SHALL hold that request for the full hold cap and SHALL then forward it unchanged
 
-#### Scenario: Latch persists below the threshold
+#### Scenario: Utilization falling below the threshold clears the latch
 
 - **WHEN** the latch state file exists and the latest snapshot reports utilization below the resolved threshold
-- **THEN** the proxy SHALL keep holding admissions, because only deletion of the latch state file clears the latch
+- **THEN** the proxy SHALL delete the latch state file and SHALL forward that request immediately without any hold
+
+##### Example: symmetric boundary for trip and clear
+
+| Resolved threshold | Observed utilization | Latch state after admission |
+| ------------------ | -------------------- | --------------------------- |
+| 0.96 | 0.960 | latched (trip boundary is inclusive) |
+| 0.96 | 0.959 | cleared |
+| 0.96 | 0.000 | cleared |
+
+#### Scenario: Latch persists while no utilization observation exists
+
+- **WHEN** the latch state file exists and no five-hour utilization value has been observed, such as immediately after a daemon restart
+- **THEN** the proxy SHALL keep holding admissions, because clearing the latch without an observation would be a guess
+
+#### Scenario: Latch file deletion failure is fail-open
+
+- **WHEN** utilization has fallen below the threshold but the latch state file cannot be deleted
+- **THEN** the proxy SHALL forward the request immediately without any hold, SHALL emit a warning to stderr, and SHALL NOT retry the deletion within that admission
 
 #### Scenario: Deleting the latch restores normal forwarding
 
@@ -93,7 +111,7 @@ The limiter SHALL evaluate the five-hour window only. Seven-day utilization SHAL
 
 ### Requirement: Latch state file contract
 
-The latch state file SHALL be the sole interface through which the latch is observed and cleared. Its content SHALL be human-readable and SHALL record the wall-clock time the latch tripped, the utilization value observed at that moment, the threshold in force, the detected tier, and the instruction for clearing it. Consumers SHALL treat the existence of the file as the latch signal and SHALL NOT infer latch state from any other source.
+The latch state file SHALL be the sole interface through which the latch is observed, and SHALL be one of the two ways it is cleared, the other being the proxy's own release when utilization falls below the threshold. Its content SHALL be human-readable and SHALL record the wall-clock time the latch tripped, the utilization value observed at that moment, the threshold in force, the detected tier, and the instruction for clearing it. Consumers SHALL treat the existence of the file as the latch signal and SHALL NOT infer latch state from any other source.
 
 The disable flag file and the latch state file SHALL be distinct files with distinct names, because deleting the wrong one produces silently different outcomes: clearing the latch resumes normal operation, whereas setting the disable flag turns the limiter off entirely.
 
@@ -101,6 +119,11 @@ The disable flag file and the latch state file SHALL be distinct files with dist
 
 - **WHEN** the latch trips
 - **THEN** the latch state file SHALL contain the trip time, the observed utilization, the threshold in force, the detected tier, and the clearing instruction
+
+#### Scenario: Latch file states both release paths
+
+- **WHEN** the latch state file is written
+- **THEN** its clearing instruction SHALL state both that the proxy releases the latch automatically once utilization falls below the threshold and that deleting the file releases it immediately, so that the operator does not read the file as requiring manual action
 
 #### Scenario: Guard surfaces the latch to the operator
 

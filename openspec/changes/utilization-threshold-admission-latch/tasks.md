@@ -34,3 +34,13 @@
 - [x] 7.1 [P] 同步 README.md、README.en.md、README.ja.md 與 plugins/claude-hot-limit/README.md：新增 limiter 段落，明寫 opt-in 方式、兩個旗標檔的語意差異、以及「unattended 長跑會被閂到人回來是特性不是當機」。驗證：四份檔案經內容審閱皆含這三點。
 - [x] 7.2 [P] 於 changelog 目錄新增本次條目，記錄行為變更、部署需求（daemon graceful restart）與兩層回退路徑（建立停用旗標即時停用、移除環境變數並重啟完全回退）。驗證：檔案存在且內容審閱確認含上述三項。
 - [ ] 7.3 部署並釘住驗收 baseline：以帶 opt-in 環境變數的方式 graceful restart daemon，並把 baseline 數字（2026-07-16 起 31 天、429 共 8,489 筆、395 個叢集、最大叢集 1,032 筆／20.8 分鐘）寫進 issue #33 供日後對照。驗證：daemon 程序環境含該變數，且 issue 留有可對照的 baseline 紀錄。
+
+## 8. 門檻上調與危機解除即自動解除
+
+- [x] 8.1 先寫自動解除的行為測試（TDD 紅燈），一併落實 **5h 窗為固定窗，故對稱解除不需遲滯**（解除門檻與觸發門檻為同一值，測試不得引入第二個門檻或最短閂鎖時間）：閂鎖存在且 5h utilization 低於門檻時，該次 admission 持住毫秒為 0、閂鎖檔已不存在；utilization 恰等於門檻時仍維持閂鎖（與觸發共用同一個 inclusive 邊界）；utilization 為 None（daemon 重啟後尚無觀測）時維持閂鎖；閂鎖檔刪除失敗時仍立即轉發且不重試。驗證：於 plugins/claude-hot-limit/tests/test_rate_limit_proxy.py 新增的四個測試在實作前全數失敗。
+- [x] 8.2 於 limiter 的 admission 判定實作 **閂鎖語意：持滿上限後轉發；危機解除即自動解除**：閂鎖存在時不再直接持住，而是先取與觸發同一份 5h utilization 快照、同一次 resolve_limiter_threshold 結果比對，低於門檻則刪除閂鎖檔並回傳 0（不持住）、否則維持既有持住行為。解除路徑沿用 fail-open 鐵律：刪檔拋例外時仍立即轉發。驗證：8.1 的四個測試轉綠，且既有的觸發／持住／人工刪檔測試全數維持綠燈。
+- [x] 8.3 [P] 將方案別預設門檻由 5x 0.90／20x 0.95 上調為 **5x 0.96／20x 0.98**，未判定 tier 的單一預設仍取兩者較低者（0.96）。驗證：spec 的 tier-to-threshold Example 表與 boundary Example 表對應測試改用新值後通過，且未判定 tier 的測試斷言解析結果為 0.96。
+- [x] 8.4 [P] 更新閂鎖檔的解除說明文案：明寫「水位回落到門檻以下時 proxy 會自動解除」與「刪除本檔案可立即解除」**兩條路徑並存**，取代現行「解除方式：刪除本檔案」的單一敘述。驗證：測試斷言檔案內容同時含自動解除與手動刪檔兩句，且原有的觸發時間／utilization／門檻／tier 四項仍在。
+- [x] 8.5 [P] 同步 README.md、README.en.md、README.ja.md 與 plugins/claude-hot-limit/README.md 的 limiter 段落：新門檻值、自動解除語意、以及「閂鎖至多持續到當前 5 小時配額窗結束，不再需要人回來才恢復」。驗證：四份檔案經內容審閱皆含這三點，且原有的兩個旗標檔語意差異警語未被移除。
+- [x] 8.6 [P] 於 changelog 目錄新增本次行為變更條目：門檻上調、自動解除、以及「原 2026-08-18 事故（閂鎖於危機解除後續留四小時）」的對照說明。驗證：檔案存在且內容審閱確認含上述三項。
+- [ ] 8.7 部署並觀察一次完整的自動解除：graceful restart daemon 後，於下一次閂鎖觸發至配額窗切換之間，確認 rate-state 記錄出現「limiter_held_ms 由 90000 級距轉為 0 且閂鎖檔消失」的轉折，且該轉折發生在 rl_unified_5h_reset 跳轉之後的第一或第二個請求。驗證：以 rate-state.jsonl 取出該時段樣本，確認轉折存在且無人工刪檔介入。

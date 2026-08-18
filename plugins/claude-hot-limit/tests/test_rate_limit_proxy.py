@@ -1840,8 +1840,8 @@ class LimiterThresholdResolutionTest(unittest.TestCase):
         """spec Example 表逐列（不自行發明額外值——表就是議定規格）。"""
         rlp = _load_proxy_module()
         default = rlp._LIMITER_DEFAULT_THRESHOLD
-        for tier, expect, note in (("5x", 0.90, "default for this tier"),
-                                   ("20x", 0.95, "default for this tier"),
+        for tier, expect, note in (("5x", 0.96, "default for this tier"),
+                                   ("20x", 0.98, "default for this tier"),
                                    ("7x", default, "unrecognised tier, fail open"),
                                    (None, default, "key missing from configuration file")):
             self.assertAlmostEqual(self._resolve(tier), expect, places=6,
@@ -1850,7 +1850,7 @@ class LimiterThresholdResolutionTest(unittest.TestCase):
     def test_conservative_default_is_the_lower_tier(self):
         """未判定時取較低門檻：早停可逆，漏停不可逆。"""
         rlp = _load_proxy_module()
-        self.assertEqual(rlp._LIMITER_DEFAULT_THRESHOLD, 0.90)
+        self.assertEqual(rlp._LIMITER_DEFAULT_THRESHOLD, 0.96)
 
     def test_file_override_wins_over_tier_default(self):
         with open(os.path.join(self.dir, "limiter-20x"), "w") as f:
@@ -1865,8 +1865,8 @@ class LimiterThresholdResolutionTest(unittest.TestCase):
         for bad in ("abc", "", "0", "-0.5", "1.5", "nan", "inf", "-inf"):
             with open(os.path.join(self.dir, "limiter-5x"), "w") as f:
                 f.write(bad)
-            self.assertAlmostEqual(self._resolve("5x"), 0.90, places=6,
-                                   msg="壞值 %r 應落回 tier 預設 0.90" % bad)
+            self.assertAlmostEqual(self._resolve("5x"), 0.96, places=6,
+                                   msg="壞值 %r 應落回 tier 預設 0.96" % bad)
 
     def test_boundary_one_is_accepted(self):
         with open(os.path.join(self.dir, "limiter-5x"), "w") as f:
@@ -1878,7 +1878,7 @@ class LimiterThresholdResolutionTest(unittest.TestCase):
 class LimiterLatchTest(unittest.TestCase):
     """spec「Utilization-threshold admission latch」— 觸發邊界、opt-in／逃生、閂鎖語意。
 
-    單元層直接餵 `_LAST_UNIFIED` 快照，才驗得到 0.899/0.900 這種邊界；hold cap 設極小
+    單元層直接餵 `_LAST_UNIFIED` 快照，才驗得到 0.959/0.960 這種邊界；hold cap 設極小
     值讓測試不真的睡。
     """
 
@@ -1919,21 +1919,27 @@ class LimiterLatchTest(unittest.TestCase):
     def _admit(self, tier="5x"):
         return self.rlp.limiter_admission(self.dir, tier=tier)
 
-    # --- 觸發邊界（門檻 0.90）---
+    # --- 觸發邊界（spec Example「boundary at the threshold」四列）---
 
     def test_below_threshold_does_not_trip(self):
-        self._snap(util_5h=0.899)
-        self.assertEqual(self._admit(), 0, "0.899 < 0.90 不應閂鎖")
+        self._snap(util_5h=0.959)
+        self.assertEqual(self._admit(), 0, "0.959 < 0.96 不應閂鎖")
         self.assertFalse(os.path.exists(self.latch), "不應建立閂鎖檔")
 
     def test_exactly_at_threshold_trips(self):
-        self._snap(util_5h=0.900)
-        self.assertGreater(self._admit(), 0, "0.900 達門檻應閂鎖並持住")
+        self._snap(util_5h=0.960)
+        self.assertGreater(self._admit(), 0, "0.960 達門檻應閂鎖並持住")
         self.assertTrue(os.path.exists(self.latch), "應建立閂鎖檔")
 
     def test_above_threshold_trips(self):
-        self._snap(util_5h=0.910)
-        self.assertGreater(self._admit(), 0, "0.910 > 0.90 應閂鎖並持住")
+        self._snap(util_5h=0.970)
+        self.assertGreater(self._admit(), 0, "0.970 > 0.96 應閂鎖並持住")
+
+    def test_twenty_x_tier_holds_to_its_own_higher_threshold(self):
+        """spec boundary 表第四列：門檻 0.98 時 0.970 不觸發——門檻確實隨 tier 走。"""
+        self._snap(util_5h=0.970)
+        self.assertEqual(self._admit(tier="20x"), 0, "0.970 < 0.98 不應閂鎖")
+        self.assertFalse(os.path.exists(self.latch), "不應建立閂鎖檔")
 
     def test_seven_day_window_never_trips(self):
         """觸發訊號只取 5 小時窗——7 天窗達標不得閂鎖。"""
@@ -1989,11 +1995,13 @@ class LimiterLatchTest(unittest.TestCase):
         for _ in range(3):
             self.assertGreater(self._admit(), 0, "閂鎖期間每個 admission 都要持住")
 
-    def test_latch_persists_below_threshold(self):
+    def test_falling_below_threshold_clears_latch(self):
+        """危機解除即自動解除——取代舊契約「水位回落不解除」。"""
         self._snap(util_5h=0.99)
         self._admit()
-        self._snap(util_5h=0.10)  # 水位回落
-        self.assertGreater(self._admit(), 0, "水位回落不解除閂鎖——只有刪檔才解除")
+        self._snap(util_5h=0.10)  # 水位回落（例如配額窗切換）
+        self.assertEqual(self._admit(), 0, "水位回落到門檻以下應自動解除且不持住")
+        self.assertFalse(os.path.exists(self.latch), "自動解除後閂鎖檔應消失")
 
     def test_deleting_latch_restores_forwarding(self):
         self._snap(util_5h=0.99)
@@ -2003,14 +2011,123 @@ class LimiterLatchTest(unittest.TestCase):
         self.assertEqual(self._admit(), 0, "刪除閂鎖檔後下一個請求應立即轉發")
 
     def test_latch_survives_module_reload(self):
-        """閂鎖是檔案狀態，daemon 重啟（等同重新載入模組）不解除。"""
+        """閂鎖是檔案狀態，daemon 重啟（等同重新載入模組）不解除。
+
+        水位刻意維持在門檻之上：重啟本身不解除閂鎖，但**水位回落**會（見
+        LimiterAutoReleaseTest）。兩者是不同的解除條件，測試不可混用。
+        """
         self._snap(util_5h=0.99)
         self._admit()
         fresh = _load_proxy_module()
-        fresh._LAST_UNIFIED = {"status": "allowed", "utilization": 0.10,
+        fresh._LAST_UNIFIED = {"status": "allowed", "utilization": 0.99,
                                "reset": None, "observed_at": time.time()}
         self.assertGreater(fresh.limiter_admission(self.dir, tier="5x"), 0,
                            "重新載入後閂鎖仍在")
+
+    def test_latch_persists_when_no_observation_after_reload(self):
+        """daemon 重啟後尚無 utilization 觀測 → 維持閂鎖（不猜）。"""
+        self._snap(util_5h=0.99)
+        self._admit()
+        fresh = _load_proxy_module()  # 全新模組：_LAST_UNIFIED 尚未被任何回應填過
+        self.assertGreater(fresh.limiter_admission(self.dir, tier="5x"), 0,
+                           "無觀測時不得解除——解除需要證據，不能靠猜")
+        self.assertTrue(os.path.exists(self.latch), "無觀測時閂鎖檔應留著")
+
+
+class LimiterAutoReleaseTest(unittest.TestCase):
+    """spec「Utilization falling below the threshold clears the latch」— 自動解除。
+
+    門檻以 env 顯式固定為 0.96，**刻意不依賴 tier 預設**：解除語意與方案別預設值是兩件
+    事，預設值日後再調不應該讓這組測試連帶重寫。
+    """
+
+    ENV_KEYS = ("RATE_LIMIT_PROXY_LIMITER", "RATE_LIMIT_PROXY_LIMITER_HOLD_CAP",
+                "RATE_LIMIT_PROXY_LIMITER_THRESHOLD")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        self._old = {k: os.environ.get(k) for k in self.ENV_KEYS}
+        os.environ["RATE_LIMIT_PROXY_LIMITER"] = "1"
+        os.environ["RATE_LIMIT_PROXY_LIMITER_HOLD_CAP"] = "0.01"  # 不真睡
+        os.environ["RATE_LIMIT_PROXY_LIMITER_THRESHOLD"] = "0.96"
+        self.rlp = _load_proxy_module()
+        self.latch = os.path.join(self.dir, self.rlp.LIMITER_LATCH_FILENAME)
+
+    def tearDown(self):
+        for k, v in self._old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.tmp.cleanup()
+
+    def _snap(self, util):
+        self.rlp._LAST_UNIFIED = {"status": "allowed", "reset": None,
+                                  "utilization": util, "observed_at": time.time()}
+
+    def _admit(self):
+        return self.rlp.limiter_admission(self.dir, tier="5x")
+
+    def _trip(self):
+        self._snap(0.99)
+        self.assertGreater(self._admit(), 0, "前置：應先閂鎖")
+        self.assertTrue(os.path.exists(self.latch), "前置：閂鎖檔應存在")
+
+    def test_symmetric_boundary_table(self):
+        """spec Example「symmetric boundary for trip and clear」逐列。
+
+        觸發邊界 inclusive、解除邊界 exclusive——同一個門檻值，不留遲滯帶。
+        """
+        for util, latched_after, note in ((0.960, True, "trip boundary is inclusive"),
+                                          (0.959, False, "cleared"),
+                                          (0.000, False, "cleared")):
+            with self.subTest(util=util):
+                self._trip()
+                self._snap(util)
+                held = self._admit()
+                if latched_after:
+                    self.assertGreater(held, 0, "util=%r（%s）應維持閂鎖" % (util, note))
+                    self.assertTrue(os.path.exists(self.latch), "閂鎖檔應留著")
+                else:
+                    self.assertEqual(held, 0, "util=%r（%s）應解除且不持住" % (util, note))
+                    self.assertFalse(os.path.exists(self.latch), "閂鎖檔應被刪除")
+
+    def test_missing_utilization_keeps_latch(self):
+        """無觀測 → 維持閂鎖。解除需要證據；沒有資料不等於水位低。"""
+        self._trip()
+        self._snap(None)
+        self.assertGreater(self._admit(), 0, "utilization 為 None 時不得解除")
+        self.assertTrue(os.path.exists(self.latch), "閂鎖檔應留著")
+
+    def test_release_is_immediate_not_after_a_hold(self):
+        """解除的那一次 admission 本身就不持住——不是「再等 90 秒才恢復」。"""
+        self._trip()
+        self._snap(0.10)
+        t0 = time.monotonic()
+        held = self._admit()
+        elapsed = time.monotonic() - t0
+        self.assertEqual(held, 0, "觀測到回落的那個請求即應立即轉發")
+        self.assertLess(elapsed, 0.01, "不應在解除路徑上睡任何 hold cap")
+
+    def test_latch_deletion_failure_is_fail_open(self):
+        """閂鎖檔刪不掉（權限／已被他人移除）→ 視同已解除，立即轉發、不重試。"""
+        self._trip()
+        self._snap(0.10)
+
+        def boom(_path):
+            raise OSError("simulated unlink failure")
+
+        captured = io.StringIO()
+        old_stderr, old_unlink = sys.stderr, self.rlp.os.unlink
+        sys.stderr = captured
+        self.rlp.os.unlink = boom
+        try:
+            self.assertEqual(self._admit(), 0, "刪檔失敗仍須立即轉發（fail-open）")
+        finally:
+            sys.stderr = old_stderr
+            self.rlp.os.unlink = old_unlink
+        self.assertIn("WARNING", captured.getvalue(), "應留下可歸因的警告")
 
 
 class LatchStateFileContractTest(unittest.TestCase):
@@ -2038,23 +2155,38 @@ class LatchStateFileContractTest(unittest.TestCase):
                 os.environ[k] = v
         self.tmp.cleanup()
 
-    def _trip(self, util=0.93, tier="5x"):
+    def _trip(self, util=0.97, tier="5x"):
         self.rlp._LAST_UNIFIED = {"status": "allowed", "utilization": util,
                                   "reset": None, "observed_at": time.time()}
         return self.rlp.limiter_admission(self.dir, tier=tier)
 
     def test_latch_file_records_all_five_items(self):
-        self._trip(util=0.9321, tier="5x")
+        self._trip(util=0.9721, tier="5x")
         with open(self.latch) as f:
             body = f.read()
         self.assertRegex(body, r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}",
                          "① 觸發時間")
-        self.assertIn("0.9321", body, "② 當時 utilization")
-        self.assertIn("0.9000", body, "③ 當時門檻")
+        self.assertIn("0.9721", body, "② 當時 utilization")
+        self.assertIn("0.9600", body, "③ 當時門檻")
         self.assertIn("5x", body, "④ 偵測到的 tier")
         self.assertIn(self.rlp.LIMITER_LATCH_FILENAME, body, "⑤ 解除方式須指名該檔")
         self.assertTrue(any(w in body for w in ("刪除", "delete")),
                         "⑤ 解除方式須說明是「刪除」，body=%r" % body)
+
+    def test_latch_file_states_both_release_paths(self):
+        """spec「Latch file states both release paths」——自動解除與手動刪檔兩條都要寫。
+
+        只寫刪檔會讓操作者把「等它自己好」誤判成不可能，於是把每次閂鎖都當成必須人工
+        介入的事件；2026-08-18 的四小時停滯就是讀著那句話發生的。
+        """
+        self._trip()
+        with open(self.latch) as f:
+            body = f.read()
+        self.assertTrue(any(w in body for w in ("自動解除", "自動")),
+                        "須說明 proxy 會在水位回落後自動解除，body=%r" % body)
+        self.assertIn("回落", body, "須點名解除條件是水位回落到門檻以下")
+        self.assertTrue(any(w in body for w in ("刪除", "delete")),
+                        "手動刪檔仍須保留為即時解除路徑")
 
     def test_latch_file_names_undetermined_tier_explicitly(self):
         self._trip(tier=None)

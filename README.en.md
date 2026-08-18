@@ -21,13 +21,15 @@ When Claude Code launches **agents or workflows**, this plugin prevents back-to-
 ### 🛑 Usage-watermark limiter (optional · off by default)
 
 Hitting the wall is a *lagging* signal. The limiter uses the account-level **5-hour utilization** the API
-itself reports as a leading one: once it reaches the plan-tier threshold (Max 5x → 0.90, Max 20x → 0.95,
+itself reports as a leading one: once it reaches the plan-tier threshold (Max 5x → 0.96, Max 20x → 0.98,
 detected from `claudeMaxTier`), the proxy **trips a latch and holds all API traffic**, and pacing-guard
 denies tool launches while printing why.
 
 - **Two-step opt-in**: set up `ANTHROPIC_BASE_URL` routing (above), then add `RATE_LIMIT_PROXY_LIMITER=1`. Unset = behavior is unchanged.
 - **The two flag files mean opposite things — don't delete the wrong one**: `<data_dir>/limiter-tripped` is **the latch itself** (delete it to resume work; the guard stays on); `<data_dir>/limiter-off` **disables the whole feature** (delete it to get the guard back).
-- **An unattended long run will stay latched until a human returns — that is the feature, not a hang.** The whole point is that the machine performs the pause you never get to perform yourself, so `/loop` and scheduled jobs stop and wait for someone to delete the latch file.
+- **The latch clears itself once the watermark falls back below the same threshold** — usually the moment the five-hour quota window rolls over and utilization resets to zero. No human action required.
+- **Being slow while latched is the feature, not a hang.** The machine performs the pause you never get to perform yourself, so `/loop` and scheduled jobs are throttled — but only until the current five-hour window ends. Delete the latch file if you want to resume sooner.
+- **The release threshold is the same value as the trip threshold**, with no hysteresis band: the five-hour window is a fixed window, so utilization only rises within it and drops to zero at the rollover. There is no way for it to oscillate around the threshold.
 
 
 ## Install

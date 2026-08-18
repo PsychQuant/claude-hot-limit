@@ -572,9 +572,9 @@ def resolve_sched_hold_cap():
 
 # #33 limiter：已知訂閱方案別 → 預設門檻。canonical 是「桶」以外的**第三個軸**——
 # 既不是 model 桶（per-bucket-settings.md 管的）、也不是既有的單一帳號值。
-_LIMITER_TIER_DEFAULTS = {"5x": 0.90, "20x": 0.95}
-# tier 未判定時的保守預設：取**較低**者。方向刻意——早一點閂鎖只是早一點停下來（可逆、
-# 人刪檔即恢復），晚一點閂鎖則是保護沒發生（不可逆的額度已經燒掉）。
+_LIMITER_TIER_DEFAULTS = {"5x": 0.96, "20x": 0.98}
+# tier 未判定時的保守預設：取**較低**者。方向刻意——早一點閂鎖只是早一點停下來（可逆：
+# 水位回落即自動解除，人刪檔亦可），晚一點閂鎖則是保護沒發生（不可逆的額度已經燒掉）。
 _LIMITER_DEFAULT_THRESHOLD = min(_LIMITER_TIER_DEFAULTS.values())
 # 設定檔讀取上限。`~/.claude.json` 實測可達數 MB（projects 區塊），但仍必須有界：
 # 無上限的 read() 對上病態大檔 / 特殊檔案會讓 daemon 啟動卡死。
@@ -742,6 +742,7 @@ def schedule_admission(flag_dir):
 
 
 _LIMITER_WARNED = False  # fail-open 警告一次性節流（比照 _SCHED_WARNED）
+_LIMITER_CLEAR_WARNED = False  # 解除失敗的警告獨立節流——不與 _LIMITER_WARNED 互相蓋掉
 LIMITER_LATCH_FILENAME = "limiter-tripped"   # 閂鎖本身：存在 = 已觸發、持住中
 LIMITER_OFF_FILENAME = "limiter-off"         # 停用旗標：存在 = 整個 limiter 不跑
 
@@ -763,22 +764,51 @@ def _write_latch_file(path, util, threshold, tier):
             "plan tier  : %s\n"
             "\n"
             "到解除為止，每個 API 請求都會被持住約 %s 秒後才轉發。\n"
-            "解除方式   : 刪除本檔案（%s）——立即生效，不需重啟 daemon。\n"
+            "\n"
+            "解除方式（兩條，任一成立即恢復）:\n"
+            "  1. 自動：5 小時水位回落到門檻 %.4f 以下時，proxy 會自己解除並刪除本檔案，\n"
+            "     不需要你做任何事。配額窗切換時水位歸零，通常就是這一刻。\n"
+            "  2. 手動：刪除本檔案（%s）——立即生效，不需重啟 daemon。\n"
+            "     水位確實仍在門檻之上時，這是唯一能強制放行的手段。\n"
+            "\n"
             "注意       : 不要改動 %s，那是「整個 limiter 停用」，語意不同。\n"
             % (time.strftime("%Y-%m-%d %H:%M:%S %z"), util, threshold,
                tier if tier else "undetermined (using default threshold)",
-               resolve_limiter_hold_cap(), path, LIMITER_OFF_FILENAME))
+               resolve_limiter_hold_cap(), threshold, path, LIMITER_OFF_FILENAME))
+
+
+def _clear_latch_file(path):
+    """#33：解除閂鎖。刪不掉一律視同已解除（fail-open），絕不因此阻塞流量。
+
+    刪除失敗的兩種現實情況都不該讓請求繼續被持住：檔案已被使用者／另一個 daemon 刪掉
+    （競態，實際上已解除），或權限問題（人為介入，硬持住只是把問題變成謎題）。
+    警告用**獨立**節流旗標——與 admission 例外共用會讓「先前印過一次 admission 警告」
+    永久蓋掉刪檔失敗的可見度，正是本功能要消滅的那種安靜降級。
+    """
+    global _LIMITER_CLEAR_WARNED
+    try:
+        os.unlink(path)
+    except Exception as e:
+        if not _LIMITER_CLEAR_WARNED:
+            _LIMITER_CLEAR_WARNED = True
+            print("[rate-limit-proxy] WARNING: could not delete limiter latch file "
+                  "(treating latch as released, forwarding immediately): %s" % e,
+                  file=sys.stderr)
 
 
 def limiter_admission(flag_dir, tier=None):
     """#33：utilization 門檻閂鎖。回傳實際持住毫秒（int；未持住 = 0）。
 
-    判準（依序）：env opt-in ∧ cap 有效 ∧ 停用旗標不存在 → 若已閂鎖則直接持住；否則看
-    最近快照的 **5h** utilization ≥ 門檻才閂鎖。閂鎖一旦建立，**只有刪除閂鎖檔**能解除
-    ——水位回落不解除、daemon 重啟不解除。這是本功能的核心：機器執行那個使用者來不及
-    執行的暫停，然後停在原地等人決定。
+    判準（依序）：env opt-in ∧ cap 有效 ∧ 停用旗標不存在 → 取最近快照的 **5h**
+    utilization 與門檻比較。未閂鎖時 ≥ 門檻則閂鎖並持住；已閂鎖時 < 門檻則**自動解除**
+    並立即轉發該請求。觸發與解除**共用同一次門檻解析**（同一個 tier、同一條 override
+    鏈），僅方向相反；不設遲滯帶、不設 TTL、不設最短閂鎖時間。
 
-    fail-open 鐵律：任何例外（含閂鎖檔寫不出來）→ 回 0 直接轉發。
+    無 utilization 觀測（None）時**兩個方向都不動作**：未閂鎖不觸發，已閂鎖維持閂鎖。
+    解除需要證據，daemon 重啟後快照為空即屬此類。人工刪除閂鎖檔仍是有效的解除路徑，
+    且是水位確實仍高時唯一的強制放行手段。
+
+    fail-open 鐵律：任何例外（含閂鎖檔寫不出來、刪不掉）→ 回 0 直接轉發。
     """
     global _LIMITER_WARNED
     try:
@@ -791,14 +821,17 @@ def limiter_admission(flag_dir, tier=None):
         if os.path.exists(os.path.join(flag_dir, LIMITER_OFF_FILENAME)):
             return 0
         latch = os.path.join(flag_dir, LIMITER_LATCH_FILENAME)
-        if not os.path.exists(latch):
-            snap = _LAST_UNIFIED
-            util = (snap or {}).get("utilization")  # 快照的窄投影欄位名，非原始 header 欄位名
-            if util is None:
-                return 0  # 無水位資料 → 不猜（7d 有值也不代用，觸發訊號只取 5h）
-            util = float(util)
-            threshold = resolve_limiter_threshold(flag_dir, tier)
-            if util < threshold:
+        snap = _LAST_UNIFIED
+        util = (snap or {}).get("utilization")  # 快照的窄投影欄位名，非原始 header 欄位名
+        util = float(util) if util is not None else None  # 無水位資料 → 不猜（7d 不代用）
+        # 觸發與解除共用**同一次**解析結果：兩處各自解析會漂移成互相矛盾的兩個門檻。
+        threshold = resolve_limiter_threshold(flag_dir, tier)
+        if os.path.exists(latch):
+            if util is not None and util < threshold:
+                _clear_latch_file(latch)
+                return 0  # 危機解除：觀測到回落的這個請求本身就不持住
+        else:
+            if util is None or util < threshold:
                 return 0
             _write_latch_file(latch, util, threshold, tier)
         t0 = time.monotonic()

@@ -95,7 +95,7 @@ proxy 相關 env（與上面「設定」表的 hook env 分開）：
 | `RATE_LIMIT_PROXY_SCHED_HOLD_CAP` | `90` | hold 上限秒數（float；上限箝 240、`≤0` 停用排程；reset 比 cap 遠的請求不 hold 直接放行） |
 | `RATE_LIMIT_PROXY_LIMITER` | `—` | 設 `1` 啟用 **utilization 水位 limiter**（#33）：帳號級 unified **5h** utilization 達方案別門檻 → 建立閂鎖並持住流量。與 `RATE_LIMIT_PROXY_SCHEDULE` 是**兩個獨立機制**（前者 proactive 看水位、後者 reactive 看 `rejected`），各自 opt-in、各自的 audit 欄位 |
 | `RATE_LIMIT_PROXY_LIMITER_HOLD_CAP` | `90` | limiter 閂鎖期間每個請求持住的秒數（float；上限箝 240、`≤0` 停用 limiter）。**刻意獨立於 `SCHED_HOLD_CAP`**——共用旋鈕會讓「關掉舊機制」意外改到 limiter |
-| `RATE_LIMIT_PROXY_LIMITER_THRESHOLD` | 依方案別 | 覆寫觸發門檻（0 < v ≤ 1）。未設時依 `claudeMaxTier` 取 `5x`→`0.90`、`20x`→`0.95`；**偵測不到方案別則取較低的 `0.90`**（早停可逆、漏停不可逆） |
+| `RATE_LIMIT_PROXY_LIMITER_THRESHOLD` | 依方案別 | 覆寫門檻（0 < v ≤ 1）。未設時依 `claudeMaxTier` 取 `5x`→`0.96`、`20x`→`0.98`；**偵測不到方案別則取較低的 `0.96`**（早停可逆、漏停不可逆）。**觸發與自動解除共用這一個值**，不設遲滯帶 |
 | `RATE_LIMIT_PROXY_ROTATE_MB` | `64` | `rate-state.jsonl` 輪替門檻（float MiB；超過→歸檔成 `rate-state-<ts>.jsonl` **全保留**（校準語料，手動清理）；`≤0` 停用；#17） |
 | `RATE_LIMIT_PROXY_LOG_ROTATE_MB` | `32` | `proxy.log` spawn 前輪替門檻（float MiB；轉 `proxy.log.1` 只留一代；`≤0` 停用；#17） |
 | `RATE_LIMIT_PROXY_DEBUG_HEADERS` | — | 設 `1` 時把每筆回應的 header **名單** + `anthropic-*` header 的**值**寫進 `<data>/proxy-headers-debug.jsonl`（診斷「rate-limit header 到底在不在回應上」用；#12）。只記 `anthropic-*` 的值，Authorization/Cookie 等只留名。**預設關 → 零影響**。查完記得關 |
@@ -106,16 +106,25 @@ proxy 相關 env（與上面「設定」表的 hook env 分開）：
 
 | 檔案 | 意義 | 刪掉它 |
 |------|------|--------|
-| `<data_dir>/limiter-tripped` | **閂鎖本身**：limiter 已觸發、正在持住每個請求 | **解除閂鎖、恢復正常轉發**；limiter 仍在守，水位再達標會重新閂鎖 |
+| `<data_dir>/limiter-tripped` | **閂鎖本身**：limiter 已觸發、正在持住每個請求。水位回落到門檻以下時 **proxy 會自己刪掉它** | **立即解除閂鎖、恢復正常轉發**；limiter 仍在守，水位再達標會重新閂鎖 |
 | `<data_dir>/limiter-off` | **停用旗標**：整個 limiter 不作用 | 讓 limiter 重新開始作用（若閂鎖檔還在，閂鎖立刻恢復生效） |
 
 兩個檔名只差一個詞，但**刪錯的後果是相反的**：想恢復工作的人若誤刪 `limiter-off`，limiter
 會立刻回來閂住他；想關掉保護的人若誤刪 `limiter-tripped`，保護其實還開著。閂鎖檔本身的內容
 也會提醒這件事——它記錄觸發時間、當時 utilization、當時門檻、偵測到的方案別，以及解除方式。
 
-**unattended 長跑會被閂到人回來——這是特性不是當機。** limiter 的全部價值就是「機器執行那個你
-來不及執行的暫停，然後停在原地等你決定」。所以 `/loop`、排程 job、背景 agent 在水位達標後會停住
-不動，直到有人刪掉閂鎖檔。若你看到自動化流程無故卡住，先看 `<data_dir>/limiter-tripped` 在不在。
+### 閂鎖怎麼解除（兩條路徑，任一成立即恢復）
+
+1. **自動**：5h utilization 回落到**同一個門檻**以下時，proxy 立即刪除閂鎖檔並放行該請求。5h 是
+   固定窗，窗內水位只增不減、切換時歸零，所以這一刻通常就是配額窗切換。因為沒有在門檻附近
+   來回穿越的條件，**解除門檻與觸發門檻刻意相同**，不設遲滯帶或最短閂鎖時間。
+2. **手動**：刪除 `<data_dir>/limiter-tripped`，立即生效、不需重啟 daemon。水位確實仍在門檻之上
+   時，這是唯一能強制放行的手段。
+
+**閂鎖期間變慢是特性不是當機。** limiter 的價值是「機器執行那個你來不及執行的暫停」，所以
+`/loop`、排程 job、背景 agent 在水位達標後會被拖慢到每個請求 `LIMITER_HOLD_CAP` 秒——但**至多
+持續到當前 5 小時配額窗結束**。若你看到自動化流程無故變慢，先看 `<data_dir>/limiter-tripped`
+在不在，檔案內容會寫明觸發時間、當時水位、當時門檻與上面兩條解除路徑。
 
 ## 設定
 
