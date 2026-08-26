@@ -2463,6 +2463,7 @@ class HandleErrorLoggingTest(unittest.TestCase):
             time.sleep(1.5)
         finally:
             proxy_server.shutdown()
+            proxy_server.server_close()
             sys.stderr = real_stderr
 
         output = captured.getvalue()
@@ -2513,6 +2514,77 @@ class HandleErrorLoggingTest(unittest.TestCase):
         self.assertIn("Traceback (most recent call last)", output,
                       "非 client-disconnect exception 仍應保留完整 traceback，got:\n%s" % output)
         self.assertIn("ValueError", output)
+
+    def test_connection_reset_direct_via_handle_error_when_client_write_flagged(self):
+        """verify #36 R1 mutation finding：端對端測試在這台機器上只會觸發
+        BrokenPipeError，`ConnectionResetError` 這個 issue 標題點名的型別從未被實際
+        執行過——刪掉它測試仍全綠。改用確定性直接呼叫，不依賴平台湊巧觸發哪個 errno。
+        """
+        rlp = _load_proxy_module()
+        handler_cls = rlp.ProxyHandler
+        handler_cls.upstream_base_url = self.mock_url
+        handler_cls.state_file_path = self.state_file
+        server = rlp.ThreadingHTTPServer(("127.0.0.1", free_port()), handler_cls)
+        try:
+            captured = io.StringIO()
+            real_stderr = sys.stderr
+            sys.stderr = captured
+            try:
+                rlp._mark_client_write_in_progress(True)  # 模擬正在對 client 寫入時斷線
+                try:
+                    raise ConnectionResetError(54, "Connection reset by peer")
+                except ConnectionResetError:
+                    server.handle_error(None, ("127.0.0.1", 0))
+            finally:
+                rlp._mark_client_write_in_progress(False)
+                sys.stderr = real_stderr
+        finally:
+            server.server_close()
+
+        output = captured.getvalue()
+        self.assertNotIn("Traceback (most recent call last)", output,
+                         "client-write 期間的 ConnectionResetError 應降噪，got:\n%s" % output)
+        self.assertIn("ConnectionResetError", output)
+        self.assertIn("[rate-limit-proxy]", output)
+        import re
+        self.assertRegex(output, r"\d{4}-\d{2}-\d{2}")
+
+    def test_upstream_side_disconnect_not_mislabeled_as_client(self):
+        """verify #36 R1 confirmed HIGH：`ConnectionResetError`/`BrokenPipeError` 也會
+        從讀 upstream response 的路徑冒出（非 client-write 期間），不該被降噪成
+        「client disconnected early」——那是誤判方向、且會吞掉唯一能歸因的 traceback。
+        `_is_client_write_in_progress()` 在這個情境下應為 False（沒進 `_client_write_scope()`），
+        `handle_error` 必須 fallback 到完整 traceback。
+        """
+        rlp = _load_proxy_module()
+        handler_cls = rlp.ProxyHandler
+        handler_cls.upstream_base_url = self.mock_url
+        handler_cls.state_file_path = self.state_file
+        server = rlp.ThreadingHTTPServer(("127.0.0.1", free_port()), handler_cls)
+        try:
+            captured = io.StringIO()
+            real_stderr = sys.stderr
+            sys.stderr = captured
+            try:
+                # 刻意不呼叫 _mark_client_write_in_progress(True) —— 模擬這個
+                # ConnectionResetError 發生在讀 upstream（不在 _client_write_scope() 內）。
+                self.assertFalse(rlp._is_client_write_in_progress(),
+                                 "pre-condition：這個 thread 不該處於 client-write 狀態")
+                try:
+                    raise ConnectionResetError(54, "Connection reset by peer")
+                except ConnectionResetError:
+                    server.handle_error(None, ("127.0.0.1", 0))
+            finally:
+                sys.stderr = real_stderr
+        finally:
+            server.server_close()
+
+        output = captured.getvalue()
+        self.assertIn("Traceback (most recent call last)", output,
+                      "upstream 端斷線不該被降噪，應保留完整 traceback，got:\n%s" % output)
+        self.assertIn("ConnectionResetError", output)
+        self.assertNotIn("disconnected early", output,
+                         "upstream 端斷線不該被誤標成 client disconnected，got:\n%s" % output)
 
 
 if __name__ == "__main__":
