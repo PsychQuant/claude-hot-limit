@@ -371,8 +371,25 @@ def _mark_upstream_side(exc):
     return exc
 
 
-def _is_upstream_side(exc):
-    return bool(exc is not None and getattr(exc, _UPSTREAM_SIDE_MARK, False))
+def _is_upstream_side(exc, _seen=None):
+    """verify #36 R3（codex confirmed HIGH）：只看最外層 exception instance 不夠——
+    若標記過的例外在傳播路徑上被另一個未標記的例外「取代」（最常見：`finally` 區塊
+    自己又拋出新例外，Python 會把原例外自動接到新例外的 `__context__`；或中間層
+    `raise NewExc(...) from marked_exc` 接到 `__cause__`），最外層看起來沒有標記，
+    upstream 故障就會被誤判成 client 側而降噪。沿 `__cause__` / `__context__` 鏈往回
+    找，只要鏈上任一節點被標記過就算——`_seen` 防止 exception chain 出現循環時無限遞迴
+    （理論上不該發生，但 exception chaining 是使用者可控的，防禦性處理）。
+    """
+    if exc is None:
+        return False
+    if _seen is None:
+        _seen = set()
+    if id(exc) in _seen:
+        return False
+    _seen.add(id(exc))
+    if getattr(exc, _UPSTREAM_SIDE_MARK, False):
+        return True
+    return _is_upstream_side(exc.__cause__, _seen) or _is_upstream_side(exc.__context__, _seen)
 
 
 class ProxyHandler(http.server.BaseHTTPRequestHandler):

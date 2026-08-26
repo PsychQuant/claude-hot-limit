@@ -2427,6 +2427,60 @@ def start_threading_proxy(upstream_url, state_file=None, env_overrides=None):
     return server, "http://127.0.0.1:%d" % port, rlp
 
 
+def _raw_upstream_rst(response_prefix=None, delay_before_rst=0.05):
+    """verify #36 R3（codex 實測確認的 HIGH：把 4 個 `_mark_upstream_side()` 呼叫點
+    全部換成裸 `raise` 後，整份套件仍然全綠——代表既有測試只驗 `handle_error` 的分支
+    邏輯，沒有驗證 production call site 真的會標記）。
+
+    這個 helper 起一個**原始 socket** 假上游（不是 `http.server.HTTPServer`），讓
+    caller 能精準控制「送多少 bytes 之後才 RST」——藉此讓 proxy 的**真實**
+    `urllib.request.urlopen(req)` / `upstream_resp.read()` 呼叫點自己撞上
+    `ConnectionResetError`，而不是像其他測試那樣在測試程式碼裡手動呼叫
+    `_mark_upstream_side()`。
+
+    `response_prefix=None`：完全不回應就 RST（模擬連線建立後、送 header 前斷線，
+      對應 `_handle()` 的 `urlopen(req)` 那個 except 分支）。
+    `response_prefix=<bytes>`：先送這些 bytes（可以是完整 header + 不完整 body），
+      再 RST（模擬 upstream 送到一半斷線，對應 buffered `.read()` 或 streaming
+      `.read(1)` 分支，視 header 的 content-type 而定）。
+
+    回傳 `(thread, "http://127.0.0.1:<port>")`；thread 是 daemon，不需要 join。
+    """
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    port = srv.getsockname()[1]
+    srv.listen(1)
+
+    def _serve():
+        try:
+            srv.settimeout(5)
+            conn, _addr = srv.accept()
+        except Exception:
+            return
+        try:
+            conn.settimeout(5)
+            try:
+                conn.recv(65536)  # 把 client 送來的 request 收掉，內容不重要
+            except Exception:
+                pass
+            if response_prefix:
+                try:
+                    conn.sendall(response_prefix)
+                except Exception:
+                    pass
+            time.sleep(delay_before_rst)
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                            struct.pack("ii", 1, 0))
+        finally:
+            conn.close()
+            srv.close()
+
+    t = threading.Thread(target=_serve, daemon=True)
+    t.start()
+    return t, "http://127.0.0.1:%d" % port
+
+
 class HandleErrorLoggingTest(unittest.TestCase):
     """#36 — client 提早斷線（ConnectionResetError／BrokenPipeError）不應印出完整
     traceback 洗版 proxy.log；其他未預期 exception 仍要保留完整 traceback（不能因為
@@ -2584,6 +2638,114 @@ class HandleErrorLoggingTest(unittest.TestCase):
         self.assertNotIn("disconnected early", output,
                          "upstream 端斷線不該被誤標成 client disconnected，got:\n%s" % output)
 
+    def test_urlopen_connect_reset_via_real_call_site_shows_full_traceback(self):
+        """verify #36 R3 confirmed HIGH（codex mutation test 實測：把 `_handle()` 的
+        `urlopen(req)` outer except 那個 `raise _mark_upstream_side(e)` 換成裸 `raise`，
+        整份套件仍全綠）——上面的 `test_upstream_side_disconnect_not_mislabeled_as_client`
+        只驗證了「已標記的例外會被 `handle_error` 正確分類」，沒驗證「真的走
+        `urlopen()` 這條 production 路徑時，proxy 自己會不會呼叫 `_mark_upstream_side()`」。
+
+        本測試讓 upstream 在收到 request 後、**還沒送出任何 bytes** 就 RST——
+        `urllib.request.urlopen(req)` 在讀 status line 階段（`h.getresponse()`，urllib
+        不會把它包成 `URLError`）撞上裸 `ConnectionResetError`，直接命中 `_handle()`
+        的 `except (ConnectionResetError, BrokenPipeError) as e: raise _mark_upstream_side(e)`
+        分支。"""
+        _thread, upstream_url = _raw_upstream_rst(response_prefix=None)
+        proxy_server, proxy_url, rlp = start_threading_proxy(
+            upstream_url, os.path.join(self.tmp.name, "state-r3-a.jsonl"))
+        captured = io.StringIO()
+        real_stderr = sys.stderr
+        sys.stderr = captured
+        try:
+            req = urllib.request.Request(proxy_url + "/v1/messages",
+                                          data=b'{"model":"x"}', method="POST")
+            try:
+                urllib.request.urlopen(req, timeout=5).read()
+            except Exception:
+                pass  # client 端會看到某種錯誤（連線被關）；我們只在意 proxy 自己的 log
+            time.sleep(0.5)
+        finally:
+            proxy_server.shutdown()
+            proxy_server.server_close()
+            sys.stderr = real_stderr
+
+        output = captured.getvalue()
+        self.assertIn("Traceback (most recent call last)", output,
+                      "urlopen() 階段的 upstream 斷線（真實呼叫路徑）不該被降噪，"
+                      "got:\n%s" % output)
+        self.assertNotIn("disconnected early", output,
+                         "upstream 側斷線不該被誤標成 client disconnected，got:\n%s" % output)
+
+    def test_buffered_upstream_read_reset_via_real_call_site_shows_full_traceback(self):
+        """verify #36 R3 confirmed HIGH：同上，但針對非串流（buffered）回應路徑——
+        `_handle()` else 分支的 `upstream_resp.read()`。upstream 先送出合法 header
+        （宣告 Content-Length 100 但只送 10 bytes 的 body），client 端 `read()` 讀到一半
+        撞 RST。"""
+        prefix = (b"HTTP/1.1 200 OK\r\n"
+                  b"Content-Type: application/json\r\n"
+                  b"Content-Length: 100\r\n\r\n"
+                  b"0123456789")  # 只送 10 bytes，client 端還在等剩下 90 bytes 時就 RST
+        _thread, upstream_url = _raw_upstream_rst(response_prefix=prefix)
+        proxy_server, proxy_url, rlp = start_threading_proxy(
+            upstream_url, os.path.join(self.tmp.name, "state-r3-b.jsonl"))
+        captured = io.StringIO()
+        real_stderr = sys.stderr
+        sys.stderr = captured
+        try:
+            req = urllib.request.Request(proxy_url + "/v1/messages",
+                                          data=b'{"model":"x"}', method="POST")
+            try:
+                urllib.request.urlopen(req, timeout=5).read()
+            except Exception:
+                pass
+            time.sleep(0.5)
+        finally:
+            proxy_server.shutdown()
+            proxy_server.server_close()
+            sys.stderr = real_stderr
+
+        output = captured.getvalue()
+        self.assertIn("Traceback (most recent call last)", output,
+                      "buffered upstream_resp.read() 撞到的 upstream 斷線（真實呼叫路徑）"
+                      "不該被降噪，got:\n%s" % output)
+        self.assertNotIn("disconnected early", output,
+                         "upstream 側斷線不該被誤標成 client disconnected，got:\n%s" % output)
+
+    def test_streaming_upstream_read_reset_via_real_call_site_shows_full_traceback(self):
+        """verify #36 R3 confirmed HIGH：同上，針對 streaming（SSE）路徑——
+        `_forward_streaming()` 的 `upstream_resp.read(1)`。upstream 送出
+        `text/event-stream` header + 一小段 body 後 RST。"""
+        prefix = (b"HTTP/1.1 200 OK\r\n"
+                  b"Content-Type: text/event-stream\r\n"
+                  b"Transfer-Encoding: chunked\r\n\r\n"
+                  b"5\r\nhello\r\n")  # 送一個合法 chunk 後斷線，client 還在等下一個 chunk
+        _thread, upstream_url = _raw_upstream_rst(response_prefix=prefix)
+        proxy_server, proxy_url, rlp = start_threading_proxy(
+            upstream_url, os.path.join(self.tmp.name, "state-r3-c.jsonl"))
+        captured = io.StringIO()
+        real_stderr = sys.stderr
+        sys.stderr = captured
+        try:
+            req = urllib.request.Request(proxy_url + "/v1/messages",
+                                          data=b'{"model":"x","stream":true}', method="POST")
+            try:
+                resp = urllib.request.urlopen(req, timeout=5)
+                resp.read()
+            except Exception:
+                pass
+            time.sleep(0.5)
+        finally:
+            proxy_server.shutdown()
+            proxy_server.server_close()
+            sys.stderr = real_stderr
+
+        output = captured.getvalue()
+        self.assertIn("Traceback (most recent call last)", output,
+                      "streaming upstream_resp.read(1) 撞到的 upstream 斷線（真實呼叫路徑）"
+                      "不該被降噪，got:\n%s" % output)
+        self.assertNotIn("disconnected early", output,
+                         "upstream 側斷線不該被誤標成 client disconnected，got:\n%s" % output)
+
     def test_keepalive_client_read_disconnect_is_quiet(self):
         """verify #36 R2 confirmed HIGH（devils-advocate，production log A/B 重現）：
         R1 的第一版只標記 `wfile.write`（client-write）為降噪對象，但 HTTP/1.1
@@ -2612,33 +2774,41 @@ class HandleErrorLoggingTest(unittest.TestCase):
                    b"Content-Length: %d\r\n"
                    b"Connection: keep-alive\r\n"
                    b"\r\n%s") % (len(body), body)
+            # verify #36 R3（codex）：`sock` 用自己獨立的 try/finally 確保任何步驟
+            # （含 setsockopt 在不支援的平台拋例外）都不會漏關這個 socket——
+            # `ThreadingHTTPServer.daemon_threads = True`（#27 既有設定）已保證
+            # `server_close()` 不會因為殘留的 non-daemon request thread 卡死，但
+            # 漏關 client socket 仍會讓 handler thread 白白多等一段時間才被 daemon
+            # 屬性放行，沒有必要冒這個險。
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect((host, port))
-            sock.sendall(req)
-            # 讀到完整回應（headers + body）再放手——不 assert 內容，只確保第一個
-            # request 已完整走完，thread 已回到 keep-alive 迴圈等下一個 request。
-            resp = b""
-            sock.settimeout(5)
-            while b"\r\n\r\n" not in resp:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                resp += chunk
-            # 抓 Content-Length 讀滿 body，確保 handler 真的處理完第一個 request
-            header_part, _, body_part = resp.partition(b"\r\n\r\n")
-            cl_match = [l for l in header_part.split(b"\r\n") if l.lower().startswith(b"content-length")]
-            if cl_match:
-                need = int(cl_match[0].split(b":")[1].strip())
-                while len(body_part) < need:
+            try:
+                sock.connect((host, port))
+                sock.sendall(req)
+                # 讀到完整回應（headers + body）再放手——不 assert 內容，只確保第一個
+                # request 已完整走完，thread 已回到 keep-alive 迴圈等下一個 request。
+                resp = b""
+                sock.settimeout(5)
+                while b"\r\n\r\n" not in resp:
                     chunk = sock.recv(4096)
                     if not chunk:
                         break
-                    body_part += chunk
-            # 強制 RST（SO_LINGER l_onoff=1, l_linger=0）而非優雅 FIN——重現 client
-            # 異常斷線（非正常 client.close()），跟 keep-alive 下的真實斷線一致。
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
-                            struct.pack("ii", 1, 0))
-            sock.close()
+                    resp += chunk
+                # 抓 Content-Length 讀滿 body，確保 handler 真的處理完第一個 request
+                header_part, _, body_part = resp.partition(b"\r\n\r\n")
+                cl_match = [l for l in header_part.split(b"\r\n") if l.lower().startswith(b"content-length")]
+                if cl_match:
+                    need = int(cl_match[0].split(b":")[1].strip())
+                    while len(body_part) < need:
+                        chunk = sock.recv(4096)
+                        if not chunk:
+                            break
+                        body_part += chunk
+                # 強制 RST（SO_LINGER l_onoff=1, l_linger=0）而非優雅 FIN——重現 client
+                # 異常斷線（非正常 client.close()），跟 keep-alive 下的真實斷線一致。
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                struct.pack("ii", 1, 0))
+            finally:
+                sock.close()
             time.sleep(1.0)  # 讓 server thread 有機會跑到下一輪 readline() 並撞上斷線
         finally:
             proxy_server.shutdown()
