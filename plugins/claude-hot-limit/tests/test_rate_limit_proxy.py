@@ -2405,5 +2405,115 @@ class LatchDecisionAuditFieldTest(unittest.TestCase):
         self.assertEqual(sched_total, 0,
                          "兩個欄位可分別統計，互不污染")
 
+
+def start_threading_proxy(upstream_url, state_file=None, env_overrides=None):
+    """啟動真正的 production server class（`ThreadingHTTPServer`），不是測試常用的
+    `http.server.HTTPServer`。#36 的 `handle_error` override 掛在 `ThreadingHTTPServer`
+    上（server 層，不是 handler 層），一般 `start_proxy()` 繞過這個 class，測不到它。
+    """
+    env_overrides = env_overrides or {}
+    for k, v in env_overrides.items():
+        os.environ[k] = v
+    rlp = _load_proxy_module()
+
+    port = free_port()
+    handler_cls = rlp.ProxyHandler
+    handler_cls.upstream_base_url = upstream_url
+    handler_cls.state_file_path = state_file
+    server = rlp.ThreadingHTTPServer(("127.0.0.1", port), handler_cls)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return server, "http://127.0.0.1:%d" % port, rlp
+
+
+class HandleErrorLoggingTest(unittest.TestCase):
+    """#36 — client 提早斷線（ConnectionResetError／BrokenPipeError）不應印出完整
+    traceback 洗版 proxy.log；其他未預期 exception 仍要保留完整 traceback（不能因為
+    降噪連真正的 bug 也一起吞掉）。"""
+
+    def setUp(self):
+        self.mock, self.mock_url = start_mock_upstream()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state_file = os.path.join(self.tmp.name, "rate-state.jsonl")
+
+    def tearDown(self):
+        self.mock.shutdown()
+        self.tmp.cleanup()
+
+    def test_connection_reset_logged_concisely_not_full_traceback(self):
+        MockUpstreamHandler.response_status = 200
+        MockUpstreamHandler.response_headers = {}
+        MockUpstreamHandler.sse_chunks = [
+            b'data: {"type": "message_start", "usage": {"input_tokens": 10, "output_tokens": 0}}\n\n',
+            b'data: {"type": "content_block_delta"}\n\n',
+            b'data: {"type": "message_delta", "usage": {"output_tokens": 5}}\n\n',
+        ]
+        MockUpstreamHandler.chunk_delay = 0.3
+
+        proxy_server, proxy_url, rlp = start_threading_proxy(self.mock_url, self.state_file)
+        captured = io.StringIO()
+        real_stderr = sys.stderr
+        sys.stderr = captured
+        try:
+            req = urllib.request.Request(proxy_url + "/v1/messages",
+                                          data=b'{"model":"x","stream":true}', method="POST")
+            resp = urllib.request.urlopen(req)
+            resp.read(1)
+            resp.close()  # 模擬 client 提早斷線 → server 端寫入時觸發 ConnectionResetError
+            time.sleep(1.5)
+        finally:
+            proxy_server.shutdown()
+            sys.stderr = real_stderr
+
+        output = captured.getvalue()
+        # 同一個 captured stderr 也會混到 mock upstream（獨立、未受本次修改影響的
+        # `http.server.HTTPServer`）自己的 broken-pipe traceback——只針對「來源是
+        # rate-limit-proxy.py 自己的堆疊」斷言，不要求全域零 traceback（mock upstream
+        # 的堆疊本來就跟本次修改無關）。
+        proxy_traceback_blocks = [
+            b for b in output.split("-" * 40)
+            if "Traceback (most recent call last)" in b and "rate-limit-proxy.py" in b
+        ]
+        self.assertEqual(proxy_traceback_blocks, [],
+                         "proxy 自己觸發的 ConnectionResetError/BrokenPipeError 不該印出完整"
+                         " traceback，got:\n%s" % output)
+        self.assertTrue(
+            ("ConnectionResetError" in output) or ("BrokenPipeError" in output),
+            "精簡訊息仍應點名是哪個 exception，got:\n%s" % output)
+        self.assertIn("[rate-limit-proxy]", output,
+                      "精簡訊息應帶既有的 log 前綴，方便辨識來源，got:\n%s" % output)
+        # 時間戳記層：至少要有 ISO-8601 日期 pattern，方便回溯發生時間
+        import re
+        self.assertRegex(output, r"\d{4}-\d{2}-\d{2}",
+                         "精簡訊息應帶時間戳記，got:\n%s" % output)
+
+    def test_other_exceptions_still_print_full_traceback(self):
+        """降噪不能連真正的 bug 也吞掉——非 client-disconnect 類 exception 仍要保留
+        完整堆疊，用 handle_error 直接呼叫驗證（不依賴湊巧觸發某個真實 bug）。"""
+        rlp = _load_proxy_module()
+        handler_cls = rlp.ProxyHandler
+        handler_cls.upstream_base_url = self.mock_url
+        handler_cls.state_file_path = self.state_file
+        server = rlp.ThreadingHTTPServer(("127.0.0.1", free_port()), handler_cls)
+        try:
+            captured = io.StringIO()
+            real_stderr = sys.stderr
+            sys.stderr = captured
+            try:
+                try:
+                    raise ValueError("not a client disconnect")
+                except ValueError:
+                    server.handle_error(None, ("127.0.0.1", 0))
+            finally:
+                sys.stderr = real_stderr
+        finally:
+            server.server_close()
+
+        output = captured.getvalue()
+        self.assertIn("Traceback (most recent call last)", output,
+                      "非 client-disconnect exception 仍應保留完整 traceback，got:\n%s" % output)
+        self.assertIn("ValueError", output)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

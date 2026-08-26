@@ -31,8 +31,10 @@ import socketserver
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 
 try:
     import fcntl
@@ -48,6 +50,15 @@ DEFAULT_PORT = 8787
 # 上游恆回未壓縮 → 側路（SSE data: 掃描 + buffered json.loads）永遠可讀。client 不壞
 #（identity 恆可接受，HTTP 標準）；代價只有頻寬（SSE 本多未壓縮，實際影響小）。
 _SKIP_REQUEST_HEADERS = {"host", "content-length", "connection", "accept-encoding"}
+
+
+def _log_stderr(msg):
+    """統一的 stderr 輸出：帶 ISO-8601 UTC 時間戳記前綴（#36）。proxy.log 先前完全
+    沒有時間戳記層，難以回溯特定訊息發生的時間點；所有既有 print(..., file=sys.stderr)
+    呼叫改走這個 helper，訊息本文不變、只多一個前綴。
+    """
+    ts = datetime.now(timezone.utc).isoformat()
+    print("[rate-limit-proxy] %s %s" % (ts, msg), file=sys.stderr)
 
 
 def resolve_upstream():
@@ -295,8 +306,7 @@ def _rotate_state_file(state_file_path):
             target = "%s-%s-%d.jsonl" % (base, stamp, n)
         os.replace(state_file_path, target)
     except Exception as e:
-        print("[rate-limit-proxy] WARNING: state file rotation failed: %s" % e,
-              file=sys.stderr)
+        _log_stderr("WARNING: state file rotation failed: %s" % e)
 
 
 # verify F2（R1+Codex 收斂）：in-process baseline mutex。fcntl=None（Windows）時
@@ -331,7 +341,7 @@ def write_state_record(state_file_path, record):
                     fcntl.flock(lockf, fcntl.LOCK_UN)
                     lockf.close()
     except Exception as e:
-        print("[rate-limit-proxy] WARNING: failed to write state file: %s" % e, file=sys.stderr)
+        _log_stderr("WARNING: failed to write state file: %s" % e)
 
 
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
@@ -550,6 +560,22 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     # 卡死 stream 不得綁架 process 退出——daemon thread 是這條上限的 backstop。
     daemon_threads = True
 
+    # #36：client 提早斷線（ConnectionResetError/BrokenPipeError）是 proxy 轉發過程中
+    # 正常會發生的網路事件，不是未預期的 bug——socketserver 的預設 handle_error() 卻把它
+    # 當一般 exception 印出完整 traceback，production 觀測到 17 分鐘內 2567 筆重複堆疊
+    # 洗版 proxy.log。只對這兩個明確型別降噪成一行；其餘 exception 一律 fallback 到父類別
+    # 的完整 traceback（不能因為降噪連真正的 bug 也吞掉）。
+    _QUIET_DISCONNECT_EXCEPTIONS = (ConnectionResetError, BrokenPipeError)
+
+    def handle_error(self, request, client_address):
+        exc_type = sys.exc_info()[0]
+        if exc_type is not None and issubclass(exc_type, self._QUIET_DISCONNECT_EXCEPTIONS):
+            exc = sys.exc_info()[1]
+            _log_stderr("%s: client %s disconnected early (%s)"
+                        % (exc_type.__name__, client_address, exc))
+            return
+        super().handle_error(request, client_address)
+
 
 def resolve_sched_hold_cap():
     """#7 v1：admission hold 上限秒數；None = 排程停用。
@@ -602,15 +628,15 @@ def resolve_plan_tier(config_path=None):
         if not os.path.isfile(path):
             return None  # 特殊檔案（FIFO 等）的 open 可能永久 block——比照 file_override_* 紀律
         if os.path.getsize(path) > _CLAUDE_CONFIG_MAX_BYTES:
-            print("[rate-limit-proxy] WARNING: Claude config exceeds read cap; "
-                  "plan tier undetermined (falling back to default threshold)", file=sys.stderr)
+            _log_stderr("WARNING: Claude config exceeds read cap; "
+                        "plan tier undetermined (falling back to default threshold)")
             return None
         with open(path) as f:
             tier = json.load(f).get("claudeMaxTier")
     except Exception:
         # 訊息刻意不含 path 之外的任何檔案內容（隱私鐵律）。
-        print("[rate-limit-proxy] WARNING: could not read plan tier from Claude config; "
-              "falling back to default threshold", file=sys.stderr)
+        _log_stderr("WARNING: could not read plan tier from Claude config; "
+                    "falling back to default threshold")
         return None
     if isinstance(tier, str) and tier.strip() in _LIMITER_TIER_DEFAULTS:
         return tier.strip()
@@ -736,8 +762,8 @@ def schedule_admission(flag_dir):
     except Exception as e:
         if not _SCHED_WARNED:
             _SCHED_WARNED = True
-            print("[rate-limit-proxy] WARNING: schedule_admission failed (fail-open, "
-                  "forwarding immediately): %s" % e, file=sys.stderr)
+            _log_stderr("WARNING: schedule_admission failed (fail-open, "
+                        "forwarding immediately): %s" % e)
         return 0
 
 
@@ -794,9 +820,8 @@ def _clear_latch_file(path):
     except Exception as e:
         if not _LIMITER_CLEAR_WARNED:
             _LIMITER_CLEAR_WARNED = True
-            print("[rate-limit-proxy] WARNING: could not delete limiter latch file "
-                  "(treating latch as released, forwarding immediately): %s" % e,
-                  file=sys.stderr)
+            _log_stderr("WARNING: could not delete limiter latch file "
+                        "(treating latch as released, forwarding immediately): %s" % e)
 
 
 def limiter_admission(flag_dir, tier=None):
@@ -847,8 +872,8 @@ def limiter_admission(flag_dir, tier=None):
     except Exception as e:
         if not _LIMITER_WARNED:
             _LIMITER_WARNED = True
-            print("[rate-limit-proxy] WARNING: limiter failed (fail-open, forwarding "
-                  "immediately): %s" % e, file=sys.stderr)
+            _log_stderr("WARNING: limiter failed (fail-open, forwarding "
+                        "immediately): %s" % e)
         return 0
 
 
@@ -903,8 +928,7 @@ def main():
     signal.signal(signal.SIGTERM, _request_drain)
     signal.signal(signal.SIGINT, _request_drain)
 
-    print("[rate-limit-proxy] listening on 127.0.0.1:%d, upstream=%s" % (port, resolve_upstream()),
-          file=sys.stderr)
+    _log_stderr("listening on 127.0.0.1:%d, upstream=%s" % (port, resolve_upstream()))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -951,7 +975,7 @@ def main():
         time.sleep(0.2)
     with server.inflight_lock:
         remaining = server.inflight
-    print("[rate-limit-proxy] drained (inflight=%d), exiting" % remaining, file=sys.stderr)
+    _log_stderr("drained (inflight=%d), exiting" % remaining)
 
 
 if __name__ == "__main__":
