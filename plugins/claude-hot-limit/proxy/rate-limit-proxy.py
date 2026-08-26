@@ -33,7 +33,6 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from contextlib import contextmanager
 from datetime import datetime, timezone
 
 try:
@@ -345,43 +344,35 @@ def write_state_record(state_file_path, record):
 
 
 # verify #36 R1 finding（3 個獨立 lens 交叉確認 + 實機重現）：ConnectionResetError／
-# BrokenPipeError 在 proxy 轉發路徑上會從**兩側**冒出——寫給 client 的 `self.wfile.write`
-# 斷線是良性事件，但讀 upstream 的 `upstream_resp.read()` 撞到同型別 exception 是
-# upstream 故障，兩者不能共用同一句「client disconnected early」。用 thread-local 旗標
-# 標記「這個 thread 目前正在對 client 寫入」，`handle_error` 只在旗標為真時才降噪；
-# upstream 讀取路徑的斷線一律 fallback 到 super() 保留完整 traceback。
-# ThreadingMixIn 對每個 request 開新 thread（非 pool 重用），thread-local 天然不會
-# 跨 request 殘留；仍在 `_handle`（in-flight tracking wrapper）進站時明確重置以防萬一。
-_CLIENT_WRITE_TL = threading.local()
+# BrokenPipeError 在 proxy 轉發路徑上會從**兩側**冒出——client 端（讀下一個 keep-alive
+# request、寫 response）的斷線是良性事件，但讀/連 upstream 時撞到同型別 exception 是
+# upstream 故障，兩者不能共用同一句「client disconnected early」。
+#
+# R1 的第一版用 thread-local 旗標「標記 client-write 區段」，R2 verify（devils-advocate，
+# 用 production log 做 A/B 重現）證實這個方向選錯了層次：client 端不是只有寫，
+# HTTP/1.1 keep-alive 下同一個 thread 送完 response 會回去 `rfile.readline()` 等下一個
+# request，那條路徑沒被標記，斷線時旗標為 False → 被誤判成「非 client」→ 印出完整
+# traceback——production 資料顯示這佔了原始洗版量的 49%，是本 issue 要修的主要案例，
+# 反而被 R1 的第一版修正回歸。
+#
+# R2 修正：**反過來標記**——預設「這是 client 側」（降噪），只把**明確面向 upstream**
+# 的呼叫點（`urllib.request.urlopen`、`upstream_resp.read()`）標起來。標記直接掛在
+# exception instance 上（而非 thread-local + 例外傳播時序），隨例外一起傳播到
+# `handle_error`——不依賴任何關於「exception 何時被誰接住」的隱性假設，也不需要
+# 列舉 stdlib 內部所有碰 client socket 的地方（列舉法必漏，R1 的第一版就漏了
+# `rfile.readline`）。
+_UPSTREAM_SIDE_MARK = "_rate_limit_proxy_upstream_side"
 
 
-def _mark_client_write_in_progress(value):
-    _CLIENT_WRITE_TL.in_progress = value
+def _mark_upstream_side(exc):
+    """把「這個 exception 發生在 proxy 對 upstream 的 read/connect 路徑」的標記掛到
+    exception instance 上，然後回傳它（呼叫端接著 `raise`）。"""
+    setattr(exc, _UPSTREAM_SIDE_MARK, True)
+    return exc
 
 
-def _is_client_write_in_progress():
-    return getattr(_CLIENT_WRITE_TL, "in_progress", False)
-
-
-@contextmanager
-def _client_write_scope():
-    """包住「這段程式碼是在對 client socket 寫入」的區間。handle_error 只在旗標為真
-    時才把 ConnectionResetError/BrokenPipeError 降噪——upstream 端的同型別 exception
-    （旗標為 False）一律保留完整 traceback（verify #36 R1 confirmed finding）。
-
-    刻意**不用 try/finally 重置旗標**：write 若拋例外，例外會沿著呼叫堆疊一路往上
-    傳到 `process_request_thread` 才被接住並呼叫 `handle_error`——若用 finally，
-    reset 會在例外「經過」這個 context manager 時就先執行，等 exception 真正抵達
-    `handle_error` 時旗標早被清成 False（TDD 抓到的真實回歸：第一版用 finally 時
-    `test_upstream_side_disconnect_not_mislabeled_as_client` 的對照組
-    `test_connection_reset_direct_via_handle_error_when_client_write_flagged` 一度
-    失敗）。只在**正常結束**（沒拋例外，走到 `yield` 之後那行）才清旗標；例外路徑上
-    旗標維持 True 直到整個 request thread 結束（thread-local 隨 thread 一起消滅，
-    不會漏到下一個 request）。
-    """
-    _mark_client_write_in_progress(True)
-    yield
-    _mark_client_write_in_progress(False)
+def _is_upstream_side(exc):
+    return bool(exc is not None and getattr(exc, _UPSTREAM_SIDE_MARK, False))
 
 
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
@@ -431,18 +422,28 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             # 無關（#13：Max 訂閱下 header 全 null 時，status 仍是可靠的撞牆偵測訊號）。
             status = e.code
             resp_headers = list(e.headers.items()) if e.headers else []
-            resp_body = e.read()
+            try:
+                resp_body = e.read()
+            except (ConnectionResetError, BrokenPipeError) as read_exc:
+                raise _mark_upstream_side(read_exc)
             self._record_state(status, resp_headers, resp_body, req_model, sched_held_ms,
                                limiter_held_ms)
             self._forward_buffered(status, resp_headers, resp_body)
             return
+        except (ConnectionResetError, BrokenPipeError) as e:
+            # verify #36 R2：urlopen() 本身連線／收 header 階段撞到 upstream 斷線——
+            # 明確標記為 upstream 側，讓 handle_error 保留完整 traceback。
+            raise _mark_upstream_side(e)
 
         content_type = dict((k.lower(), v) for k, v in resp_headers).get("content-type", "")
         if content_type.startswith("text/event-stream"):
             self._forward_streaming(status, resp_headers, upstream_resp, req_model, sched_held_ms,
                                     limiter_held_ms)
         else:
-            resp_body = upstream_resp.read()
+            try:
+                resp_body = upstream_resp.read()
+            except (ConnectionResetError, BrokenPipeError) as e:
+                raise _mark_upstream_side(e)
             self._record_state(status, resp_headers, resp_body, req_model, sched_held_ms,
                                limiter_held_ms)
             self._forward_buffered(status, resp_headers, resp_body)
@@ -468,17 +469,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         write_state_record(self._state_file(), record)
 
     def _forward_buffered(self, status, resp_headers, resp_body):
-        # verify #36 R1：整段都是對 client 寫入，用旗標包住讓 handle_error 能分辨
-        # 這裡發生的 ConnectionResetError/BrokenPipeError 屬於 client 端斷線。
-        with _client_write_scope():
-            self.send_response(status)
-            for k, v in resp_headers:
-                if k.lower() in ("transfer-encoding", "connection", "content-length"):
-                    continue
-                self.send_header(k, v)
-            self.send_header("Content-Length", str(len(resp_body)))
-            self.end_headers()
-            self.wfile.write(resp_body)
+        # verify #36 R2：不再需要對這裡包 scope——client 端是預設（未標記＝降噪），
+        # 只有明確的 upstream 呼叫點（_handle 的 urlopen/read）才會標記例外。
+        self.send_response(status)
+        for k, v in resp_headers:
+            if k.lower() in ("transfer-encoding", "connection", "content-length"):
+                continue
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(resp_body)))
+        self.end_headers()
+        self.wfile.write(resp_body)
 
     def _forward_streaming(self, status, resp_headers, upstream_resp, req_model=None,
                            sched_held_ms=0, limiter_held_ms=0):
@@ -488,14 +488,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         最終累積值連同 rate-limit header 一起寫進狀態檔——usage 總量只在最後一個 event
         才知道，但絕不能因此延遲任何一個 chunk 交付給 client。
         """
-        with _client_write_scope():
-            self.send_response(status)
-            for k, v in resp_headers:
-                if k.lower() in ("transfer-encoding", "connection", "content-length"):
-                    continue
-                self.send_header(k, v)
-            self.send_header("Transfer-Encoding", "chunked")
-            self.end_headers()
+        self.send_response(status)
+        for k, v in resp_headers:
+            if k.lower() in ("transfer-encoding", "connection", "content-length"):
+                continue
+            self.send_header(k, v)
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
 
         usage_acc = {}
         sse_buffer = bytearray()
@@ -503,17 +502,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         completed = False
         try:
             while True:
-                # verify #36 R1：這裡讀的是 upstream socket——旗標保持 False，讓
-                # ConnectionResetError/BrokenPipeError 在這一行冒出時仍走完整 traceback
-                # （upstream 故障不該被誤標成「client 提早斷線」）。
-                chunk = upstream_resp.read(1)
+                try:
+                    # verify #36 R2：明確標記——這裡讀的是 upstream socket，斷線是
+                    # upstream 故障，讓 ConnectionResetError/BrokenPipeError 在這一行
+                    # 冒出時仍走完整 traceback（不該被誤標成「client 提早斷線」）。
+                    chunk = upstream_resp.read(1)
+                except (ConnectionResetError, BrokenPipeError) as e:
+                    raise _mark_upstream_side(e)
                 if not chunk:
                     break
-                with _client_write_scope():
-                    self.wfile.write(("%x\r\n" % len(chunk)).encode("ascii"))
-                    self.wfile.write(chunk)
-                    self.wfile.write(b"\r\n")
-                    self.wfile.flush()
+                self.wfile.write(("%x\r\n" % len(chunk)).encode("ascii"))
+                self.wfile.write(chunk)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
 
                 if len(sample_head) < 2048:
                     sample_head += chunk
@@ -534,9 +535,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         break
                     accumulate_usage_from_sse_event(event_bytes, usage_acc)
             completed = True  # 上游 EOF＝usage 累積完整（terminator 寫失敗不影響完整性判定）
-            with _client_write_scope():
-                self.wfile.write(b"0\r\n\r\n")
-                self.wfile.flush()
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
         finally:
             # record 保寫（#26 第二缺口）：client mid-stream 斷線（wfile 寫入 raise）時，舊版
             # 直接跳出、record 從未寫入——整筆蒸發（production proxy.log 大量 ConnectionResetError）。
@@ -617,24 +617,26 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     _QUIET_DISCONNECT_EXCEPTIONS = (ConnectionResetError, BrokenPipeError)
 
     def handle_error(self, request, client_address):
-        exc_type = sys.exc_info()[0]
-        # verify #36 R1（3 個獨立 lens 交叉確認 + 實機重現）：只憑 exception 型別無法
-        # 分辨斷線發生在 client 端還是 upstream 端——ConnectionResetError/BrokenPipeError
-        # 在讀 upstream response 時同樣會冒出，若照型別一律降噪會把 upstream 故障誤標成
-        # 「client disconnected early」且吞掉唯一能歸因的 traceback。只在 `_client_write_scope()`
-        # 標記過（確認正在對 client socket 寫入）時才降噪；upstream 讀取路徑的同型別
-        # exception 一律 fallback 到 super() 保留完整 traceback。
+        exc_type, exc, _tb = sys.exc_info()
+        # verify #36 R2（devils-advocate，production log A/B 重現後修正 R1 的方向錯誤）：
+        # **預設判斷是「client 側」**（降噪）——client 端不是只有 write，HTTP/1.1
+        # keep-alive 下同一 thread 送完 response 還會回去 `rfile.readline()` 等下一個
+        # request，斷在那裡也是良性事件；列舉「client 端所有可能碰 socket 的地方」
+        # 必然會漏（R1 的第一版就漏了這條）。只有**明確標記為 upstream 側**的例外
+        # （`_mark_upstream_side()`，掛在 `_handle`/`_forward_streaming` 的 urlopen／
+        # read 呼叫點）才 fallback 到完整 traceback；其餘同型別一律視為 client 側降噪。
         if (exc_type is not None and issubclass(exc_type, self._QUIET_DISCONNECT_EXCEPTIONS)
-                and _is_client_write_in_progress()):
-            exc = sys.exc_info()[1]
+                and not _is_upstream_side(exc)):
             _log_stderr("%s: client %s disconnected early (%s)"
                         % (exc_type.__name__, client_address, exc))
             return
         # verify #36 R1（MEDIUM）：fallback 分支先前完全沒有時間戳記——真正未預期的
-        # exception（本降噪機制存在的目的正是要保留它們）反而是 proxy.log 裡唯一沒被
-        # 時間戳記層涵蓋的訊息。先印一行 timestamped 錨點，再讓 super() 印完整 traceback。
+        # exception（含明確標記的 upstream 側斷線）反而是 proxy.log 裡唯一沒被時間戳記
+        # 層涵蓋的訊息。先印一行 timestamped 錨點，再讓 super() 印完整 traceback。
+        # 訊息措辭刻意不寫「client」（verify #36 R2 devils-advocate）：這個分支涵蓋
+        # upstream 側例外，寫成「from client_address」會誤導成是 client 的問題。
         if exc_type is not None:
-            _log_stderr("UNEXPECTED %s from %s (full traceback follows)"
+            _log_stderr("UNEXPECTED %s while serving client %s (full traceback follows)"
                         % (exc_type.__name__, client_address))
         super().handle_error(request, client_address)
 

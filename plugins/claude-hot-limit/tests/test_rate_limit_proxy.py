@@ -16,6 +16,7 @@ import json
 import os
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -2515,10 +2516,12 @@ class HandleErrorLoggingTest(unittest.TestCase):
                       "非 client-disconnect exception 仍應保留完整 traceback，got:\n%s" % output)
         self.assertIn("ValueError", output)
 
-    def test_connection_reset_direct_via_handle_error_when_client_write_flagged(self):
+    def test_connection_reset_direct_via_handle_error_default_quiet(self):
         """verify #36 R1 mutation finding：端對端測試在這台機器上只會觸發
         BrokenPipeError，`ConnectionResetError` 這個 issue 標題點名的型別從未被實際
         執行過——刪掉它測試仍全綠。改用確定性直接呼叫，不依賴平台湊巧觸發哪個 errno。
+
+        verify #36 R2 之後：client 側是**預設**（未標記 = 降噪），不需要任何前置呼叫。
         """
         rlp = _load_proxy_module()
         handler_cls = rlp.ProxyHandler
@@ -2530,20 +2533,18 @@ class HandleErrorLoggingTest(unittest.TestCase):
             real_stderr = sys.stderr
             sys.stderr = captured
             try:
-                rlp._mark_client_write_in_progress(True)  # 模擬正在對 client 寫入時斷線
                 try:
                     raise ConnectionResetError(54, "Connection reset by peer")
                 except ConnectionResetError:
                     server.handle_error(None, ("127.0.0.1", 0))
             finally:
-                rlp._mark_client_write_in_progress(False)
                 sys.stderr = real_stderr
         finally:
             server.server_close()
 
         output = captured.getvalue()
         self.assertNotIn("Traceback (most recent call last)", output,
-                         "client-write 期間的 ConnectionResetError 應降噪，got:\n%s" % output)
+                         "未標記的 ConnectionResetError 應視為 client 側、降噪，got:\n%s" % output)
         self.assertIn("ConnectionResetError", output)
         self.assertIn("[rate-limit-proxy]", output)
         import re
@@ -2551,10 +2552,10 @@ class HandleErrorLoggingTest(unittest.TestCase):
 
     def test_upstream_side_disconnect_not_mislabeled_as_client(self):
         """verify #36 R1 confirmed HIGH：`ConnectionResetError`/`BrokenPipeError` 也會
-        從讀 upstream response 的路徑冒出（非 client-write 期間），不該被降噪成
-        「client disconnected early」——那是誤判方向、且會吞掉唯一能歸因的 traceback。
-        `_is_client_write_in_progress()` 在這個情境下應為 False（沒進 `_client_write_scope()`），
-        `handle_error` 必須 fallback 到完整 traceback。
+        從讀 upstream response 的路徑冒出，不該被降噪成「client disconnected early」——
+        那是誤判方向、且會吞掉唯一能歸因的 traceback。用 `_mark_upstream_side()`
+        明確標記（verify #36 R2：不再是「未標記=client」的反向設計，而是「標記=upstream」
+        的正向設計——production A/B 證實反向設計會漏掉 client 端的 keep-alive read 路徑）。
         """
         rlp = _load_proxy_module()
         handler_cls = rlp.ProxyHandler
@@ -2566,12 +2567,9 @@ class HandleErrorLoggingTest(unittest.TestCase):
             real_stderr = sys.stderr
             sys.stderr = captured
             try:
-                # 刻意不呼叫 _mark_client_write_in_progress(True) —— 模擬這個
-                # ConnectionResetError 發生在讀 upstream（不在 _client_write_scope() 內）。
-                self.assertFalse(rlp._is_client_write_in_progress(),
-                                 "pre-condition：這個 thread 不該處於 client-write 狀態")
                 try:
-                    raise ConnectionResetError(54, "Connection reset by peer")
+                    exc = ConnectionResetError(54, "Connection reset by peer")
+                    raise rlp._mark_upstream_side(exc)
                 except ConnectionResetError:
                     server.handle_error(None, ("127.0.0.1", 0))
             finally:
@@ -2585,6 +2583,79 @@ class HandleErrorLoggingTest(unittest.TestCase):
         self.assertIn("ConnectionResetError", output)
         self.assertNotIn("disconnected early", output,
                          "upstream 端斷線不該被誤標成 client disconnected，got:\n%s" % output)
+
+    def test_keepalive_client_read_disconnect_is_quiet(self):
+        """verify #36 R2 confirmed HIGH（devils-advocate，production log A/B 重現）：
+        R1 的第一版只標記 `wfile.write`（client-write）為降噪對象，但 HTTP/1.1
+        keep-alive 下同一 thread 送完第一個 response 後會回去 `rfile.readline()`
+        等下一個 request——client 在這個空檔斷線，屬於良性事件，但沒被 R1 標記到，
+        會被誤判成「不是 client」而印出完整 traceback（production 資料：這條路徑
+        佔原始洗版量的 49%，是本 issue 要修的主要案例）。用真實 raw socket 重現：
+        送完一個完整請求＋讀完整回應後，用 SO_LINGER(0) 強制 RST，讓 server thread
+        在等待下一個 keep-alive request 時撞上 ConnectionResetError。
+        """
+        MockUpstreamHandler.response_status = 200
+        MockUpstreamHandler.response_headers = {"Content-Type": "application/json"}
+        MockUpstreamHandler.response_body = b'{"ok": true}'
+        MockUpstreamHandler.sse_chunks = None
+
+        proxy_server, proxy_url, rlp = start_threading_proxy(self.mock_url, self.state_file)
+        host, port = proxy_server.server_address[0], proxy_server.server_address[1]
+        captured = io.StringIO()
+        real_stderr = sys.stderr
+        sys.stderr = captured
+        try:
+            body = b'{"model":"x"}'
+            req = (b"POST /v1/messages HTTP/1.1\r\n"
+                   b"Host: 127.0.0.1\r\n"
+                   b"Content-Type: application/json\r\n"
+                   b"Content-Length: %d\r\n"
+                   b"Connection: keep-alive\r\n"
+                   b"\r\n%s") % (len(body), body)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((host, port))
+            sock.sendall(req)
+            # 讀到完整回應（headers + body）再放手——不 assert 內容，只確保第一個
+            # request 已完整走完，thread 已回到 keep-alive 迴圈等下一個 request。
+            resp = b""
+            sock.settimeout(5)
+            while b"\r\n\r\n" not in resp:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                resp += chunk
+            # 抓 Content-Length 讀滿 body，確保 handler 真的處理完第一個 request
+            header_part, _, body_part = resp.partition(b"\r\n\r\n")
+            cl_match = [l for l in header_part.split(b"\r\n") if l.lower().startswith(b"content-length")]
+            if cl_match:
+                need = int(cl_match[0].split(b":")[1].strip())
+                while len(body_part) < need:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    body_part += chunk
+            # 強制 RST（SO_LINGER l_onoff=1, l_linger=0）而非優雅 FIN——重現 client
+            # 異常斷線（非正常 client.close()），跟 keep-alive 下的真實斷線一致。
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                            struct.pack("ii", 1, 0))
+            sock.close()
+            time.sleep(1.0)  # 讓 server thread 有機會跑到下一輪 readline() 並撞上斷線
+        finally:
+            proxy_server.shutdown()
+            proxy_server.server_close()
+            sys.stderr = real_stderr
+
+        output = captured.getvalue()
+        # 不像其他測試需要用「檔名是否含 rate-limit-proxy.py」過濾 mock upstream 雜訊——
+        # 這個情境完全沒有 upstream 流量（第一個 request 已處理完、第二個 request 根本
+        # 沒送出），captured stderr 100% 來自 proxy 自己的 thread。也正因如此才更要小心：
+        # 這條 traceback 的呼叫堆疊**全部是 stdlib frame**（socketserver.py /
+        # http/server.py / socket.py，見 readline() 的呼叫鏈），完全不含
+        # `rate-limit-proxy.py` 字樣——早期版本的斷言用「rate-limit-proxy.py in block」
+        # 過濾，在這個情境下是假陰性（filter 排除掉了它要抓的那個 traceback）。
+        self.assertNotIn("Traceback (most recent call last)", output,
+                         "keep-alive 空檔的 client 斷線（rfile.readline）不該印出完整"
+                         " traceback，got:\n%s" % output)
 
 
 if __name__ == "__main__":
